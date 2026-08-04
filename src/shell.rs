@@ -1,8 +1,9 @@
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::{ata, cpuid, fat, interrupts, io, keyboard, mouse, multiboot, port, rtc, serial, task, vga};
+use crate::{ata, cpuid, fat, fat::FatError, interrupts, io, keyboard, mouse, multiboot, port, rtc, serial, task, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
@@ -13,7 +14,7 @@ pub const PROMPT: &str = "machaos> ";
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "ls", "cat", "fatinfo",
+    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm",
 ];
 
 pub fn run() -> ! {
@@ -131,6 +132,9 @@ pub fn execute(line: &str) {
         "ls" => cmd_ls(&args),
         "cat" => cmd_cat(&args),
         "fatinfo" => cmd_fatinfo(),
+        "write" => cmd_write(&args),
+        "mkdir" => cmd_mkdir(&args),
+        "rm" => cmd_rm(&args),
         _ => println!("unknown command: '{}' (type 'help')", command),
     }
 }
@@ -158,6 +162,10 @@ fn cmd_help() {
     println!("  ls [path]   list files on the mounted disk");
     println!("  cat <path>  print a file's contents");
     println!("  fatinfo     show mounted volume information");
+    println!("  write <path> <text>");
+    println!("               write text to a file (LFN supported)");
+    println!("  mkdir <path> create a directory");
+    println!("  rm <path>   remove a file or empty directory");
 }
 
 fn cmd_date() {
@@ -211,8 +219,44 @@ fn cmd_cat(args: &[&str]) {
     }
 }
 
-fn cmd_fatinfo() {
-    match fat::info() {
+fn cmd_write(args: &[&str]) {
+    if args.len() < 2 {
+        println!("usage: write <path> <text>");
+        return;
+    }
+    // Reassemble the text: the shell splits on whitespace.
+    let text = args[1..].join(" ");
+    match fat::write_file(args[0], text.as_bytes()) {
+        Ok(()) => println!("wrote {} bytes to {}", text.len(), args[0]),
+        Err(e) => println!("write: {}", e),
+    }
+}
+
+fn cmd_mkdir(args: &[&str]) {
+    if args.is_empty() {
+        println!("usage: mkdir <path>");
+        return;
+    }
+    let path = args.join(" ");
+    match fat::make_dir(&path) {
+        Ok(()) => println!("created directory {}", path),
+        Err(e) => println!("mkdir: {}", e),
+    }
+}
+
+fn cmd_rm(args: &[&str]) {
+    if args.is_empty() {
+        println!("usage: rm <path>");
+        return;
+    }
+    let path = args.join(" ");
+    match fat::remove(&path) {
+        Ok(()) => println!("removed {}", path),
+        Err(e) => println!("rm: {}", e),
+    }
+}
+
+fn cmd_fatinfo() {    match fat::info() {
         Some(info) => {
             let cluster_bytes = info.sectors_per_cluster as u32 * 512;
             println!(
@@ -437,6 +481,52 @@ pub fn selftest() -> ! {
             println!("[OK] FAT32 read /docs/readme.txt matches fixture")
         }
         _ => selftest_fail("FAT32 subdirectory read mismatch"),
+    }
+
+    // FAT32 write verification: create a directory, write a file into it
+    // (LFN >8.3), read it back, overwrite it, then delete both. Exercising
+    // remove also proves that free clusters are recycled.
+    match fat::make_dir("/selftest") {
+        Ok(()) => println!("[OK] FAT32 mkdir /selftest"),
+        Err(e) => selftest_fail("FAT32 mkdir failed"),
+    }
+    let payload = "selftest payload line 1\nline 2 (2 KiB+ to force multi-cluster)\n".repeat(64);
+    if let Err(e) = fat::write_file("/selftest/multicluster payload.txt", payload.as_bytes()) {
+        selftest_fail("FAT32 write failed");
+    }
+    match fat::read_file("/selftest/multicluster payload.txt") {
+        Ok(data) if data == payload.as_bytes() => {
+            println!("[OK] FAT32 write+read round trip ({} bytes, LFN)", payload.len())
+        }
+        Ok(_) => selftest_fail("FAT32 write+read round trip mismatch"),
+        Err(_) => selftest_fail("FAT32 write+read round trip failed"),
+    }
+    let overwrite = "shorter overwrite";
+    if let Err(e) = fat::write_file("/selftest/multicluster payload.txt", overwrite.as_bytes()) {
+        selftest_fail("FAT32 overwrite failed");
+    }
+    match fat::read_file("/selftest/multicluster payload.txt") {
+        Ok(data) if data == overwrite.as_bytes() => {
+            println!("[OK] FAT32 overwrite shrinks file")
+        }
+        _ => selftest_fail("FAT32 overwrite mismatch"),
+    }
+    if let Err(e) = fat::remove("/selftest/multicluster payload.txt") {
+        selftest_fail("FAT32 rm file failed");
+    }
+    if let Err(e) = fat::remove("/selftest") {
+        selftest_fail(&format!("FAT32 rm dir failed: {}", e));
+    }
+    match fat::list_dir("/selftest") {
+        Err(FatError::NotFound) => println!("[OK] FAT32 rm file+dir cleans up"),
+        _ => selftest_fail("FAT32 rm did not remove entries"),
+    }
+    let info = fat::info();
+    if let Some(info) = info {
+        println!(
+            "     volume free: {} clusters after write/rm cycle",
+            info.free_clusters
+        );
     }
 
     // Physical memory manager: allocate two frames, scribble on the
