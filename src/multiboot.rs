@@ -145,7 +145,7 @@ impl Iterator for MemoryMapIter {
             let base = core::ptr::read_unaligned((self.current + 4) as *const u64);
             let length = core::ptr::read_unaligned((self.current + 12) as *const u64);
             let region_type = core::ptr::read_unaligned((self.current + 20) as *const u32);
-            self.current = (self.current + size + 4 + 7) & !7;
+            self.current = self.current + size + 4;
             Some(MemoryRegion {
                 base,
                 length,

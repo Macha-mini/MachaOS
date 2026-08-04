@@ -124,12 +124,8 @@ const fn align_up(value: usize, align: usize) -> usize {
 
 // `MIN_ALIGN`-aligned so every allocation this allocator can ever hand out
 // (bounded by `MIN_ALIGN` in `alloc()` below) starts from a heap base that's
-// actually aligned; a plain `[u8; N]` has no alignment guarantee beyond 1.
-#[repr(align(16))]
-struct Heap([u8; HEAP_SIZE]);
-
-static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
-
+// actually aligned; `alloc_contiguous` returns page-aligned addresses, so
+// the runtime heap base trivially satisfies this.
 #[global_allocator]
 static ALLOCATOR: SpinLock<FreeListAllocator> = SpinLock::new(FreeListAllocator::new());
 
@@ -148,9 +144,13 @@ unsafe impl GlobalAlloc for SpinLock<FreeListAllocator> {
     }
 }
 
+/// Takes `HEAP_SIZE` contiguous frames from the physical memory manager
+/// (identity-mapped by the boot map, so physical == virtual) and hands
+/// them to the free-list allocator. Must run after `pmm::init()`.
 pub fn init() {
+    let pages = HEAP_SIZE / crate::pmm::FRAME_SIZE;
+    let start = crate::pmm::alloc_contiguous(pages).expect("heap allocation failed");
     unsafe {
-        let start = core::ptr::addr_of!(HEAP.0) as usize;
         let end = start + HEAP_SIZE;
         ALLOCATOR.lock().init(start, end);
     }

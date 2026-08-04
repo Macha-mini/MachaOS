@@ -407,7 +407,14 @@ impl WindowManager {
 
         let ticks = interrupts::ticks();
         let secs = ticks / 100;
-        let clock = format!("up {:02}:{:02}", secs / 60, secs % 60);
+        let now = crate::rtc::now();
+        let clock = format!(
+            "{:02}:{:02}  up {:02}:{:02}",
+            now.hour,
+            now.minute,
+            secs / 60,
+            secs % 60
+        );
         let clock_w = (clock.len() * font::GLYPH_WIDTH) as u32;
         gfx::draw_string(surface, self.screen_w - clock_w - 12, y + 8, &clock, 0x00_FFFFFF, None);
 

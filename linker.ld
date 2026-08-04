@@ -3,6 +3,7 @@ ENTRY(boot)
 SECTIONS
 {
     . = 1M;
+    _kernel_start = .;
 
     .text : {
         KEEP(*(.multiboot))
@@ -29,4 +30,6 @@ SECTIONS
         *(.eh_frame)
         *(.comment)
     }
+
+    _kernel_end = .;
 }

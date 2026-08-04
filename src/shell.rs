@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::{cpuid, interrupts, io, keyboard, mouse, multiboot, port, serial, task, vga};
+use crate::{cpuid, interrupts, io, keyboard, mouse, multiboot, port, rtc, serial, task, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
@@ -11,8 +11,9 @@ pub const PROMPT: &str = "machaos> ";
 // match in `execute()` and the descriptions in `cmd_help()` by hand — if
 // you add a command there, add it here too.
 pub const COMMANDS: &[&str] = &[
-    "help", "clear", "cls", "echo", "time", "uptime", "meminfo", "heap", "cpuinfo", "version",
-    "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest", "tasks",
+    "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
+    "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
+    "tasks",
 ];
 
 pub fn run() -> ! {
@@ -94,6 +95,7 @@ pub fn execute(line: &str) {
             let ticks = interrupts::ticks();
             println!("system ticks: {}", ticks);
         }
+        "date" => cmd_date(),
         "uptime" => {
             let ticks = interrupts::ticks();
             println!("uptime: {} seconds ({} ticks)", ticks / 100, ticks);
@@ -136,6 +138,7 @@ fn cmd_help() {
     println!("  clear       clear the screen");
     println!("  echo <txt>  print text");
     println!("  time        print timer ticks");
+    println!("  date        print the current date and time (RTC)");
     println!("  uptime      print time since boot");
     println!("  meminfo     print memory information");
     println!("  heap        exercise the heap allocator");
@@ -149,6 +152,14 @@ fn cmd_help() {
     println!("  panic       trigger a kernel panic");
     println!("  mousetest   poll the PS/2 mouse for a few seconds");
     println!("  tasks       list scheduler tasks and their counters");
+}
+
+fn cmd_date() {
+    let now = rtc::now();
+    println!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        now.year, now.month, now.day, now.hour, now.minute, now.second
+    );
 }
 
 fn cmd_meminfo() {
@@ -196,6 +207,13 @@ fn cmd_meminfo() {
         crate::allocator::total_bytes(),
         crate::allocator::allocated_bytes(),
         crate::allocator::free_bytes()
+    );
+    println!(
+        "pmm: {} frames ({} MiB) total, {} used, {} free",
+        crate::pmm::total_frames(),
+        crate::pmm::total_frames() * crate::pmm::FRAME_SIZE / (1024 * 1024),
+        crate::pmm::used_frames(),
+        crate::pmm::free_frames()
     );
 }
 
@@ -310,11 +328,59 @@ pub fn selftest() -> ! {
     execute("version");
     execute("echo MachaOS is running in kernel mode");
     execute("time");
+    execute("date");
     execute("uptime");
     execute("meminfo");
     execute("heap");
     execute("cpuinfo");
     execute("tasks");
+
+    // Physical memory manager: allocate two frames, scribble on the
+    // first, free both, then confirm the first allocation hands the
+    // same frame back (a full alloc/free round trip).
+    let frame_a = crate::pmm::frame_alloc().unwrap_or_else(|| selftest_fail("pmm alloc"));
+    let frame_b = crate::pmm::frame_alloc().unwrap_or_else(|| selftest_fail("pmm alloc"));
+    unsafe {
+        let p = frame_a as *mut u8;
+        core::ptr::write_volatile(p, 0xAB);
+        core::ptr::write_volatile(p.add(1), 0xCD);
+        if core::ptr::read_volatile(p) != 0xAB || core::ptr::read_volatile(p.add(1)) != 0xCD {
+            selftest_fail("pmm frame contents did not survive");
+        }
+    }
+    crate::pmm::frame_free(frame_a);
+    crate::pmm::frame_free(frame_b);
+    let frame_c = crate::pmm::frame_alloc().unwrap_or_else(|| selftest_fail("pmm re-alloc"));
+    if frame_c != frame_a && frame_c != frame_b {
+        selftest_fail("pmm did not reuse a freed frame");
+    }
+    crate::pmm::frame_free(frame_c);
+    println!("[OK] pmm alloc/free round trip (frames {:#x}, {:#x}, {:#x})", frame_a, frame_b, frame_c);
+
+    // Page table surgery: split the 2 MiB region containing a freshly
+    // allocated frame, map that single 4 KiB page onto itself, verify
+    // it is reachable, then tear the mapping down again.
+    let frame = crate::pmm::frame_alloc().unwrap_or_else(|| selftest_fail("paging frame alloc"));
+    let mapped = crate::paging::map_page(
+        frame as u64,
+        frame as u64,
+        crate::paging::PAGE_PRESENT | crate::paging::PAGE_WRITABLE,
+    );
+    if !mapped {
+        selftest_fail("map_page refused the request");
+    }
+    unsafe {
+        core::ptr::write_volatile(frame as *mut u32, 0x1234_5678);
+    }
+    let value = unsafe { core::ptr::read_volatile(frame as *mut u32) };
+    if !crate::paging::unmap_page(frame as u64) {
+        selftest_fail("unmap_page refused the request");
+    }
+    crate::pmm::frame_free(frame);
+    if value != 0x1234_5678 {
+        selftest_fail("paging map/write/read/unmap round trip mismatch");
+    }
+    println!("[OK] paging 4 KiB map/split/unmap round trip (frame {:#x})", frame);
 
     let before: Vec<u64> = task::COUNTERS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let deadline = interrupts::ticks() + 30; // spans several scheduler quanta (5 ticks each)
@@ -332,6 +398,12 @@ pub fn selftest() -> ! {
     } else {
         println!("[SELFTEST FAIL] background task counters did not advance");
     }
+    unsafe { port::outb(0xF4, 0) }
+    interrupts::halt_forever()
+}
+
+fn selftest_fail(reason: &str) -> ! {
+    println!("[SELFTEST FAIL] {}", reason);
     unsafe { port::outb(0xF4, 0) }
     interrupts::halt_forever()
 }

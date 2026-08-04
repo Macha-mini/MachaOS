@@ -24,7 +24,9 @@ mod multiboot;
 mod paging;
 mod pic;
 mod pit;
+mod pmm;
 mod port;
+mod rtc;
 mod serial;
 mod shell;
 mod sync;
@@ -196,6 +198,14 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     }
     println!("[OK] memory map: {} regions", info.memory_map().count());
 
+    println!("[OK] initializing physical memory manager...");
+    pmm::init(&info);
+    println!(
+        "[OK] memory: {} MiB usable ({} KiB heap reserved)",
+        (pmm::total_frames() * pmm::FRAME_SIZE) / (1024 * 1024),
+        allocator::HEAP_SIZE / 1024
+    );
+
     println!("[OK] initializing heap allocator...");
     allocator::init();
 
@@ -222,6 +232,15 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
         println!("[OK] graphics mode: {}x{}x32", width, height);
     } else {
         println!("[WARN] no usable linear framebuffer; staying in VGA text mode");
+    }
+    if let Some(framebuffer) = info.framebuffer() {
+        // Keep the physical memory manager from ever handing out the
+        // framebuffer's MMIO region, in case it wasn't flagged reserved
+        // in the memory map.
+        pmm::mark_reserved(
+            framebuffer.addr as usize,
+            framebuffer.pitch as usize * framebuffer.height as usize,
+        );
     }
 
     let vendor = cpuid::vendor_id();
