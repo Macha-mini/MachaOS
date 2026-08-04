@@ -122,7 +122,13 @@ const fn align_up(value: usize, align: usize) -> usize {
     (value + align - 1) & !(align - 1)
 }
 
-static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+// `MIN_ALIGN`-aligned so every allocation this allocator can ever hand out
+// (bounded by `MIN_ALIGN` in `alloc()` below) starts from a heap base that's
+// actually aligned; a plain `[u8; N]` has no alignment guarantee beyond 1.
+#[repr(align(16))]
+struct Heap([u8; HEAP_SIZE]);
+
+static mut HEAP: Heap = Heap([0; HEAP_SIZE]);
 
 #[global_allocator]
 static ALLOCATOR: SpinLock<FreeListAllocator> = SpinLock::new(FreeListAllocator::new());
@@ -143,9 +149,9 @@ unsafe impl GlobalAlloc for SpinLock<FreeListAllocator> {
 }
 
 pub fn init() {
-    let start = core::ptr::addr_of!(HEAP) as usize;
-    let end = start + HEAP_SIZE;
     unsafe {
+        let start = core::ptr::addr_of!(HEAP.0) as usize;
+        let end = start + HEAP_SIZE;
         ALLOCATOR.lock().init(start, end);
     }
 }

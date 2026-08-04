@@ -27,6 +27,7 @@ mod port;
 mod serial;
 mod shell;
 mod sync;
+mod task;
 mod vga;
 mod wm;
 
@@ -208,6 +209,9 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
 
     println!("[OK] programming PIT timer at 100 Hz...");
     pit::init();
+
+    println!("[OK] starting preemptive task scheduler...");
+    task::init();
 
     println!("[OK] enabling PS/2 mouse (IRQ12)...");
     mouse::init();

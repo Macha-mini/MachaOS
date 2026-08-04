@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::io;
 use crate::pic;
+use crate::task;
 
 global_asm!(include_str!("isr_stubs.asm"), options(att_syntax));
 
@@ -185,7 +186,13 @@ pub fn ticks() -> u64 {
 
 fn timer(_frame: &InterruptFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    // EOI must go out before a possible task switch: if scheduler_tick()
+    // switches away from this task before the PIC hears about it, IRQ0's
+    // in-service bit stays latched and every interrupt on the system
+    // stalls until this task runs again to send it — which would require
+    // another timer interrupt that can now never arrive.
     pic::eoi(0);
+    task::scheduler_tick();
 }
 
 fn keyboard(_frame: &InterruptFrame) {

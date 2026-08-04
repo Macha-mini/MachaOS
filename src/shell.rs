@@ -1,7 +1,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
-use crate::{cpuid, interrupts, io, keyboard, mouse, multiboot, port, serial, vga};
+use crate::{cpuid, interrupts, io, keyboard, mouse, multiboot, port, serial, task, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
 
@@ -108,6 +109,7 @@ pub fn execute(line: &str) {
         }
         "panic" => panic!("user-requested kernel panic"),
         "mousetest" => cmd_mousetest(),
+        "tasks" => cmd_tasks(),
         _ => println!("unknown command: '{}' (type 'help')", command),
     }
 }
@@ -130,6 +132,7 @@ fn cmd_help() {
     println!("  fault       trigger a page fault");
     println!("  panic       trigger a kernel panic");
     println!("  mousetest   poll the PS/2 mouse for a few seconds");
+    println!("  tasks       list scheduler tasks and their counters");
 }
 
 fn cmd_meminfo() {
@@ -220,6 +223,17 @@ fn cmd_cpuinfo() {
     println!("features: {}", features.join(" "));
 }
 
+fn cmd_tasks() {
+    let count = task::task_count();
+    println!("scheduler tasks: {}", count);
+    for i in 0..count {
+        println!("  [{}] {}", i, task::task_name(i));
+    }
+    for (i, counter) in task::COUNTERS.iter().enumerate() {
+        println!("  bg-{} counter: {}", i, counter.load(Ordering::Relaxed));
+    }
+}
+
 fn cmd_mousetest() {
     println!("polling PS/2 mouse for 5 seconds...");
     let deadline = interrupts::ticks() + 500;
@@ -284,7 +298,24 @@ pub fn selftest() -> ! {
     execute("meminfo");
     execute("heap");
     execute("cpuinfo");
-    println!("[SELFTEST OK]");
+    execute("tasks");
+
+    let before: Vec<u64> = task::COUNTERS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let deadline = interrupts::ticks() + 30; // spans several scheduler quanta (5 ticks each)
+    while interrupts::ticks() < deadline {
+        interrupts::halt();
+    }
+    execute("tasks");
+    let progressed = task::COUNTERS
+        .iter()
+        .zip(before.iter())
+        .all(|(counter, &prior)| counter.load(Ordering::Relaxed) > prior);
+
+    if progressed {
+        println!("[SELFTEST OK]");
+    } else {
+        println!("[SELFTEST FAIL] background task counters did not advance");
+    }
     unsafe { port::outb(0xF4, 0) }
     interrupts::halt_forever()
 }

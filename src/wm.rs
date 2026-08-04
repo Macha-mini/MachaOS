@@ -18,6 +18,7 @@ use crate::keyboard;
 use crate::mouse::MouseEvent;
 use crate::multiboot;
 use crate::shell::{self, Feed, LineEditor};
+use crate::task;
 
 const TITLE_BAR_HEIGHT: u32 = 20;
 const TASKBAR_HEIGHT: u32 = 28;
@@ -257,6 +258,17 @@ impl WindowManager {
         let clock = format!("up {:02}:{:02}", secs / 60, secs % 60);
         let clock_w = (clock.len() * font::GLYPH_WIDTH) as u32;
         gfx::draw_string(surface, self.screen_w - clock_w - 12, y + 8, &clock, 0x00_FFFFFF, None);
+
+        // Background counter tasks keep running (preemptively, via the
+        // scheduler in task.rs) whether or not anyone is looking at the
+        // Terminal window — this is the visible proof of that.
+        let counters = task::COUNTERS
+            .iter()
+            .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
+            .collect::<Vec<_>>();
+        let bg = format!("bg: {} {} {}", counters[0], counters[1], counters[2]);
+        let bg_w = (bg.len() * font::GLYPH_WIDTH) as u32;
+        gfx::draw_string(surface, self.screen_w - clock_w - bg_w - 24, y + 8, &bg, 0x00_9FCB6B, None);
     }
 }
 
