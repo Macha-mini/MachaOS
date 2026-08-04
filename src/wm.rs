@@ -1154,17 +1154,31 @@ fn title_button_positions(wx: i32, content_w: u32, resizable: bool) -> (i32, Opt
     (minimize_x, maximize_x, close_x)
 }
 
-/// 1px-thick diagonal line from (x0, y0) down-right to (x1, y1),
-/// inclusive (x1 >= x0, y1 >= y0).
+/// 1px-thick diagonal line between two endpoints (any direction),
+/// inclusive of both endpoints. `Bresenham`-style step per pixel.
 fn draw_diagonal(surface: &mut dyn Surface, x0: u32, y0: u32, x1: u32, y1: u32, color: u32) {
-    let (mut x, mut y) = (x0, y0);
+    let (mut x, mut y) = (x0 as i32, y0 as i32);
+    let sx = if x1 >= x0 { 1 } else { -1 };
+    let sy = if y1 >= y0 { 1 } else { -1 };
+    let dx = (x1 as i32 - x0 as i32).abs();
+    let dy = (y1 as i32 - y0 as i32).abs();
+    let mut err = dx - dy;
     loop {
-        surface.put_pixel(x, y, color);
-        if x >= x1 || y >= y1 {
+        if x >= 0 && y >= 0 {
+            surface.put_pixel(x as u32, y as u32, color);
+        }
+        if x == x1 as i32 && y == y1 as i32 {
             break;
         }
-        x += 1;
-        y += 1;
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
     }
 }
 
@@ -1283,9 +1297,16 @@ fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool, cursor
     if window.resizable && !window.maximized {
         let grip_x = x + content_w - RESIZE_GRIP_SIZE;
         let grip_y = y + TITLE_BAR_HEIGHT + content_h - RESIZE_GRIP_SIZE;
-        draw_diagonal(surface, grip_x, grip_y + 7, grip_x + 6, grip_y + 1, RESIZE_GRIP_COLOR);
-        draw_diagonal(surface, grip_x + 2, grip_y + 9, grip_x + 8, grip_y + 3, RESIZE_GRIP_COLOR);
-        draw_diagonal(surface, grip_x + 4, grip_y + 11, grip_x + 10, grip_y + 5, RESIZE_GRIP_COLOR);
+        // A clearly visible resize handle: a shaded block with diagonal
+        // stripe lines, so it reads as "grab this corner to resize".
+        gfx::fill_rect(surface, grip_x, grip_y, RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE, 0x00_141B23);
+        draw_diagonal(surface, grip_x, grip_y + 11, grip_x + 11, grip_y, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x + 2, grip_y + 11, grip_x + 11, grip_y + 2, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x, grip_y + 9, grip_x + 9, grip_y, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x + 4, grip_y + 11, grip_x + 11, grip_y + 4, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x, grip_y + 7, grip_x + 7, grip_y, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x, grip_y + 1, grip_x + 1, grip_y, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x + 10, grip_y + 11, grip_x + 11, grip_y + 10, RESIZE_GRIP_COLOR);
     }
 }
 
