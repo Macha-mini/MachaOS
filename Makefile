@@ -53,7 +53,7 @@ disk:
 	rm -f target/fixture.txt target/fixture2.txt
 
 run: iso disk
-	$(QEMU) -cdrom $(ISO) -hda $(DISK) -serial stdio
+	$(QEMU) -cdrom $(ISO) -boot d -drive file=$(DISK),format=raw -serial stdio
 
 run-nographic: iso disk
 	$(QEMU) -cdrom $(ISO) -boot d -display none -serial stdio
