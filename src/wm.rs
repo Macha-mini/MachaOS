@@ -14,6 +14,7 @@ use crate::console::Console;
 use crate::cpuid;
 use crate::fat;
 use crate::fb;
+use crate::file_explorer::{FileExplorer, FsAction};
 use crate::font;
 use crate::gfx::{self, Surface};
 use crate::interrupts;
@@ -125,6 +126,7 @@ const EDITOR_STATUS_FG: u32 = 0x00_8FB8D8;
 enum LauncherAction {
     Terminal,
     Calculator,
+    Files,
     Notepad,
     SysInfo,
     RunElf(String),
@@ -141,9 +143,10 @@ enum AppId {
     Calculator,
     Notepad,
     SysInfo,
+    Files,
 }
 
-const APP_ID_COUNT: usize = 4;
+const APP_ID_COUNT: usize = 5;
 
 #[derive(Clone, Copy)]
 struct RememberedWindow {
@@ -159,6 +162,7 @@ pub enum AppKind {
     SysInfo { console: Console },
     Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String },
     Calculator(CalculatorApp),
+    FileExplorer(FileExplorer),
 }
 
 pub struct Window {
@@ -183,6 +187,7 @@ impl Window {
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => (console.width_px(), console.height_px()),
             AppKind::Calculator(app) => (app.width(), app.height()),
+            AppKind::FileExplorer(app) => (app.width(), app.height()),
         }
     }
 
@@ -192,6 +197,7 @@ impl Window {
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => console.pixels(),
             AppKind::Calculator(app) => app.pixels(),
+            AppKind::FileExplorer(app) => app.pixels(),
         }
     }
 
@@ -203,7 +209,7 @@ impl Window {
             AppKind::Terminal { console, .. }
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => (console.cols(), console.rows()),
-            AppKind::Calculator(_) => (0, 0),
+            AppKind::Calculator(_) | AppKind::FileExplorer(_) => (0, 0),
         }
     }
 }
@@ -538,6 +544,7 @@ impl WindowManager {
         let mut items = vec![
             ("Terminal".to_string(), LauncherAction::Terminal),
             ("Calculator".to_string(), LauncherAction::Calculator),
+            ("Files".to_string(), LauncherAction::Files),
             ("Notepad".to_string(), LauncherAction::Notepad),
             ("System Info".to_string(), LauncherAction::SysInfo),
         ];
@@ -580,6 +587,14 @@ impl WindowManager {
                     AppKind::Calculator(CalculatorApp::new()),
                 );
             }
+            LauncherAction::Files => {
+                self.spawn_window(
+                    "Files",
+                    false,
+                    Some(AppId::Files),
+                    AppKind::FileExplorer(FileExplorer::new()),
+                );
+            }
             LauncherAction::Notepad => {
                 let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
                 let lines = vec![String::new()];
@@ -602,25 +617,64 @@ impl WindowManager {
                 );
             }
             LauncherAction::RunElf(path) => {
-                let title: &'static str = alloc::boxed::Box::leak(format!("Terminal: {}", path).into_boxed_str());
-                let idx = self.spawn_window(
-                    title,
-                    true,
-                    None,
-                    AppKind::Terminal {
-                        console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
-                        editor: LineEditor::new(),
-                    },
-                );
-                if let AppKind::Terminal { console, .. } = &mut self.windows[idx].kind {
-                    io::set_console_sink(Some(console));
-                    let command = format!("run {}", path);
-                    println!("{}{}", shell::prompt(), command);
-                    shell::execute(&command);
-                    print!("{}", shell::prompt());
-                    io::set_console_sink(None);
-                }
+                self.launch_elf_in_terminal(path);
             }
+        }
+    }
+
+    /// Spawns a terminal window running `run <path>` (used by the
+    /// launcher's `/bin` entries and by the file explorer for `.elf`).
+    fn launch_elf_in_terminal(&mut self, path: String) {
+        let title: &'static str = alloc::boxed::Box::leak(format!("Terminal: {}", path).into_boxed_str());
+        let idx = self.spawn_window(
+            title,
+            true,
+            None,
+            AppKind::Terminal {
+                console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
+                editor: LineEditor::new(),
+            },
+        );
+        if let AppKind::Terminal { console, .. } = &mut self.windows[idx].kind {
+            io::set_console_sink(Some(console));
+            let command = format!("run {}", path);
+            println!("{}{}", shell::prompt(), command);
+            shell::execute(&command);
+            print!("{}", shell::prompt());
+            io::set_console_sink(None);
+        }
+    }
+
+    /// Spawns a Notepad window preloaded with a text file (used by the
+    /// file explorer when opening `.txt`/`.md`/... files).
+    fn open_notepad_with(&mut self, path: String, content: &[u8]) {
+        let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
+        let mut lines: Vec<String> = core::str::from_utf8(content)
+            .unwrap_or("")
+            .split('\n')
+            .map(|l| l.to_string())
+            .collect();
+        if lines.last().map(String::is_empty) == Some(true) {
+            lines.pop();
+        }
+        let mut scroll = 0usize;
+        let mut status = format!("opened {} ({} bytes)", path, content.len());
+        editor_render(&mut console, &lines, 0, 0, &mut scroll, &mut status);
+        let base = path.rsplit('/').next().unwrap_or(&path);
+        let title: &'static str = alloc::boxed::Box::leak(format!("Notepad: {}", base).into_boxed_str());
+        self.spawn_window(
+            title,
+            true,
+            None,
+            AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status },
+        );
+    }
+
+    /// Handles a `FsAction` reported by an app (the file explorer).
+    fn dispatch_action(&mut self, action: FsAction) {
+        match action {
+            FsAction::RunTerminal(path) => self.launch_elf_in_terminal(path),
+            FsAction::OpenText(path, content) => self.open_notepad_with(path, &content),
         }
     }
 
@@ -673,20 +727,31 @@ impl WindowManager {
         if self.windows.is_empty() {
             return;
         }
-        let window = &mut self.windows[self.focused];
-        match &mut window.kind {
-            AppKind::Terminal { console, editor } => {
-                io::set_console_sink(Some(console));
-                if let Feed::Line(line) = editor.feed(event) {
-                    shell::execute(&line);
-                    print!("{}", shell::prompt());
+        // The file explorer reports "open this file" actions that need
+        // the window manager, so collect it inside the borrow and act
+        // on it after `window` is released.
+        let action = {
+            let window = &mut self.windows[self.focused];
+            match &mut window.kind {
+                AppKind::Terminal { console, editor } => {
+                    io::set_console_sink(Some(console));
+                    if let Feed::Line(line) = editor.feed(event) {
+                        shell::execute(&line);
+                        print!("{}", shell::prompt());
+                    }
+                    io::set_console_sink(None);
+                    None
                 }
-                io::set_console_sink(None);
+                AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {
+                    editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, event);
+                    None
+                }
+                AppKind::FileExplorer(app) => app.handle_key(event),
+                AppKind::SysInfo { .. } | AppKind::Calculator(_) => None,
             }
-            AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {
-                editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, event);
-            }
-            AppKind::SysInfo { .. } | AppKind::Calculator(_) => {}
+        };
+        if let Some(action) = action {
+            self.dispatch_action(action);
         }
     }
 
@@ -872,8 +937,19 @@ impl WindowManager {
                 let local_x = self.cursor_x - wx;
                 let local_y = self.cursor_y - wy - TITLE_BAR_HEIGHT as i32;
                 self.raise(i);
-                if let AppKind::Calculator(app) = &mut self.windows[self.focused].kind {
-                    app.handle_click(local_x, local_y);
+                let action = {
+                    let window = &mut self.windows[self.focused];
+                    match &mut window.kind {
+                        AppKind::Calculator(app) => {
+                            app.handle_click(local_x, local_y);
+                            None
+                        }
+                        AppKind::FileExplorer(app) => app.handle_click(local_x, local_y),
+                        _ => None,
+                    }
+                };
+                if let Some(action) = action {
+                    self.dispatch_action(action);
                 }
                 return;
             }
@@ -991,7 +1067,7 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             console.resize(cols, rows);
             editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
         }
-        AppKind::SysInfo { .. } | AppKind::Calculator(_) => {} // not resizable
+        AppKind::SysInfo { .. } | AppKind::Calculator(_) | AppKind::FileExplorer(_) => {} // not resizable
     }
 }
 

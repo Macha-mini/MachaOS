@@ -13,6 +13,7 @@ mod desktop;
 mod elf;
 mod fb;
 mod fat;
+mod file_explorer;
 mod font;
 mod gdt;
 mod gfx;
