@@ -1,11 +1,15 @@
-//! Preemptive kernel-thread multitasking. Tasks are ring-0-only and share
-//! one address space (no per-task page tables); switching happens purely
-//! from the timer interrupt (`interrupts::timer` calls `scheduler_tick`
-//! after sending EOI). There is no cooperative `yield_now` — the task
-//! table is built once in `init()` before interrupts are enabled and is
-//! only ever mutated afterward from inside the (non-reentrant, because
-//! interrupt gates disable further interrupts) timer handler, so no lock
-//! is needed around it, mirroring `interrupts::HANDLERS`.
+//! Preemptive kernel-thread multitasking with per-task address spaces.
+//!
+//! Two kinds of schedulable entities exist:
+//!
+//! - **Kernel tasks**: ring-0-only functions sharing the kernel's own
+//!   address space (the boot PML4). The three background counter tasks
+//!   and the bootstrap "main" task are of this kind.
+//! - **Processes**: ELF programs loaded into a *private* address space
+//!   (see `process.rs`). Until the ring-3 work lands they still execute
+//!   in ring 0, but they have their own PML4 and their own page
+//!   mappings, and a page fault in one of them kills just that process
+//!   instead of the whole system.
 //!
 //! Context switching relies on every interrupt on this kernel running on
 //! whichever task's stack happened to be current when it fired (there is
@@ -15,11 +19,29 @@
 //! task's state (general registers, vector, RIP/CS/RFLAGS/RSP/SS) is
 //! already sitting safely on that task's own stack as the ISR frame that
 //! `isr_common` (see isr_stubs.asm) pushed, untouched by any of this.
+//! Switching to a process additionally writes its PML4 to CR3 before the
+//! stack swap; kernel stacks and kernel code are identity-mapped in every
+//! address space (processes deep-copy the boot map), so both the old and
+//! new `rsp` stay valid across the switch.
+//!
+//! Locking story: `init()` builds the table before interrupts are
+//! enabled; `scheduler_tick()` runs from the (non-reentrant, because
+//! interrupt gates disable further interrupts) timer handler and is the
+//! only place that ever *switches* tasks; `push_task`/`remove_process`
+//! mutate the table from normal context with interrupts disabled (they
+//! are the only non-timer mutators); the various read-only accessors are
+//! safe because on this single CPU a task's `state` is written only by
+//! the task itself (or the ISR handling its fault) before it stops
+//! running. The static-mut access through `addr_of_mut!` is the standard
+//! Rust 2024 workaround for `static_mut_refs` and is sound under those
+//! rules.
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::interrupts;
+use crate::paging;
+use crate::process::{ExitInfo, Process};
 
 core::arch::global_asm!(
     r#"
@@ -72,14 +94,28 @@ struct Task {
     // bootstrap task, which runs on the original kernel stack.
     _stack: Option<Vec<u8>>,
     name: &'static str,
+    // PML4 the task runs with: the kernel's own map, or a process's
+    // private address space.
+    cr3: u64,
+    // `Some` exactly for processes; carries the ELF entry, the frames
+    // and mappings the process owns, and its exit state.
+    process: Option<Process>,
+}
+
+impl Task {
+    fn is_exited(&self) -> bool {
+        self.process
+            .as_ref()
+            .is_some_and(|process| process.is_exited())
+    }
 }
 
 const STACK_SIZE: usize = 16 * 1024;
 const QUANTUM_TICKS: u64 = 5; // 50ms at the 100Hz PIT rate
 
-// Built once in `init()` before interrupts are enabled, then only ever
-// touched from `scheduler_tick()` (timer-interrupt context, which cannot
-// be reentered), so no lock is needed. See module docs.
+// Built once in `init()` before interrupts are enabled, then mutated from
+// `scheduler_tick()` (timer-interrupt context) or from `push_task` /
+// `remove_process` with interrupts disabled. See the module docs.
 static mut TASKS: Vec<Task> = Vec::new();
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
@@ -90,9 +126,8 @@ pub static COUNTERS: [AtomicU64; COUNTER_COUNT] =
 // Rust 2024 denies implicit `&`/`&mut` formation on `static mut` items
 // (`static_mut_refs`); going through `addr_of_mut!`/`addr_of!` and
 // dereferencing the raw pointer locally is the standard workaround, and
-// is sound here precisely because `TASKS` is only ever touched from
-// `scheduler_tick()` (non-reentrant interrupt context) after `init()`
-// finishes, as documented above.
+// is sound here precisely because `TASKS` is only ever touched from the
+// contexts listed in the module docs.
 fn tasks_mut() -> &'static mut Vec<Task> {
     unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
 }
@@ -106,6 +141,8 @@ pub fn init() {
         context: Context { rsp: 0 }, // overwritten by the first switch away from this task
         _stack: None,
         name: "main",
+        cr3: paging::kernel_pml4(),
+        process: None,
     });
     spawn(counter_task_0, "bg-0");
     spawn(counter_task_1, "bg-1");
@@ -113,6 +150,19 @@ pub fn init() {
 }
 
 fn spawn(entry: fn() -> !, name: &'static str) {
+    push_task(entry as *const () as usize, name, paging::kernel_pml4(), None);
+}
+
+/// Registers a new task running `entry` (a kernel function address) on a
+/// fresh 16 KiB stack, returning its index ("pid"). Runs with interrupts
+/// disabled around the table mutation. `cr3` selects the address space
+/// the task runs in; `process` is `Some` exactly when `entry` is a
+/// process trampoline.
+pub fn spawn_process(entry: extern "C" fn() -> !, name: &'static str, cr3: u64, process: Process) -> usize {
+    push_task(entry as usize, name, cr3, Some(process))
+}
+
+fn push_task(entry: usize, name: &'static str, cr3: u64, process: Option<Process>) -> usize {
     let mut stack = alloc::vec![0u8; STACK_SIZE];
     let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
 
@@ -133,11 +183,17 @@ fn spawn(entry: fn() -> !, name: &'static str) {
         *base.add(7) = entry as usize; // trampoline's `pop rdi` target
     }
 
+    interrupts::disable_interrupts();
     tasks_mut().push(Task {
         context: Context { rsp: x },
         _stack: Some(stack),
         name,
+        cr3,
+        process,
     });
+    let pid = tasks().len() - 1;
+    interrupts::enable_interrupts();
+    pid
 }
 
 /// Called from `interrupts::timer()`, strictly *after* `pic::eoi(0)` — if
@@ -156,9 +212,21 @@ pub fn scheduler_tick() {
         return;
     }
     let current = CURRENT.load(Ordering::Relaxed);
-    let next = (current + 1) % count;
+    // Round-robin over the runnable tasks, skipping exited processes.
+    let mut next = None;
+    for step in 1..count {
+        let candidate = (current + step) % count;
+        if !tasks[candidate].is_exited() {
+            next = Some(candidate);
+            break;
+        }
+    }
+    let Some(next) = next else { return }; // kernel tasks are always runnable
     CURRENT.store(next, Ordering::Relaxed);
 
+    if paging::read_cr3() != tasks[next].cr3 {
+        paging::write_cr3(tasks[next].cr3);
+    }
     let new_rsp = tasks[next].context.rsp;
     let old_rsp_ptr = &mut tasks[current].context.rsp as *mut usize;
     unsafe {
@@ -172,6 +240,95 @@ pub fn task_count() -> usize {
 
 pub fn task_name(index: usize) -> &'static str {
     tasks()[index].name
+}
+
+/// "running"/"exited" for a process task, `None` for kernel tasks.
+pub fn process_state_label(index: usize) -> Option<&'static str> {
+    tasks()[index]
+        .process
+        .as_ref()
+        .map(Process::state_label)
+}
+
+pub fn current_is_process() -> bool {
+    tasks()
+        .get(CURRENT.load(Ordering::Relaxed))
+        .is_some_and(|task| task.process.is_some())
+}
+
+/// ELF entry address of the current task (only valid for processes).
+pub fn current_process_entry() -> usize {
+    tasks()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_ref()
+        .expect("current task is not a process")
+        .entry
+}
+
+/// The process's exit status once it has exited, `None` while it runs
+/// (or when `pid` is not a process).
+///
+/// The fields are read with volatile loads: a `wait` loop spins between
+/// `hlt`s waiting for the process to mark itself, and `halt()` is
+/// `asm!("hlt", options(nomem))` — not a compiler memory barrier — so a
+/// plain load could be hoisted out of the loop and observe a stale
+/// "still running" forever.
+pub fn process_exit_status(pid: usize) -> Option<ExitInfo> {
+    let tasks = tasks();
+    let Some(task) = tasks.get(pid) else {
+        return None;
+    };
+    let Some(process) = task.process.as_ref() else {
+        return None;
+    };
+    unsafe {
+        if core::ptr::read_volatile(core::ptr::addr_of!(process.state)) != crate::process::ProcessState::Exited {
+            return None;
+        }
+        Some(core::ptr::read_volatile(core::ptr::addr_of!(process.exit_info)).unwrap())
+    }
+}
+
+/// The process's segment mappings, used by `process::read_result` to
+/// translate a virtual address to a physical frame.
+pub fn process_mappings(pid: usize) -> Option<&'static [crate::process::Mapping]> {
+    tasks()
+        .get(pid)
+        .and_then(|task| task.process.as_ref().map(|p| p.mappings.as_slice()))
+}
+
+/// Marks the current task's process as exited. Keeps the first exit info
+/// recorded (a page-fault kill must not be overwritten by the exit stub
+/// that follows it).
+pub fn mark_current_exited(info: ExitInfo) {
+    if let Some(process) = tasks_mut()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_mut()
+    {
+        process.mark_exited(info);
+    }
+}
+
+/// Detaches a process from the scheduler, returning it so the caller can
+/// free its frames. Refuses to remove the running task. Call with
+/// interrupts disabled (the caller owns the freed frames afterwards).
+pub fn remove_process(pid: usize) -> Option<Process> {
+    let tasks = tasks_mut();
+    if pid >= tasks.len() {
+        return None;
+    }
+    let current = CURRENT.load(Ordering::Relaxed);
+    if current == pid {
+        return None;
+    }
+    let task = tasks.swap_remove(pid);
+    if current == tasks.len() {
+        // The current task was the last entry and got swapped into `pid`.
+        CURRENT.store(pid, Ordering::Relaxed);
+    } else if pid < current {
+        CURRENT.store(current - 1, Ordering::Relaxed);
+    }
+    task.process
 }
 
 fn counter_task_0() -> ! {

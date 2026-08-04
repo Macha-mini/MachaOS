@@ -10,14 +10,21 @@ ISO := target/machaos.iso
 DISK := target/disk.img
 TEST_LOG := /tmp/machaos-selftest.log
 
-.PHONY: all build gen iso disk run run-nographic test clean
+.PHONY: all build gen user iso disk run run-nographic test clean
 
 all: build
 
 gen:
 	python3 tools/gen_isr.py
 
-build: gen
+# Builds the freestanding user-program ELFs (user/) and copies them to
+# target/ where the kernel embeds them at compile time.
+user:
+	cd user && cargo build --release --bins
+	cp user/target/x86_64-unknown-none/release/prog_exit target/user-exit.elf
+	cp user/target/x86_64-unknown-none/release/prog_fault target/user-fault.elf
+
+build: gen user
 	cargo build --release
 
 iso: build
@@ -38,6 +45,9 @@ disk:
 	mcopy -i $(DISK) target/fixture.txt "::/hello world.txt"
 	mcopy -i $(DISK) target/fixture2.txt ::/greetings.txt
 	mcopy -i $(DISK) target/fixture.txt ::/docs/readme.txt
+	mmd -i $(DISK) ::/bin
+	mcopy -i $(DISK) target/user-exit.elf ::/bin/prog_exit.elf
+	mcopy -i $(DISK) target/user-fault.elf ::/bin/prog_fault.elf
 	rm -f target/fixture.txt target/fixture2.txt
 
 run: iso disk
