@@ -50,6 +50,7 @@ pub(crate) const SYS_FB_PRESENT: u64 = 13;
 pub(crate) const SYS_GETPID: u64 = 14;
 pub(crate) const SYS_WIN_FOCUS: u64 = 15;
 pub(crate) const SYS_SHELL_EXEC: u64 = 16;
+pub(crate) const SYS_FB_PRESENT_RECT: u64 = 17;
 // Returned by write/read/send/recv when an argument (fd, or a pointer
 // range the calling process doesn't own) is rejected.
 const SYSCALL_ERROR: u64 = u64::MAX;
@@ -358,12 +359,7 @@ fn sys_win_update(pixels_ptr: u64, pixel_count: u64) -> u64 {
     if pixel_count == 0 || pixel_count > MAX_WINDOW_DIM * MAX_WINDOW_DIM || pixels_ptr % 4 != 0 {
         return SYSCALL_ERROR;
     }
-    let Some(phys) = resolve_user_buffer(pixels_ptr, pixel_count * 4) else {
-        return SYSCALL_ERROR;
-    };
-    // `phys` inherits `pixels_ptr`'s 4-byte alignment (checked above):
-    // every mapping's physical base is page-aligned, so the offset within
-    // it preserves alignment exactly.
+    let Some(phys) = resolve_user_buffer(pixels_ptr, pixel_count * 4) else { return SYSCALL_ERROR };
     let pixels = unsafe { core::slice::from_raw_parts(phys as *const u32, pixel_count as usize) }.to_vec();
     if crate::window_server::update(crate::task::current_pid(), pixels) { 0 } else { SYSCALL_ERROR }
 }
@@ -379,7 +375,8 @@ fn sys_win_list(ptr: u64, max_records: u64) -> u64 {
     let mut count = 0usize;
     crate::window_server::with_windows(|windows| {
         for window in windows.iter().take(max_records as usize) {
-            let out = unsafe { core::slice::from_raw_parts_mut((phys + (count * WINDOW_RECORD_SIZE) as u64) as *mut u8, WINDOW_RECORD_SIZE) };
+            let mut record = [0u8; WINDOW_RECORD_SIZE];
+            let out = &mut record;
             out.fill(0);
             out[0..8].copy_from_slice(&(window.pid as u64).to_le_bytes());
             out[8..12].copy_from_slice(&window.x.to_le_bytes());
@@ -391,6 +388,8 @@ fn sys_win_list(ptr: u64, max_records: u64) -> u64 {
             let title_len = title.len().min(crate::window_server::TITLE_CAPACITY);
             out[28..32].copy_from_slice(&(title_len as u32).to_le_bytes());
             out[32..32 + title_len].copy_from_slice(&title[..title_len]);
+            let destination = (phys + (count * WINDOW_RECORD_SIZE) as u64) as *mut u8;
+            unsafe { core::ptr::copy_nonoverlapping(out.as_ptr(), destination, WINDOW_RECORD_SIZE); }
             count += 1;
         }
     });
@@ -420,7 +419,16 @@ fn sys_fb_present(ptr: u64, pixel_count: u64) -> u64 {
     if pixel_count != width as u64 * height as u64 { return SYSCALL_ERROR; }
     let Some(phys) = resolve_user_buffer(ptr, pixel_count * 4) else { return SYSCALL_ERROR };
     let pixels = unsafe { core::slice::from_raw_parts(phys as *const u32, pixel_count as usize) };
-    if crate::fb::present_pixels(pixels) { 0 } else { SYSCALL_ERROR }
+    if crate::fb::present_pixels(&pixels) { 0 } else { SYSCALL_ERROR }
+}
+
+fn sys_fb_present_rect(ptr: u64, x: u64, y: u64, packed_size: u64) -> u64 {
+    let width = (packed_size >> 32) as u32;
+    let height = packed_size as u32;
+    if width == 0 || height == 0 || width > 1920 || height > 128 { return SYSCALL_ERROR; }
+    let Some(phys) = resolve_user_buffer(ptr, width as u64 * height as u64 * 4) else { return SYSCALL_ERROR };
+    let pixels = unsafe { core::slice::from_raw_parts(phys as *const u32, (width * height) as usize) };
+    if crate::fb::present_rect_pixels(x as u32, y as u32, width, height, pixels) { 0 } else { SYSCALL_ERROR }
 }
 
 fn sys_win_focus(pid: u64) -> u64 {
@@ -495,6 +503,7 @@ extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: 
         SYS_GETPID => crate::task::current_pid() as u64,
         SYS_WIN_FOCUS => sys_win_focus(arg1),
         SYS_SHELL_EXEC => sys_shell_exec(arg1, arg2, arg3, arg4),
+        SYS_FB_PRESENT_RECT => sys_fb_present_rect(arg1, arg2, arg3, arg4),
         _ => SYSCALL_ERROR,
     }
 }

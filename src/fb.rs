@@ -125,6 +125,22 @@ pub fn present_pixels(pixels: &[u32]) -> bool {
     true
 }
 
+pub fn present_rect_pixels(x: u32, y: u32, width: u32, height: u32, pixels: &[u32]) -> bool {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else { return false };
+    if x.checked_add(width).is_none() || y.checked_add(height).is_none()
+        || x + width > state.width || y + height > state.height
+        || pixels.len() != (width * height) as usize { return false; }
+    for row in 0..height as usize {
+        let dst = (y as usize + row) * state.width as usize + x as usize;
+        let src = row * width as usize;
+        state.back_buffer[dst..dst + width as usize].copy_from_slice(&pixels[src..src + width as usize]);
+    }
+    drop(guard);
+    present();
+    true
+}
+
 /// Lock-free, back-buffer-free pixel write straight to MMIO. Only safe to
 /// call from the panic handler, where nothing else can be concurrently
 /// touching the framebuffer.
