@@ -31,10 +31,17 @@ const MINIMIZE_BUTTON_SIZE: u32 = 14;
 const RESIZE_GRIP_SIZE: u32 = 12;
 const MIN_COLS: usize = 20;
 const MIN_ROWS: usize = 5;
-const DESKTOP_BG: u32 = 0x00_2B4570;
+const DESKTOP_BG_TOP: u32 = 0x00_3A5680;
+const DESKTOP_BG_BOTTOM: u32 = 0x00_1B2A42;
 const TITLE_FOCUSED: u32 = 0x00_2C5F9E;
 const TITLE_UNFOCUSED: u32 = 0x00_45505C;
+const TITLE_HIGHLIGHT: u32 = 0x00_5B8FD4;
+const WINDOW_BORDER_FOCUSED: u32 = 0x00_7FB2E5;
+const WINDOW_BORDER: u32 = 0x00_223143;
+const WINDOW_SHADOW: u32 = 0x00_121D28;
+const WINDOW_SHADOW_OFFSET: u32 = 6;
 const TASKBAR_BG: u32 = 0x00_15202B;
+const TASKBAR_TOP_LINE: u32 = 0x00_3E5878;
 const TASKBAR_BUTTON_FOCUSED: u32 = 0x00_3C6EA8;
 const TASKBAR_BUTTON: u32 = 0x00_263340;
 const TASKBAR_BUTTON_MINIMIZED: u32 = 0x00_18222C;
@@ -370,6 +377,9 @@ impl WindowManager {
 
     fn draw_launcher(&self, surface: &mut dyn Surface) {
         let (px, py, pw, ph) = self.launcher_popup_rect();
+        let bx = (px - 1).max(0) as u32;
+        let by = (py - 1).max(0) as u32;
+        gfx::fill_rect(surface, bx, by, pw + 2, ph + 2, WINDOW_BORDER_FOCUSED);
         gfx::fill_rect(surface, px as u32, py as u32, pw, ph, LAUNCHER_BG);
         for (i, (label, _)) in self.launcher_items.iter().enumerate() {
             let iy = py as u32 + 4 + i as u32 * LAUNCHER_ITEM_HEIGHT;
@@ -576,7 +586,7 @@ impl WindowManager {
 
     pub fn composite(&self) {
         fb::with_surface(|surface| {
-            gfx::fill_rect(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG);
+            gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM);
             for (i, window) in self.windows.iter().enumerate() {
                 if window.open && !window.minimized {
                     draw_window(surface, window, i == self.focused);
@@ -594,6 +604,7 @@ impl WindowManager {
     fn draw_taskbar(&self, surface: &mut dyn Surface) {
         let y = self.screen_h - TASKBAR_HEIGHT;
         gfx::fill_rect(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, TASKBAR_BG);
+        gfx::fill_rect(surface, 0, y, self.screen_w, 1, TASKBAR_TOP_LINE);
 
         let start_color = if self.launcher_open { TASKBAR_BUTTON_FOCUSED } else { START_BUTTON_BG };
         gfx::fill_rect(surface, 8, y + 4, START_BUTTON_WIDTH, TASKBAR_HEIGHT - 8, start_color);
@@ -811,9 +822,21 @@ fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool) {
     let (content_w, content_h) = window.content_size();
     let x = window.x as u32;
     let y = window.y as u32;
+    let total_h = TITLE_BAR_HEIGHT + content_h;
+
+    // Drop shadow first, so the window itself paints over the part that
+    // overlaps it; then a 1px border frame just outside the window edge.
+    gfx::fill_rect(surface, x + WINDOW_SHADOW_OFFSET, y + WINDOW_SHADOW_OFFSET, content_w, total_h, WINDOW_SHADOW);
+    let border_color = if focused { WINDOW_BORDER_FOCUSED } else { WINDOW_BORDER };
+    let bx = x.saturating_sub(1);
+    let by = y.saturating_sub(1);
+    gfx::fill_rect(surface, bx, by, content_w + 2, total_h + 2, border_color);
 
     let title_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
     gfx::fill_rect(surface, x, y, content_w, TITLE_BAR_HEIGHT, title_color);
+    if focused {
+        gfx::fill_rect(surface, x, y, content_w, 1, TITLE_HIGHLIGHT);
+    }
     gfx::draw_string(surface, x + 4, y + 6, window.title, 0x00_FFFFFF, None);
 
     let close_x = x + content_w - CLOSE_BUTTON_SIZE - 3;

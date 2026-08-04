@@ -21,6 +21,27 @@ pub fn fill_rect(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32, colo
     }
 }
 
+/// Same as `fill_rect`, but interpolates linearly from `top` to `bottom`
+/// (each 0x00RRGGBB) one scanline at a time, for a soft vertical gradient
+/// instead of a flat fill.
+pub fn fill_rect_gradient_v(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32, top: u32, bottom: u32) {
+    if h == 0 {
+        return;
+    }
+    let denom = (h - 1).max(1) as i32;
+    let channel = |c: u32, shift: u32| ((c >> shift) & 0xFF) as i32;
+    for row in 0..h {
+        let mut color = 0u32;
+        for shift in [16u32, 8, 0] {
+            let a = channel(top, shift);
+            let b = channel(bottom, shift);
+            let v = a + (b - a) * row as i32 / denom;
+            color |= (v as u32 & 0xFF) << shift;
+        }
+        fill_rect(surface, x, y + row, w, 1, color);
+    }
+}
+
 pub fn draw_char(surface: &mut dyn Surface, x: u32, y: u32, ch: u8, fg: u32, bg: Option<u32>) {
     let glyph = font::glyph(ch);
     for (row, bits) in glyph.iter().enumerate() {
