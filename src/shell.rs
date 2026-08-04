@@ -108,7 +108,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "run",
+    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "run", "runlinux",
 ];
 
 pub fn run() -> ! {
@@ -310,6 +310,7 @@ pub fn execute(line: &str) {
         "mkdir" => cmd_mkdir(&args),
         "rm" => cmd_rm(&args),
         "run" => cmd_run(&args),
+        "runlinux" => cmd_runlinux(&args),
         "cd" => cmd_cd(&args),
         "pwd" => println!("{}", cwd()),
         "whoami" => println!("{}", crate::users::USER),
@@ -345,6 +346,8 @@ fn cmd_help() {
     println!("  mkdir <path> create a directory");
     println!("  rm <path>   remove a file or empty directory");
     println!("  run <path>  load and run an ELF program as a process");
+    println!("  runlinux <path> [args...]");
+    println!("               load and run a Linux ELF binary (Linux ABI, see linux_abi.rs)");
     println!("  cd [path]   change directory (default: home, .. goes up)");
     println!("  pwd         print the current directory");
     println!("  whoami      print the current user");
@@ -494,6 +497,40 @@ fn cmd_run(args: &[&str]) {
             Err(e) => println!("run: {}: {}", path, e),
         },
         Err(e) => println!("run: {}: {}", path, e),
+    }
+}
+
+/// Like `cmd_run`, but for a Linux binary: loads the ELF from disk and
+/// spawns it via `process::spawn_linux` (Linux-style argv/envp/auxv
+/// stack, syscalls routed through `linux_abi.rs`) instead of the native
+/// ABI's `process::spawn`. `argv[0]` is the path as given (matching what
+/// a real shell passes); any further words become `argv[1..]`.
+fn cmd_runlinux(args: &[&str]) {
+    let Some(&path) = args.first() else {
+        println!("usage: runlinux <path> [args...]");
+        return;
+    };
+    let abs = abs_path(path);
+    match fat::read_file(&abs) {
+        Ok(elf) => {
+            let mut argv = alloc::vec![path];
+            argv.extend_from_slice(&args[1..]);
+            match process::spawn_linux(&elf, "app", &argv, &["PATH=/bin"]) {
+                Ok(pid) => {
+                    println!("spawned Linux process {} from {} ({} byte ELF)", pid, abs, elf.len());
+                    match process::wait(pid, 500) {
+                        Some(info) => {
+                            println!("process {} {}", pid, process::describe_exit(&info));
+                            process::reap(pid);
+                            println!("process {} reaped", pid);
+                        }
+                        None => println!("process {} did not exit within 5s", pid),
+                    }
+                }
+                Err(e) => println!("runlinux: {}: {}", abs, e),
+            }
+        }
+        Err(e) => println!("runlinux: {}: {}", abs, e),
     }
 }
 
@@ -1059,6 +1096,27 @@ pub fn selftest() -> ! {
         println!("[OK] all process frames returned to the PMM");
     } else {
         println!("[WARN] free frames changed across process tests: {} -> {}", frames_before, frames_after);
+    }
+
+    // Process management, part 5: a real Linux binary, if one happens to
+    // be on the disk (`make disk-linux`, see the Makefile — not part of
+    // the plain `disk` target `make test` itself uses, so this quietly
+    // skips rather than needing network access for the normal build).
+    // BusyBox's `echo` applet exercises the Linux ABI layer end to end:
+    // real musl _start (brk/arch_prctl/mmap during startup), argv
+    // dispatch, and a real write(1, ...) syscall — not just a MachaOS-
+    // native test program that happens to use Linux syscall numbers.
+    match fat::read_file("/bin/busybox.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "busybox", &["busybox", "echo", "hello-from-busybox"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("busybox spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(process::ExitInfo::Normal) => println!("[OK] real busybox binary (echo applet) exited normally"),
+                other => selftest_fail(&format!("busybox gave unexpected exit: {:?}", other)),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/busybox.elf not present (run `make disk-linux` to fetch it)"),
     }
 
     // Ring 3 round trip: run a hand-assembled user-mode program (mapped

@@ -13,8 +13,15 @@ WALLPAPER := target/wallpaper.raw
 WALLPAPER_W := 1920
 WALLPAPER_H := 1080
 TEST_LOG := /tmp/machaos-selftest.log
+# A real static-musl x86_64 Linux binary (BusyBox), fetched on demand
+# rather than checked in, for testing the Linux ABI layer (linux_abi.rs)
+# against something that wasn't hand-built for MachaOS. Not needed for
+# `build`/`test` (those cover the native ABI and the Phase 1/2 test
+# programs) — only for `runlinux`-style manual runs against a real binary.
+BUSYBOX := target/busybox
+BUSYBOX_URL := https://www.busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
 
-.PHONY: all build gen user iso disk wallpaper run run-nographic test clean
+.PHONY: all build gen user iso disk disk-linux wallpaper run run-nographic run-linux test clean busybox
 
 all: build
 
@@ -79,6 +86,19 @@ disk: wallpaper
 	mcopy -i $(DISK) $(WALLPAPER) ::/system/wallpaper.raw
 	rm -f target/fixture.txt target/fixture2.txt
 	rm -f target/system-readme.txt target/desktop-welcome.txt
+
+$(BUSYBOX):
+	curl -sL $(BUSYBOX_URL) -o $(BUSYBOX)
+	chmod +x $(BUSYBOX)
+
+busybox: $(BUSYBOX)
+
+# Copies BusyBox onto an already-built disk image, for a manual
+# `runlinux /bin/busybox.elf ...` smoke test of the Linux ABI layer
+# against a real binary. Kept separate from `disk` so the automated
+# `make test` selftest suite never needs network access.
+disk-linux: disk $(BUSYBOX)
+	mcopy -i $(DISK) $(BUSYBOX) ::/bin/busybox.elf
 
 run: iso disk
 	$(QEMU) -m 256 -cdrom $(ISO) -boot d -drive file=$(DISK),format=raw -serial stdio
