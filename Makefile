@@ -39,6 +39,7 @@ user:
 	cp user/target/x86_64-unknown-none/release/prog_stack target/user-stack.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_stack target/user-linux-stack.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_syscall target/user-linux-syscall.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_phase3 target/user-linux-phase3.elf
 
 build: gen user
 	cargo build --release

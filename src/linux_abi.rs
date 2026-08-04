@@ -15,7 +15,13 @@
 //! file-backed mapping support), that argument was never going to be
 //! used anyway.
 //!
-//! KNOWN GAPS left for Phase 3/4:
+//! Phase 3 adds the handful of extra syscalls a static**glibc** binary's
+//! startup wants beyond musl's smaller set: `futex` (glibc's malloc/loader
+//! locks take this path even single-threaded, at least once, to acquire
+//! an uncontended lock), `rseq` (glibc probes for it and falls back
+//! cleanly if it's refused), `prlimit64`, `sched_getaffinity`, `sysinfo`.
+//!
+//! KNOWN GAPS left for Phase 4 (and beyond):
 //! - No signal delivery: `rt_sigaction`/`rt_sigprocmask` just record
 //!   nothing and return success.
 //! - `mmap`/`openat` treat every request as anonymous/regular-file; no
@@ -23,7 +29,10 @@
 //! - `munmap` only reclaims a mapping it fully contains (see
 //!   `process::Process::munmap`); `mprotect` only ever grants/revokes
 //!   write access (no NX enforcement — `paging.rs` has none yet).
-//! - `futex`/`clone`/threading aren't implemented at all (Phase 3).
+//! - `futex` never actually blocks or wakes anything (see `sys_futex`'s
+//!   doc comment) — fine for the single-threaded, uncontended-lock case
+//!   glibc's own startup hits, but `clone`/real threading aren't
+//!   implemented at all, so this is the extent of it for now.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -41,6 +50,7 @@ const ENOTTY: i32 = 25;
 const ESPIPE: i32 = 29;
 const ENOSYS: i32 = 38;
 const ENOENT: i32 = 2;
+const EAGAIN: i32 = 11;
 const EIO: i32 = 5;
 const ENOMEM: i32 = 12;
 
@@ -76,9 +86,12 @@ const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
+const SYS_SYSINFO: u64 = 99;
 const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
 const SYS_UNAME: u64 = 63;
+const SYS_SCHED_GETAFFINITY: u64 = 204;
+const SYS_FUTEX: u64 = 202;
 const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_SET_TID_ADDRESS: u64 = 218;
 const SYS_CLOCK_GETTIME: u64 = 228;
@@ -86,7 +99,9 @@ pub const SYS_EXIT_GROUP: u64 = 231;
 const SYS_OPENAT: u64 = 257;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
+const SYS_RSEQ: u64 = 334;
 
 // ---- helpers ------------------------------------------------------------
 
@@ -436,6 +451,105 @@ fn sys_clock_gettime(_clockid: u64, ts: u64) -> u64 {
     0
 }
 
+// ---- Phase 3: extra syscalls a static glibc binary's startup wants ----
+
+const FUTEX_WAIT: u64 = 0;
+const FUTEX_WAKE: u64 = 1;
+const FUTEX_CMD_MASK: u64 = !128; // clears FUTEX_PRIVATE_FLAG
+
+/// This kernel has no threading (`clone` isn't implemented) and is
+/// single-CPU, so nothing else could ever be running concurrently to
+/// either contend for or wake a futex — glibc's malloc arena lock and
+/// similar internal locks still take this path once at startup even
+/// single-threaded, just always uncontended. `FUTEX_WAIT` therefore
+/// either finds the lock already free (the value at `uaddr` no longer
+/// matches `val`, meaning whoever held it already released it — return
+/// success immediately rather than actually blocking, since there's
+/// nothing that could ever wake a real block) or matches (genuinely
+/// uncontended acquisition; real futex would still block waiting for a
+/// wake that, again, can never come here — return success as if a
+/// spurious wake happened, which is always a legal futex outcome).
+/// `FUTEX_WAKE` has no real waiters to wake and just reports zero.
+fn sys_futex(uaddr: u64, futex_op: u64, val: u64, _val2_or_timeout: u64) -> u64 {
+    match futex_op & FUTEX_CMD_MASK {
+        FUTEX_WAIT => {
+            let Some(phys) = resolve(uaddr, 4) else {
+                return err(EFAULT);
+            };
+            let current = unsafe { core::ptr::read(phys as *const u32) };
+            if current as u64 == (val & 0xFFFF_FFFF) {
+                0
+            } else {
+                err(EAGAIN)
+            }
+        }
+        FUTEX_WAKE => 0,
+        _ => err(ENOSYS),
+    }
+}
+
+/// Always refuses (matches a kernel that doesn't support `rseq`): glibc
+/// probes for it once at startup and falls back to its non-rseq path
+/// cleanly when this fails, the same as running on an old real kernel.
+fn sys_rseq(_rseq: u64, _rseq_len: u64, _flags: u64, _sig: u64) -> u64 {
+    err(EINVAL)
+}
+
+const RLIM_INFINITY: u64 = u64::MAX;
+
+/// Reports every resource limit as unlimited — this kernel doesn't track
+/// or enforce per-process limits at all, so "unlimited" is the only
+/// answer that can't be wrong in a way a caller would notice.
+fn sys_prlimit64(_pid: u64, _resource: u64, _new_limit: u64, old_limit: u64) -> u64 {
+    if old_limit != 0 {
+        let Some(phys) = resolve(old_limit, 16) else {
+            return err(EFAULT);
+        };
+        unsafe {
+            core::ptr::write_unaligned(phys as *mut u64, RLIM_INFINITY); // rlim_cur
+            core::ptr::write_unaligned((phys as *mut u8).add(8) as *mut u64, RLIM_INFINITY); // rlim_max
+        }
+    }
+    0
+}
+
+/// Reports a single CPU (bit 0 of the mask), matching this kernel's
+/// single-CPU reality.
+fn sys_sched_getaffinity(_pid: u64, cpusetsize: u64, mask_ptr: u64) -> u64 {
+    let Some(phys) = resolve(mask_ptr, cpusetsize) else {
+        return err(EFAULT);
+    };
+    unsafe {
+        core::ptr::write_bytes(phys as *mut u8, 0, cpusetsize as usize);
+        if cpusetsize >= 1 {
+            core::ptr::write(phys as *mut u8, 1);
+        }
+    }
+    cpusetsize.min(8)
+}
+
+/// `struct sysinfo` (Linux x86_64, 112 bytes including trailing padding —
+/// see <sys/sysinfo.h>). Only uptime/totalram/freeram/mem_unit are filled
+/// in with real values; load averages, swap, and process count stay
+/// zero (this kernel doesn't track any of those).
+fn sys_sysinfo(info_ptr: u64) -> u64 {
+    const SIZE: u64 = 112;
+    let Some(phys) = resolve(info_ptr, SIZE) else {
+        return err(EFAULT);
+    };
+    unsafe {
+        let p = phys as *mut u8;
+        core::ptr::write_bytes(p, 0, SIZE as usize);
+        core::ptr::write_unaligned(p as *mut i64, (crate::interrupts::ticks() / 100) as i64); // uptime
+        let total = (crate::pmm::total_frames() * crate::pmm::FRAME_SIZE) as u64;
+        let free = (crate::pmm::free_frames() * crate::pmm::FRAME_SIZE) as u64;
+        core::ptr::write_unaligned(p.add(32) as *mut u64, total); // totalram
+        core::ptr::write_unaligned(p.add(40) as *mut u64, free); // freeram
+        core::ptr::write_unaligned(p.add(104) as *mut u32, 1); // mem_unit
+    }
+    0
+}
+
 /// Dispatches one Linux-numbered syscall.
 pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, _arg5: u64) -> u64 {
     match num {
@@ -461,6 +575,11 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, _a
         SYS_NEWFSTATAT => sys_newfstatat(arg1, arg2, arg3, arg4),
         SYS_SET_ROBUST_LIST => 0,
         SYS_GETRANDOM => sys_getrandom(arg1, arg2, arg3),
+        SYS_FUTEX => sys_futex(arg1, arg2, arg3, arg4),
+        SYS_RSEQ => sys_rseq(arg1, arg2, arg3, arg4),
+        SYS_PRLIMIT64 => sys_prlimit64(arg1, arg2, arg3, arg4),
+        SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(arg1, arg2, arg3),
+        SYS_SYSINFO => sys_sysinfo(arg1),
         _ => err(ENOSYS),
     }
 }

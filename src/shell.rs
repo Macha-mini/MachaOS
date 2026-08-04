@@ -1028,6 +1028,24 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2e: Phase 3 syscalls (futex/rseq/
+    // prlimit64/sched_getaffinity/sysinfo) a static glibc binary's
+    // startup needs beyond Phase 2's musl-oriented set. No glibc
+    // toolchain was available to build a real test binary against, so
+    // this checks each syscall's documented (simplified — see
+    // linux_abi.rs) behavior directly; 7 checks, one bit each.
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_PHASE3, "linux-phase3", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux Phase 3 syscalls process exited normally"),
+        other => selftest_fail(&format!("linux-phase3 process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0x7F) => println!("[OK] Linux Phase 3: futex/rseq/prlimit64/sched_getaffinity/sysinfo all correct"),
+        other => selftest_fail(&format!("linux-phase3 process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.
