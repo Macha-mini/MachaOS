@@ -93,6 +93,8 @@ pub struct Process {
     /// `wait` loop can observe the mark without an optimizer barrier.
     pub(crate) state: ProcessState,
     pub(crate) exit_info: Option<ExitInfo>,
+    /// Single-slot mailbox for `sys_send`/`sys_recv` (see `task::deliver_message`).
+    pub(crate) inbox: Option<Vec<u8>>,
 }
 
 impl Process {
@@ -127,6 +129,7 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         mappings: Vec::new(),
         state: ProcessState::Running,
         exit_info: None,
+        inbox: None,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -136,11 +139,9 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
             return Err(e);
         }
     };
-    for segment in &program.segments {
-        if let Err(e) = load_segment(&mut process, pml4, segment, elf_bytes) {
-            free_process(process);
-            return Err(e);
-        }
+    if let Err(e) = load_segments(&mut process, pml4, &program.segments, elf_bytes) {
+        free_process(process);
+        return Err(e);
     }
     if let Err(e) = setup_user_stack(&mut process, pml4) {
         free_process(process);
@@ -250,15 +251,42 @@ fn build_address_space(process: &mut Process) -> Result<u64, &'static str> {
 /// Allocates physical pages for one segment, copies its file bytes
 /// (zero-filling BSS), and maps them at the segment's virtual addresses
 /// in the process's address space.
-fn load_segment(
+/// Loads every PT_LOAD segment into one contiguous physical block spanning
+/// their combined page-aligned range, rather than one block per segment.
+///
+/// A single ELF that mixes small `.text`/`.rodata`/`.data` segments (as
+/// rustc/lld output does) routinely has consecutive segments land in the
+/// *same* trailing/leading 4 KiB page — e.g. `.text` ending at 0x3000030
+/// and `.rodata` starting right there in the same page. Handling segments
+/// independently is wrong two ways at once: each would get its own fresh
+/// physical page mapped over the *same* virtual page (the later segment's
+/// `map_range_in` call silently replaces the earlier one's page-table
+/// entry, orphaning its frame), and each copies its file bytes to offset
+/// 0 of *its own* page rather than to the segment's actual offset within
+/// the shared page — so the earlier segment's bytes are simply never
+/// where they need to be. Loading the whole span as one block sidesteps
+/// both: there is only one frame per virtual page, and every segment
+/// copies to its own precise offset within it.
+///
+/// This does allocate physical memory for any gap *between* segments too
+/// (e.g. alignment padding), which is fine at the scale these programs
+/// run at; a loader for larger binaries would want to map each segment's
+/// own pages and only share frames at an explicitly-detected boundary.
+fn load_segments(
     process: &mut Process,
     pml4: u64,
-    segment: &elf::Segment,
+    segments: &[elf::Segment],
     data: &[u8],
 ) -> Result<(), &'static str> {
-    let start = segment.vaddr & !(paging::PAGE_SIZE - 1);
-    let end = align_up(segment.vaddr + segment.memsz, paging::PAGE_SIZE);
-    let len = end - start;
+    let Some(overall_start) = segments.iter().map(|s| s.vaddr & !(paging::PAGE_SIZE - 1)).min() else {
+        return Ok(()); // no segments (rejected earlier by elf::parse, but harmless)
+    };
+    let overall_end = segments
+        .iter()
+        .map(|s| align_up(s.vaddr + s.memsz, paging::PAGE_SIZE))
+        .max()
+        .unwrap();
+    let len = overall_end - overall_start;
     let pages = (len / paging::PAGE_SIZE) as usize;
 
     let phys = pmm::alloc_contiguous(pages).ok_or("out of memory")?;
@@ -267,26 +295,26 @@ fn load_segment(
     }
 
     let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
-    if segment.writable {
+    if segments.iter().any(|s| s.writable) {
         flags |= paging::PAGE_WRITABLE;
     }
-    if !paging::map_range_in(pml4, start, phys as u64, len, flags, &mut process.frames) {
+    if !paging::map_range_in(pml4, overall_start, phys as u64, len, flags, &mut process.frames) {
         return Err("failed to map segment");
     }
 
     unsafe {
-        // Zero the whole segment first, then copy the file bytes in.
         core::ptr::write_bytes(phys as *mut u8, 0, len as usize);
-        let file_offset = segment.file_offset as usize;
-        let file_len = segment.filesz as usize;
-        if file_len > 0 {
-            let dst = phys as usize;
-            let src = data.as_ptr().add(file_offset);
-            core::ptr::copy_nonoverlapping(src, dst as *mut u8, file_len);
+        for segment in segments {
+            if segment.filesz == 0 {
+                continue;
+            }
+            let dst = phys as usize + (segment.vaddr - overall_start) as usize;
+            let src = data.as_ptr().add(segment.file_offset as usize);
+            core::ptr::copy_nonoverlapping(src, dst as *mut u8, segment.filesz as usize);
         }
     }
     process.mappings.push(Mapping {
-        vaddr: start,
+        vaddr: overall_start,
         phys: phys as u64,
         len,
     });
@@ -323,6 +351,16 @@ fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str
     ) {
         return Err("failed to map user stack");
     }
+    // Without this, `process::translate` (which every syscall pointer
+    // argument goes through — see resolve_user_buffer in syscall.rs) has
+    // no record of the stack at all, so a process passing a pointer to
+    // one of its own stack-local buffers to e.g. sys_recv would always be
+    // rejected as if it were an invalid pointer.
+    process.mappings.push(Mapping {
+        vaddr: USER_STACK_BASE,
+        phys: stack_phys as u64,
+        len: stack_len,
+    });
 
     let stub_phys = alloc_frame(process)?;
     unsafe {
@@ -343,6 +381,11 @@ fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str
     ) {
         return Err("failed to map exit trampoline");
     }
+    process.mappings.push(Mapping {
+        vaddr: USER_EXIT_STUB_VIRT,
+        phys: stub_phys as u64,
+        len: paging::PAGE_SIZE,
+    });
 
     // One return-address slot at the top of the stack. Written through
     // the frame's kernel-identity address: the process's own PML4 (where
@@ -420,15 +463,13 @@ pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
 /// fault does, rather than taking down the kernel.
 pub fn kill_current_exception(vector: u8, frame: &mut interrupts::InterruptFrame) {
     task::mark_current_exited(ExitInfo::Exception { vector });
+    let rip = frame.rip;
     redirect_to_exit(frame);
 
-    let mut buf = [0u8; 128];
+    let mut buf = [0u8; 96];
     let message = io::sprint(
         &mut buf,
-        format_args!(
-            "[PROC] killed by exception vector {} (error {:#x})\n",
-            vector, frame.error_code
-        ),
+        format_args!("[PROC] killed by exception vector {} at rip={:#x}\n", vector, rip),
     );
     io::exception_print(message);
 }
@@ -466,12 +507,31 @@ fn free_process(process: Process) {
 /// Reads the u64 the process stored in its `.result` page (only valid
 /// after the process exited; call before `reap`).
 pub fn read_result(pid: usize) -> Option<u64> {
+    let phys = translate(pid, PROC_RESULT_VIRT, 8)?;
+    Some(unsafe { core::ptr::read_volatile(phys as *const u64) })
+}
+
+/// Translates `[vaddr, vaddr+len)` in `pid`'s address space to a physical
+/// address, only if the whole range is covered by one of its mappings
+/// (segments, stack, or exit trampoline — never the deep-copied kernel
+/// region, which isn't in `mappings`). Used both for `read_result` and by
+/// `syscall.rs` to validate every pointer a syscall receives from
+/// ring-3 code before the kernel reads or writes through it: without
+/// this, a process could pass a pointer into its own copy of the kernel's
+/// map and have the kernel read/corrupt arbitrary kernel memory on its
+/// behalf.
+pub fn translate(pid: usize, vaddr: u64, len: u64) -> Option<u64> {
+    let end = vaddr.checked_add(len)?;
     let mappings = task::process_mappings(pid)?;
-    let mapping = mappings
-        .iter()
-        .find(|m| m.vaddr <= PROC_RESULT_VIRT && PROC_RESULT_VIRT < m.vaddr + m.len)?;
-    let offset = (PROC_RESULT_VIRT - mapping.vaddr) as usize;
-    Some(unsafe { core::ptr::read_volatile((mapping.phys as usize + offset) as *const u64) })
+    let mapping = mappings.iter().find(|m| m.vaddr <= vaddr && end <= m.vaddr + m.len)?;
+    Some(mapping.phys + (vaddr - mapping.vaddr))
+}
+
+/// Delivers a message to `pid`'s inbox from kernel context (as opposed to
+/// `sys_send`, which delivers from another process). Used to hand a
+/// process its first message before it starts running.
+pub fn send_from_kernel(pid: usize, bytes: &[u8]) -> bool {
+    task::deliver_message(pid, bytes)
 }
 
 /// Human-readable description of an exit reason.

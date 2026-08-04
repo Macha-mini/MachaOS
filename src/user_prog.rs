@@ -4,3 +4,5 @@
 
 pub static PROG_EXIT: &[u8] = include_bytes!("../target/user-exit.elf");
 pub static PROG_FAULT: &[u8] = include_bytes!("../target/user-fault.elf");
+pub static PROG_SYSCALL: &[u8] = include_bytes!("../target/user-syscall.elf");
+pub static PROG_IPC: &[u8] = include_bytes!("../target/user-ipc.elf");

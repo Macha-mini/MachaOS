@@ -274,6 +274,11 @@ pub fn current_is_process() -> bool {
         .is_some_and(|task| task.process.is_some())
 }
 
+/// Index of the currently running task ("pid" for a process).
+pub fn current_pid() -> usize {
+    CURRENT.load(Ordering::Relaxed)
+}
+
 /// ELF entry address of the current task (only valid for processes).
 pub fn current_process_entry() -> usize {
     tasks()[CURRENT.load(Ordering::Relaxed)]
@@ -336,6 +341,34 @@ pub fn process_mappings(pid: usize) -> Option<&'static [crate::process::Mapping]
     tasks()
         .get(pid)
         .and_then(|task| task.process.as_ref().map(|p| p.mappings.as_slice()))
+}
+
+/// Delivers `bytes` to `pid`'s single-message inbox (a mailbox, not a
+/// queue: a second delivery before the first is read overwrites it).
+/// Returns false if `pid` isn't a running process. Safe to call from
+/// syscall context: interrupts are already disabled there for the whole
+/// non-blocking, non-reentrant duration (see syscall.rs's module docs),
+/// which is the same precondition `push_task`/`remove_process` rely on.
+pub fn deliver_message(pid: usize, bytes: &[u8]) -> bool {
+    let Some(task) = tasks_mut().get_mut(pid) else {
+        return false;
+    };
+    let Some(process) = task.process.as_mut() else {
+        return false;
+    };
+    if process.is_exited() {
+        return false;
+    }
+    process.inbox = Some(bytes.to_vec());
+    true
+}
+
+/// Takes (clearing) the current task's pending message, if any.
+pub fn take_current_message() -> Option<alloc::vec::Vec<u8>> {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_mut()
+        .and_then(|process| process.inbox.take())
 }
 
 /// Marks the current task's process as exited. Keeps the first exit info

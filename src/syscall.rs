@@ -35,9 +35,17 @@ const EFER_SCE: u64 = 1 << 0;
 
 pub(crate) const SYS_WRITE: u64 = 0;
 pub(crate) const SYS_EXIT: u64 = 1;
-// Returned by `syscall_dispatch` to tell the asm stub to unwind back into
-// `enter_usermode`'s caller instead of `sysretq`-ing to user mode.
-const EXIT_SENTINEL: u64 = u64::MAX;
+pub(crate) const SYS_READ: u64 = 2;
+pub(crate) const SYS_CLOCK: u64 = 3;
+pub(crate) const SYS_SEND: u64 = 4;
+pub(crate) const SYS_RECV: u64 = 5;
+// Returned by write/read/send/recv when an argument (fd, or a pointer
+// range the calling process doesn't own) is rejected.
+const SYSCALL_ERROR: u64 = u64::MAX;
+
+const FD_STDIN: u64 = 0;
+const FD_STDOUT: u64 = 1;
+const FD_STDERR: u64 = 2;
 
 unsafe fn rdmsr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
@@ -102,11 +110,27 @@ syscall_entry:
     mov rsp, [rip + SYSCALL_KERNEL_RSP]
     push rcx
     push r11
+    # SYS_EXIT (1) is checked here, before rax (the syscall number) gets
+    # shuffled into an argument register below, and handled without ever
+    # calling syscall_dispatch: unlike every other syscall it never
+    # returns to user mode, so its "return value" can't just be a normal
+    # sentinel returned from dispatch (that would collide with a genuine
+    # error return, e.g. -1 from a bad sys_write fd).
+    cmp rax, 1
+    je .Lsyscall_exit
+
+    # SysV syscall args arrive in rdi/rsi/rdx/r10/r8/r9 (r10 instead of
+    # rcx, which `syscall` clobbers); shuffle num+4 args into the rdi..r8
+    # slots `extern "C" fn syscall_dispatch` expects. r11 is free to use
+    # as scratch here — its user value is already saved on the stack above.
+    mov r11, rdx
+    mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
+    mov rcx, r11
+    mov r8, r10
     call syscall_dispatch
-    cmp rax, -1
-    je .Lsyscall_exit
+
     pop r11
     pop rcx
     mov rsp, [rip + SAVED_USER_RSP]
@@ -176,16 +200,109 @@ pub fn write_count() -> u64 {
     WRITE_COUNT.load(Ordering::Relaxed)
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(num: u64, arg0: u64) -> u64 {
-    match num {
-        SYS_WRITE => {
-            crate::io::print(core::format_args!("{}", arg0 as u8 as char));
-            WRITE_COUNT.fetch_add(1, Ordering::Relaxed);
-            0
+/// Validates that `[ptr, ptr+len)` belongs to the calling task and
+/// returns its physical (kernel-identity) address. For a process this
+/// must land entirely inside one of its own mappings (segments, stack, or
+/// exit trampoline — see `process::translate`); a pointer into the
+/// process's *deep-copied view of kernel memory* is not in `mappings` and
+/// so is rejected. Without this check a process could pass a pointer at
+/// its own copy of the kernel heap and have the kernel read or overwrite
+/// arbitrary kernel memory on its behalf via a syscall. `run_demo` is the
+/// only caller that isn't a process; its pointers are already kernel
+/// addresses the kernel mapped itself, so those are trusted as-is.
+fn resolve_user_buffer(ptr: u64, len: u64) -> Option<u64> {
+    if crate::task::current_is_process() {
+        crate::process::translate(crate::task::current_pid(), ptr, len)
+    } else if paging::is_identity_mapped(ptr, len) {
+        Some(ptr)
+    } else {
+        None
+    }
+}
+
+fn sys_write(fd: u64, ptr: u64, len: u64) -> u64 {
+    if fd != FD_STDOUT && fd != FD_STDERR {
+        return SYSCALL_ERROR;
+    }
+    let Some(phys) = resolve_user_buffer(ptr, len) else {
+        return SYSCALL_ERROR;
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
+    for &byte in bytes {
+        crate::io::print(core::format_args!("{}", byte as char));
+    }
+    WRITE_COUNT.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    bytes.len() as u64
+}
+
+/// Drains whatever's already queued from the keyboard into `buf`, up to
+/// `len` bytes. Never blocks: with 0 bytes pending this returns 0
+/// immediately rather than waiting, since a real wait would need the
+/// syscall handler to be preemptible (it currently isn't — see the module
+/// docs on `SYSCALL_KERNEL_RSP`).
+fn sys_read(fd: u64, ptr: u64, len: u64) -> u64 {
+    if fd != FD_STDIN {
+        return SYSCALL_ERROR;
+    }
+    let Some(phys) = resolve_user_buffer(ptr, len) else {
+        return SYSCALL_ERROR;
+    };
+    let buf = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, len as usize) };
+    let mut n = 0usize;
+    while n < buf.len() {
+        match crate::keyboard::next_event() {
+            Some(crate::keyboard::Event::Char(c)) => {
+                buf[n] = c as u8;
+                n += 1;
+            }
+            Some(_) => {} // arrows, Ctrl+letter, etc. — dropped for this minimal syscall
+            None => break,
         }
-        SYS_EXIT => EXIT_SENTINEL,
-        _ => 0,
+    }
+    n as u64
+}
+
+/// Delivers `[ptr, ptr+len)` (from the *sender's* address space) to
+/// `dest_pid`'s single-message inbox. See `task::deliver_message`: a
+/// second `send` before the target reads the first overwrites it.
+fn sys_send(dest_pid: u64, ptr: u64, len: u64) -> u64 {
+    let Some(phys) = resolve_user_buffer(ptr, len) else {
+        return SYSCALL_ERROR;
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
+    if crate::task::deliver_message(dest_pid as usize, bytes) {
+        0
+    } else {
+        SYSCALL_ERROR
+    }
+}
+
+/// Takes the calling process's pending message, if any, copying up to
+/// `maxlen` bytes into its buffer. Never blocks: with nothing pending
+/// this returns 0 immediately (same reasoning as `sys_read`).
+fn sys_recv(ptr: u64, maxlen: u64) -> u64 {
+    let Some(phys) = resolve_user_buffer(ptr, maxlen) else {
+        return SYSCALL_ERROR;
+    };
+    let Some(message) = crate::task::take_current_message() else {
+        return 0;
+    };
+    let n = message.len().min(maxlen as usize);
+    unsafe {
+        core::ptr::copy_nonoverlapping(message.as_ptr(), phys as *mut u8, n);
+    }
+    n as u64
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, _arg4: u64) -> u64 {
+    match num {
+        SYS_WRITE => sys_write(arg1, arg2, arg3),
+        SYS_READ => sys_read(arg1, arg2, arg3),
+        SYS_CLOCK => crate::interrupts::ticks(),
+        SYS_SEND => sys_send(arg1, arg2, arg3),
+        SYS_RECV => sys_recv(arg1, arg2),
+        _ => SYSCALL_ERROR,
     }
 }
 
@@ -195,6 +312,9 @@ pub fn init() {
     // GDT layout change can't silently desync the two.
     debug_assert_eq!(crate::gdt::USER_DATA | 3, 0x33);
     debug_assert_eq!(crate::gdt::USER_CODE | 3, 0x3B);
+    // `syscall_entry` hardcodes `cmp rax, 1` to special-case SYS_EXIT
+    // before it's even dispatched (see the asm comment above).
+    debug_assert_eq!(SYS_EXIT, 1);
 
     unsafe {
         let top = core::ptr::addr_of_mut!(SYSCALL_STACK) as usize + SYSCALL_STACK_SIZE;
@@ -216,31 +336,40 @@ pub fn init() {
     }
 }
 
-/// Hand-assembles a tiny ring-3 program that prints `message` one syscall
-/// at a time and then exits, runs it, and blocks until it does. Proves the
-/// ring 3 <-> ring 0 round trip (GDT selectors, SYSCALL/SYSRET, iretq) end
-/// to end without needing an ELF loader or process table.
+/// Hand-assembles a tiny ring-3 program that writes `message` to stdout in
+/// one sys_write call and then exits, runs it, and blocks until it does.
+/// Proves the ring 3 <-> ring 0 round trip (GDT selectors, SYSCALL/SYSRET,
+/// iretq, multi-argument syscalls) end to end without needing an ELF
+/// loader or process table.
 pub fn run_demo(message: &[u8]) {
     let code_frame = pmm::frame_alloc().expect("usermode demo: code frame");
     let stack_frame = pmm::frame_alloc().expect("usermode demo: stack frame");
 
-    let mut program = Vec::new();
-    for &byte in message {
-        program.push(0xB8); // mov eax, imm32
-        program.extend_from_slice(&(SYS_WRITE as u32).to_le_bytes());
-        program.push(0xBF); // mov edi, imm32
-        program.extend_from_slice(&(byte as u32).to_le_bytes());
-        program.push(0x0F); // syscall
-        program.push(0x05);
-    }
-    program.push(0xB8); // mov eax, SYS_EXIT
-    program.extend_from_slice(&(SYS_EXIT as u32).to_le_bytes());
-    program.push(0xBF); // mov edi, 0
-    program.extend_from_slice(&0u32.to_le_bytes());
-    program.push(0x0F); // syscall
-    program.push(0x05);
-    program.push(0xEB); // jmp $ (safety net; sys_exit never returns)
-    program.push(0xFE);
+    // Fixed instruction length so the message (appended right after) has a
+    // known, computable address: mov eax/edi/esi/edx (5 bytes each) +
+    // syscall (2) + mov eax/edi (5 each) + syscall (2) + jmp $ (2).
+    const INSTR_LEN: u32 = 5 * 4 + 2 + 5 * 2 + 2 + 2;
+    let message_addr = code_frame as u32 + INSTR_LEN;
+
+    let mut program = Vec::with_capacity(INSTR_LEN as usize + message.len());
+    let mov_imm32 = |program: &mut Vec<u8>, opcode: u8, value: u32| {
+        program.push(opcode);
+        program.extend_from_slice(&value.to_le_bytes());
+    };
+    mov_imm32(&mut program, 0xB8, SYS_WRITE as u32); // mov eax, SYS_WRITE
+    mov_imm32(&mut program, 0xBF, FD_STDOUT as u32); // mov edi, FD_STDOUT
+    mov_imm32(&mut program, 0xBE, message_addr); // mov esi, <message addr>
+    mov_imm32(&mut program, 0xBA, message.len() as u32); // mov edx, <len>
+    program.push(0x0F);
+    program.push(0x05); // syscall
+    mov_imm32(&mut program, 0xB8, SYS_EXIT as u32); // mov eax, SYS_EXIT
+    mov_imm32(&mut program, 0xBF, 0); // mov edi, 0
+    program.push(0x0F);
+    program.push(0x05); // syscall
+    program.push(0xEB);
+    program.push(0xFE); // jmp $ (safety net; sys_exit never returns)
+    debug_assert_eq!(program.len(), INSTR_LEN as usize);
+    program.extend_from_slice(message);
 
     assert!(program.len() <= paging::PAGE_SIZE as usize, "usermode demo program too big");
 

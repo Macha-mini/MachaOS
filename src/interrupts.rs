@@ -79,7 +79,7 @@ fn exception(name: &str, frame: &mut InterruptFrame) -> ! {
     halt_forever()
 }
 
-fn dump_registers(frame: &InterruptFrame) {
+pub(crate) fn dump_registers(frame: &InterruptFrame) {
     let mut buf = [0u8; 512];
     let text = io::sprint(
         &mut buf,

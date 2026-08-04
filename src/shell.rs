@@ -901,6 +901,47 @@ pub fn selftest() -> ! {
         Err(e) => selftest_fail(&format!("reading /bin/prog_exit.elf failed: {e}")),
     }
 
+    // Process management, part 4: real multi-argument syscalls. The
+    // embedded ELF writes a buffer via sys_write(stdout, ptr, len) and
+    // stores the sys_clock return value in its result — nonzero only if
+    // both syscalls actually ran and returned through the normal SYSRET
+    // path (not just the sys_exit unwind the other tests exercise).
+    let pid = crate::process::spawn(crate::user_prog::PROG_SYSCALL, "syscall")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] process syscall test exited normally"),
+        other => selftest_fail(&format!("syscall test process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(ticks) if ticks > 0 => {
+            println!("[OK] process sys_write + sys_clock round trip (clock = {} ticks)", ticks)
+        }
+        other => selftest_fail(&format!("syscall test process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 5: IPC. The kernel delivers a message to
+    // the process's inbox right after spawning it — nothing yields
+    // between `spawn` and `send_from_kernel` here, so it's guaranteed to
+    // land before the process can possibly have run — and the process
+    // reads it back via sys_recv and reports the first byte.
+    let pid = crate::process::spawn(crate::user_prog::PROG_IPC, "ipc")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    if !crate::process::send_from_kernel(pid, b"ping") {
+        selftest_fail("send_from_kernel failed to deliver to a freshly spawned process");
+    }
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] IPC process exited normally"),
+        other => selftest_fail(&format!("IPC process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(n) if n == b'p' as u64 => {
+            println!("[OK] sys_recv delivered the message sent via send_from_kernel")
+        }
+        other => selftest_fail(&format!("IPC process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     let frames_after = crate::pmm::free_frames();
     if frames_after == frames_before {
         println!("[OK] all process frames returned to the PMM");
