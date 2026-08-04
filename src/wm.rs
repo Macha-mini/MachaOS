@@ -4,6 +4,7 @@
 
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
@@ -11,6 +12,7 @@ use core::fmt::Write as _;
 use crate::calculator::CalculatorApp;
 use crate::console::Console;
 use crate::cpuid;
+use crate::fat;
 use crate::fb;
 use crate::font;
 use crate::gfx::{self, Surface};
@@ -42,11 +44,13 @@ const RESIZE_GRIP_COLOR: u32 = 0x00_6E7C8C;
 const CONSOLE_FG: u32 = 0x00_E0E0E0;
 const CONSOLE_BG: u32 = 0x00_10161C;
 const EDITOR_CURSOR_COLOR: u32 = 0x00_FFCC66;
+const EDITOR_STATUS_BG: u32 = 0x00_1A2430;
+const EDITOR_STATUS_FG: u32 = 0x00_8FB8D8;
 
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
-    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize },
+    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String },
     Calculator(CalculatorApp),
 }
 
@@ -135,7 +139,8 @@ impl WindowManager {
         let mut editor_console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
         let editor_lines = vec![String::new()];
         let mut editor_scroll = 0usize;
-        editor_render(&mut editor_console, &editor_lines, 0, 0, &mut editor_scroll);
+        let mut editor_status = String::new();
+        editor_render(&mut editor_console, &editor_lines, 0, 0, &mut editor_scroll, &mut editor_status);
         let (ex, ey) = clamp(margin, margin + 300);
         let editor_window = Window {
             title: "Notepad",
@@ -150,6 +155,7 @@ impl WindowManager {
                 cursor_row: 0,
                 cursor_col: 0,
                 scroll_offset: editor_scroll,
+                status: editor_status,
             },
         };
 
@@ -212,8 +218,8 @@ impl WindowManager {
                 }
                 io::set_console_sink(None);
             }
-            AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset } => {
-                editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, event);
+            AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {
+                editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, event);
             }
             AppKind::SysInfo { .. } | AppKind::Calculator(_) => {}
         }
@@ -439,9 +445,9 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             print!("{}{}", shell::PROMPT, editor.current_line());
             io::set_console_sink(None);
         }
-        AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset } => {
+        AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {
             console.resize(cols, rows);
-            editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset);
+            editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
         }
         AppKind::SysInfo { .. } | AppKind::Calculator(_) => {} // not resizable
     }
@@ -451,15 +457,49 @@ fn byte_index(line: &str, char_index: usize) -> usize {
     line.char_indices().nth(char_index).map(|(i, _)| i).unwrap_or(line.len())
 }
 
+const NOTEPAD_PATH: &str = "/notepad.txt";
+
 fn editor_handle_key(
     console: &mut Console,
     lines: &mut Vec<String>,
     cursor_row: &mut usize,
     cursor_col: &mut usize,
     scroll_offset: &mut usize,
+    status: &mut String,
     event: keyboard::Event,
 ) {
     match event {
+        keyboard::Event::Ctrl('s') => {
+            let mut text = lines.join("\n");
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            match fat::write_file(NOTEPAD_PATH, text.as_bytes()) {
+                Ok(()) => *status = format!("saved {} bytes to {}", text.len(), NOTEPAD_PATH),
+                Err(e) => *status = format!("save failed: {}", e),
+            }
+        }
+        keyboard::Event::Ctrl('o') => {
+            match fat::read_file(NOTEPAD_PATH) {
+                Ok(data) => {
+                    let text = core::str::from_utf8(&data).unwrap_or("");
+                    lines.clear();
+                    lines.extend(text.split('\n').map(|l| l.to_string()));
+                    if lines.last().map(String::is_empty) == Some(true) {
+                        lines.pop();
+                    }
+                    *cursor_row = 0;
+                    *cursor_col = 0;
+                    *status = format!(
+                        "opened {} ({} bytes)",
+                        NOTEPAD_PATH,
+                        data.len()
+                    );
+                }
+                Err(e) => *status = format!("open failed: {}", e),
+            }
+        }
+        keyboard::Event::Ctrl(_) => {} // Ctrl+other letters: not bound
         keyboard::Event::Char(c) => {
             let idx = byte_index(&lines[*cursor_row], *cursor_col);
             lines[*cursor_row].insert(idx, c);
@@ -518,11 +558,13 @@ fn editor_handle_key(
             }
         }
     }
-    editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset);
+    editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
 }
 
 /// Re-renders the whole visible page from `lines` (the real document —
 /// the console is just a display cache) and overlays a block cursor.
+/// The bottom row is a status bar (save/open feedback), so only
+/// `rows - 1` document lines are shown.
 /// Called after every keystroke and after a resize, since both replace
 /// the console's pixel buffer wholesale.
 fn editor_render(
@@ -531,19 +573,27 @@ fn editor_render(
     cursor_row: usize,
     cursor_col: usize,
     scroll_offset: &mut usize,
+    status: &mut String,
 ) {
     let rows = console.rows();
+    let doc_rows = rows.saturating_sub(1);
     if cursor_row < *scroll_offset {
         *scroll_offset = cursor_row;
-    } else if cursor_row >= *scroll_offset + rows {
-        *scroll_offset = cursor_row + 1 - rows;
+    } else if cursor_row >= *scroll_offset + doc_rows {
+        *scroll_offset = cursor_row + 1 - doc_rows;
     }
     console.clear();
-    for line in lines.iter().skip(*scroll_offset).take(rows) {
+    for line in lines.iter().skip(*scroll_offset).take(doc_rows) {
         let _ = writeln!(console, "{}", line);
     }
+    let sx = font::GLYPH_WIDTH as u32;
+    let sy = (doc_rows * font::GLYPH_HEIGHT) as u32;
+    let cw = console.width_px();
+    gfx::fill_rect(console, 0, sy, cw, font::GLYPH_HEIGHT as u32, EDITOR_STATUS_BG);
+    gfx::draw_string(console, sx, sy, status, EDITOR_STATUS_FG, None);
+    let visible = (cursor_row.saturating_sub(*scroll_offset)).min(doc_rows.saturating_sub(1));
     let cx = (cursor_col * font::GLYPH_WIDTH) as u32;
-    let cy = ((cursor_row - *scroll_offset) * font::GLYPH_HEIGHT) as u32;
+    let cy = (visible * font::GLYPH_HEIGHT) as u32;
     gfx::fill_rect(console, cx, cy, font::GLYPH_WIDTH as u32, font::GLYPH_HEIGHT as u32, EDITOR_CURSOR_COLOR);
 }
 

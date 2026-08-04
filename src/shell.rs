@@ -63,7 +63,8 @@ fn read_line() -> String {
                 keyboard::Event::Up
                 | keyboard::Event::Down
                 | keyboard::Event::Left
-                | keyboard::Event::Right => {}
+                | keyboard::Event::Right
+                | keyboard::Event::Ctrl(_) => {}
             }
         }
         interrupts::halt();
@@ -491,7 +492,7 @@ pub fn selftest() -> ! {
         Err(e) => selftest_fail("FAT32 mkdir failed"),
     }
     let payload = "selftest payload line 1\nline 2 (2 KiB+ to force multi-cluster)\n".repeat(64);
-    if let Err(e) = fat::write_file("/selftest/multicluster payload.txt", payload.as_bytes()) {
+    if let Err(_e) = fat::write_file("/selftest/multicluster payload.txt", payload.as_bytes()) {
         selftest_fail("FAT32 write failed");
     }
     match fat::read_file("/selftest/multicluster payload.txt") {
@@ -502,7 +503,7 @@ pub fn selftest() -> ! {
         Err(_) => selftest_fail("FAT32 write+read round trip failed"),
     }
     let overwrite = "shorter overwrite";
-    if let Err(e) = fat::write_file("/selftest/multicluster payload.txt", overwrite.as_bytes()) {
+    if let Err(_e) = fat::write_file("/selftest/multicluster payload.txt", overwrite.as_bytes()) {
         selftest_fail("FAT32 overwrite failed");
     }
     match fat::read_file("/selftest/multicluster payload.txt") {
@@ -511,7 +512,7 @@ pub fn selftest() -> ! {
         }
         _ => selftest_fail("FAT32 overwrite mismatch"),
     }
-    if let Err(e) = fat::remove("/selftest/multicluster payload.txt") {
+    if let Err(_e) = fat::remove("/selftest/multicluster payload.txt") {
         selftest_fail("FAT32 rm file failed");
     }
     if let Err(e) = fat::remove("/selftest") {
@@ -749,7 +750,7 @@ impl LineEditor {
             }
             // Not supported yet: LineEditor only ever appends/removes at
             // the end of `line`, it has no notion of a cursor within it.
-            keyboard::Event::Left | keyboard::Event::Right => Feed::Pending,
+            keyboard::Event::Left | keyboard::Event::Right | keyboard::Event::Ctrl(_) => Feed::Pending,
         }
     }
 }

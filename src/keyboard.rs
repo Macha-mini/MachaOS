@@ -6,6 +6,9 @@ use crate::sync::SpinLock;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     Char(char),
+    /// Ctrl+letter combos carry the (lowercase) letter, e.g. Ctrl+S gives
+    /// `Event::Ctrl('s')` regardless of Shift state.
+    Ctrl(char),
     Backspace,
     Enter,
     Tab,
@@ -54,6 +57,7 @@ impl EventQueue {
 static QUEUE: SpinLock<EventQueue> = SpinLock::new(EventQueue::new());
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
+static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
 // Set to true when a 0xE0 extended-scancode prefix byte is seen; consumed
 // (swapped back to false) by the very next byte, whatever it is.
 static EXTENDED: AtomicBool = AtomicBool::new(false);
@@ -101,6 +105,14 @@ fn decode(scancode: u8, extended: bool) -> Option<Event> {
             SHIFT_DOWN.store(false, Ordering::Relaxed);
             None
         }
+        0x1D => {
+            CTRL_DOWN.store(true, Ordering::Relaxed);
+            None
+        }
+        0x9D => {
+            CTRL_DOWN.store(false, Ordering::Relaxed);
+            None
+        }
         0x3A => {
             CAPS_LOCK.fetch_xor(true, Ordering::Relaxed);
             None
@@ -115,7 +127,9 @@ fn decode(scancode: u8, extended: bool) -> Option<Event> {
             let caps = CAPS_LOCK.load(Ordering::Relaxed);
             let base = KEYMAP[scancode as usize];
             let shifted_char = KEYMAP_SHIFT[scancode as usize];
-            if shifted && shifted_char != 0 {
+            if CTRL_DOWN.load(Ordering::Relaxed) && base != 0 {
+                Some(Event::Ctrl(base as char))
+            } else if shifted && shifted_char != 0 {
                 Some(Event::Char(shifted_char as char))
             } else if caps && base.is_ascii_alphabetic() {
                 Some(Event::Char(base.to_ascii_uppercase() as char))
