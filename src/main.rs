@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod allocator;
+mod ata;
 mod calculator;
 mod console;
 mod cpuid;
@@ -226,6 +227,15 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
 
     println!("[OK] enabling PS/2 mouse (IRQ12)...");
     mouse::init();
+
+    println!("[OK] probing ATA devices...");
+    ata::init();
+    for index in 0..ata::count() {
+        println!("[OK] {}", ata::describe(index).unwrap_or_default());
+    }
+    if ata::count() == 0 {
+        println!("[WARN] no ATA devices found");
+    }
 
     if fb::init(&info) {
         let (width, height) = fb::dimensions();

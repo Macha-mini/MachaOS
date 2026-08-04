@@ -13,6 +13,18 @@ pub unsafe fn inb(port: u16) -> u8 {
 }
 
 #[inline]
+pub unsafe fn inw(port: u16) -> u16 {
+    let value: u16;
+    asm!(
+        "in ax, dx",
+        out("ax") value,
+        in("dx") port,
+        options(nomem, nostack, preserves_flags)
+    );
+    value
+}
+
+#[inline]
 pub unsafe fn outb(port: u16, value: u8) {
     asm!(
         "out dx, al",
