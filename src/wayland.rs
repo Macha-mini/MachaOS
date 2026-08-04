@@ -61,6 +61,24 @@ const SURFACE_Y: u32 = 40;
 /// this instead of guessing how many ticks the compositor task needs.
 pub static FRAMES_RENDERED: AtomicU64 = AtomicU64::new(0);
 
+/// Spin-`hlt`s (same idiom as `process::wait`) until `FRAMES_RENDERED`
+/// has advanced past `after`, or `timeout_ticks` elapses. Kernel-context
+/// only (the caller — `shell.rs`'s selftest hook — isn't inside a
+/// syscall handler, so blocking like this is fine here even though it
+/// isn't for `socket.rs`'s syscalls).
+pub fn wait_for_frame(after: u64, timeout_ticks: u64) -> bool {
+    let deadline = interrupts::ticks() + timeout_ticks;
+    loop {
+        if FRAMES_RENDERED.load(Ordering::Acquire) > after {
+            return true;
+        }
+        if interrupts::ticks() >= deadline {
+            return false;
+        }
+        interrupts::halt();
+    }
+}
+
 /// Starts the compositor as a permanent background kernel task. A no-op
 /// without a real framebuffer to render onto.
 pub fn start() {
@@ -137,10 +155,12 @@ impl ConnReader {
     /// The message header every step starts with: `object_id`, `opcode`,
     /// `size` (total bytes including this 8-byte header) — read but not
     /// meaningfully validated (see module docs: no real object table).
+    /// Packed the same way `push_header` writes it (and real Wayland
+    /// does): opcode in the low 16 bits, size in the high 16.
     fn read_header(&mut self) -> u32 {
         let _object_id = self.read_u32();
         let opcode_and_size = self.read_u32();
-        opcode_and_size & 0xFFFF // low 16 bits: total message size
+        opcode_and_size >> 16
     }
 
     fn take_fd(&mut self) -> Option<usize> {

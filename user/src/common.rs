@@ -57,3 +57,29 @@ pub unsafe fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     }
     ret
 }
+
+/// Same as `syscall`, widened to all six real Linux syscall argument
+/// registers (`rdi`/`rsi`/`rdx`/`r10`/`r8`/`r9` — real x86_64 Linux
+/// convention, no stack argument at the user-mode call site; the kernel
+/// side reshuffles into its own C calling convention internally, see
+/// `syscall.rs`) — needed for `mmap`.
+#[inline(always)]
+pub unsafe fn syscall6(num: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inout("rax") num => ret,
+            inout("rdi") a1 => _,
+            inout("rsi") a2 => _,
+            inout("rdx") a3 => _,
+            inout("r10") a4 => _,
+            inout("r8") a5 => _,
+            inout("r9") a6 => _,
+            out("rcx") _,
+            out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}

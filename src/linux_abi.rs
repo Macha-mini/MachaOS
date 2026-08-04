@@ -25,6 +25,18 @@
 //! interpreter runs it, the same way an actual Linux kernel never
 //! implements the ELF relocator itself.
 //!
+//! Phase 5 adds `memfd_create`/`ftruncate` (`shm.rs`) and `socket`/
+//! `connect`/`sendmsg`/`recvmsg` (`socket.rs`, `AF_UNIX`/`SOCK_STREAM`
+//! only) plus `mmap`'s `MAP_SHARED` path (`process::Process::
+//! mmap_shared`) — real shared memory and real `SCM_RIGHTS` fd-passing,
+//! the two pieces a `wl_shm`-based GUI client needs beyond everything
+//! Phase 2-4 already had. See `wayland.rs` for the kernel-native
+//! compositor task these exist for, and its own module docs for how far
+//! "GUI apps" actually goes here (a hand-designed, Wayland-*inspired*
+//! wire subset, not the real protocol). Every syscall this phase adds
+//! is non-blocking by construction — see `socket.rs`'s module docs on
+//! why a syscall handler can never wait the way `process::wait` does.
+//!
 //! KNOWN GAPS left beyond Phase 4:
 //! - No signal delivery: `rt_sigaction`/`rt_sigprocmask` just record
 //!   nothing and return success.
@@ -60,6 +72,14 @@
 //!   one, left for follow-up rather than resolved here — consistent
 //!   with this plan's own framing of Phase 4 as roadmap-level rigor
 //!   rather than Phase 1/2's full-completion bar.
+//! - `socket`/`sendmsg`/`recvmsg` only support `AF_UNIX`/`SOCK_STREAM`,
+//!   don't expose `bind`/`listen`/`accept` at all (only `socket.rs`'s
+//!   Rust API does — `wayland.rs`'s compositor task is the only thing
+//!   that ever calls them, deliberately kernel-native rather than a
+//!   second syscall-driven process — see that module's docs), and
+//!   `recvmsg` collapses message boundaries (a `recv` that arrives after
+//!   several `send`s can return them all concatenated) rather than
+//!   honoring real datagram-style framing.
 
 use alloc::format;
 use alloc::string::{String, ToString};

@@ -1166,6 +1166,45 @@ pub fn selftest() -> ! {
         Err(_) => println!("[SKIP] /bin/hello.elf not present"),
     }
 
+    // Process management, part 7 (Phase 5): a real Linux-ABI client
+    // process drawing through `wayland.rs`'s kernel-native compositor —
+    // memfd_create/ftruncate/mmap(MAP_SHARED), socket/connect, and
+    // sendmsg with SCM_RIGHTS to hand the compositor task a real shared
+    // frame of pixels over a real AF_UNIX socket. Checking the client's
+    // own exit code only proves its own syscalls succeeded; the pixel
+    // check below is what proves the whole chain — two independently
+    // scheduled tasks sharing physical memory through a kernel-mediated
+    // fd handoff — actually worked, not just returned success codes.
+    {
+        // Must match `prog_linux_wayland_client.rs`'s TEST_COLOR/WIDTH.
+        const TEST_COLOR: u32 = 0x00_FF10_C0;
+        const SURFACE_X: u32 = 40;
+        const SURFACE_Y: u32 = 40;
+
+        let frames_before = crate::wayland::FRAMES_RENDERED.load(core::sync::atomic::Ordering::Acquire);
+        let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_WAYLAND_CLIENT, "wl-client", &["wl-client"], &[])
+            .unwrap_or_else(|e| selftest_fail(&format!("wayland client spawn failed: {e}")));
+        match crate::process::wait(pid, 200) {
+            Some(process::ExitInfo::Normal) => println!("[OK] Wayland client process exited normally"),
+            other => selftest_fail(&format!("wayland client gave unexpected exit: {:?}", other)),
+        }
+        match crate::process::read_result(pid) {
+            Some(0x7F) => println!("[OK] Wayland client: memfd/mmap/socket/connect/sendmsg all correct"),
+            other => selftest_fail(&format!("wayland client result mismatch: {:?}", other)),
+        }
+        crate::process::reap(pid);
+
+        if !crate::wayland::wait_for_frame(frames_before, 100) {
+            selftest_fail("compositor never rendered a frame for the wayland client");
+        }
+        match crate::fb::get_pixel(SURFACE_X, SURFACE_Y) {
+            Some(color) if color == TEST_COLOR => {
+                println!("[OK] compositor blitted the client's shared-memory buffer onto the real framebuffer")
+            }
+            other => selftest_fail(&format!("framebuffer pixel after wayland commit: {:?} (want {:#x})", other, TEST_COLOR)),
+        }
+    }
+
     // Ring 3 round trip: run a hand-assembled user-mode program (mapped
     // PAGE_USER, entered via `enter_usermode`'s iretq) that calls the
     // sys_write syscall once per character and then sys_exit. Reaching the
