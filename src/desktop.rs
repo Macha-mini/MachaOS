@@ -10,6 +10,11 @@ fn encode_key(event: keyboard::Event) -> Option<[u8; 6]> {
         keyboard::Event::Backspace => Some([1, 0, 0, 0, 0, 0]),
         keyboard::Event::Enter => Some([2, 0, 0, 0, 0, 0]),
         keyboard::Event::Ctrl(c) if c.is_ascii() => Some([4, c as u8, 0, 0, 0, 0]),
+        keyboard::Event::Left => Some([7, 0, 0, 0, 0, 0]),
+        keyboard::Event::Right => Some([8, 0, 0, 0, 0, 0]),
+        keyboard::Event::Up => Some([9, 0, 0, 0, 0, 0]),
+        keyboard::Event::Down => Some([10, 0, 0, 0, 0, 0]),
+        keyboard::Event::Tab => Some([11, 0, 0, 0, 0, 0]),
         _ => None,
     }
 }

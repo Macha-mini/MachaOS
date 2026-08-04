@@ -19,7 +19,7 @@ const SYS_FB_PRESENT: u64 = 13;
 const SYS_SEND: u64 = 4;
 const SYS_WIN_FOCUS: u64 = 15;
 const MAX_WINDOWS: usize = 16;
-const RECORD_SIZE: usize = 32;
+const RECORD_SIZE: usize = 64;
 const MAX_WINDOW_PIXELS: usize = 800 * 480;
 const SCREEN_W: usize = 1920;
 const SCREEN_H: usize = 1080;
@@ -43,7 +43,7 @@ impl Surface for Screen {
 }
 
 #[derive(Clone, Copy)]
-struct Window { pid: u64, x: i32, y: i32, width: u32, height: u32, focused: bool }
+struct Window { pid: u64, x: i32, y: i32, width: u32, height: u32, focused: bool, title: [u8; 32], title_len: usize }
 
 fn decode_windows(buf: &[u8; MAX_WINDOWS * RECORD_SIZE], count: usize, out: &mut [Window; MAX_WINDOWS]) {
     for i in 0..count {
@@ -55,6 +55,8 @@ fn decode_windows(buf: &[u8; MAX_WINDOWS * RECORD_SIZE], count: usize, out: &mut
             width: u32::from_le_bytes(r[16..20].try_into().unwrap()),
             height: u32::from_le_bytes(r[20..24].try_into().unwrap()),
             focused: u32::from_le_bytes(r[24..28].try_into().unwrap()) != 0,
+            title: { let mut title = [0; 32]; title.copy_from_slice(&r[32..64]); title },
+            title_len: u32::from_le_bytes(r[28..32].try_into().unwrap()).min(32) as usize,
         };
     }
 }
@@ -71,6 +73,10 @@ fn compose(windows: &[Window; MAX_WINDOWS], count: usize) {
         let color = if window.focused { TITLE } else { TITLE_DIM };
         gfx::fill_rect(&mut screen, x.saturating_sub(1), y.saturating_sub(1), window.width + 2, window.height + TITLE_H + 2, BORDER);
         gfx::fill_rect(&mut screen, x, y, window.width, TITLE_H, color);
+        let title = core::str::from_utf8(&window.title[..window.title_len]).unwrap_or("");
+        gfx::draw_string(&mut screen, x + 4, y + 6, title, 0x00_FFFFFF, None);
+        gfx::fill_rect(&mut screen, x + window.width.saturating_sub(18), y + 3, 14, 14, 0x00_B33A3A);
+        gfx::draw_string(&mut screen, x + window.width.saturating_sub(15), y + 6, "x", 0x00_FFFFFF, None);
         gfx::blit(&mut screen, x, y + TITLE_H, pixels, window.width, window.height);
     }
     unsafe { common::syscall(SYS_FB_PRESENT, core::ptr::addr_of!(FRAME) as u64, SCREEN_PIXELS as u64, 0, 0); }
@@ -89,6 +95,15 @@ fn handle_mouse(event: &[u8; 6], cursor: &mut (i32, i32), windows: &[Window; MAX
     cursor.1 = (cursor.1 + dy).clamp(0, SCREEN_H as i32 - 1);
     if event[5] == 0 { return; }
     for window in windows.iter().take(count).rev() {
+        if cursor.1 >= window.y && cursor.1 < window.y + TITLE_H as i32 {
+            if cursor.0 >= window.x + window.width as i32 - 22 {
+                let close = [6, 0, 0, 0, 0, 0];
+                unsafe { common::syscall(SYS_SEND, window.pid, close.as_ptr() as u64, 6, 0); }
+                return;
+            }
+            unsafe { common::syscall(SYS_WIN_FOCUS, window.pid, 0, 0, 0); }
+            return;
+        }
         if cursor.0 < window.x || cursor.0 >= window.x + window.width as i32 || cursor.1 < window.y + TITLE_H as i32 || cursor.1 >= window.y + TITLE_H as i32 + window.height as i32 { continue; }
         let local = [3, 0, (cursor.0 - window.x) as u16 as u8, ((cursor.0 - window.x) as u16 >> 8) as u8, (cursor.1 - window.y - TITLE_H as i32) as u16 as u8, ((cursor.1 - window.y - TITLE_H as i32) as u16 >> 8) as u8];
         unsafe { common::syscall(SYS_WIN_FOCUS, window.pid, 0, 0, 0); common::syscall(SYS_SEND, window.pid, local.as_ptr() as u64, 6, 0); }
@@ -101,7 +116,7 @@ pub extern "C" fn _start() {
     let info = unsafe { common::syscall(SYS_FB_INFO, 0, 0, 0, 0) };
     if info != ((SCREEN_W as u64) << 32 | SCREEN_H as u64) { loop {} }
     let mut records = [0u8; MAX_WINDOWS * RECORD_SIZE];
-    let mut windows = [Window { pid: 0, x: 0, y: 0, width: 0, height: 0, focused: false }; MAX_WINDOWS];
+    let mut windows = [Window { pid: 0, x: 0, y: 0, width: 0, height: 0, focused: false, title: [0; 32], title_len: 0 }; MAX_WINDOWS];
     let mut event = [0u8; 6];
     let mut cursor = (SCREEN_W as i32 / 2, SCREEN_H as i32 / 2);
     loop {
@@ -111,7 +126,7 @@ pub extern "C" fn _start() {
         decode_windows(&records, count, &mut windows);
         if n == 6 {
             if event[0] == 5 { handle_mouse(&event, &mut cursor, &windows, count); }
-            else if event[0] == 0 || event[0] == 1 || event[0] == 2 || event[0] == 4 { forward_key(&event, &windows, count); }
+            else if event[0] == 0 || event[0] == 1 || event[0] == 2 || event[0] == 4 || (7..=11).contains(&event[0]) { forward_key(&event, &windows, count); }
         }
         compose(&windows, count);
     }

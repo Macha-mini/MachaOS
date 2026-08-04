@@ -1,7 +1,7 @@
 //! A text-cell grid virtual console, the graphics-mode analogue of
 //! `vga::Writer`. Instead of writing `ScreenChar`s into the fixed 0xB8000
 //! VGA buffer, it blits glyphs (via `gfx::draw_char`) into its own pixel
-//! buffer, which a `wm::Window` owns and the compositor blits onward.
+//! buffer, which a window surface owns and a compositor blits onward.
 
 use alloc::vec;
 use alloc::vec::Vec;

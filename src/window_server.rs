@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use crate::sync::SpinLock;
 
 pub const MAX_WINDOWS: usize = 16;
+pub const TITLE_CAPACITY: usize = 32;
 
 pub struct WindowRecord {
     pub pid: usize,
@@ -68,6 +69,7 @@ pub fn focus(pid: usize) {
 pub fn focused() -> Option<usize> { *FOCUSED_PID.lock() }
 
 pub fn with_windows<R>(f: impl FnOnce(&[WindowRecord]) -> R) -> R {
+    reap_exited();
     let windows = WINDOWS.lock();
     f(&windows)
 }
@@ -75,4 +77,25 @@ pub fn with_windows<R>(f: impl FnOnce(&[WindowRecord]) -> R) -> R {
 pub fn with_window<R>(pid: usize, f: impl FnOnce(Option<&WindowRecord>) -> R) -> R {
     let windows = WINDOWS.lock();
     f(windows.iter().find(|window| window.pid == pid))
+}
+
+fn reap_exited() {
+    let mut exited = [0usize; MAX_WINDOWS];
+    let mut count = 0;
+    {
+        let windows = WINDOWS.lock();
+        for window in windows.iter() {
+            if crate::task::process_exit_status(window.pid).is_some() {
+                exited[count] = window.pid;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 { return; }
+    let mut windows = WINDOWS.lock();
+    windows.retain(|window| !exited[..count].contains(&window.pid));
+    if FOCUSED_PID.lock().is_some_and(|pid| exited[..count].contains(&pid)) {
+        *FOCUSED_PID.lock() = windows.last().map(|window| window.pid);
+    }
+    for pid in &exited[..count] { crate::process::reap(*pid); }
 }

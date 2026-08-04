@@ -27,6 +27,7 @@ use gfx::Surface;
 const SYS_RECV: u64 = 5;
 const SYS_WIN_CREATE: u64 = 6;
 const SYS_WIN_UPDATE: u64 = 7;
+const SYS_EXIT: u64 = 1;
 
 const BUTTON_SIZE: u32 = 60;
 const GRID_COLS: u32 = 4;
@@ -275,6 +276,7 @@ pub extern "C" fn _start() {
     let mut buf = [0u8; 6];
     loop {
         let n = unsafe { common::syscall(SYS_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) };
+        if n == buf.len() as u64 && buf[0] == 6 { unsafe { common::syscall(SYS_EXIT, 0, 0, 0, 0); } }
         if n != buf.len() as u64 || buf[0] != 3 {
             continue; // only tag 3 (Click) is meaningful here; see wm::encode_click_event
         }

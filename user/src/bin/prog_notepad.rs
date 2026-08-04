@@ -15,6 +15,7 @@ const SYS_WIN_CREATE: u64 = 6;
 const SYS_WIN_UPDATE: u64 = 7;
 const SYS_FILE_READ: u64 = 8;
 const SYS_FILE_WRITE: u64 = 9;
+const SYS_EXIT: u64 = 1;
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 320;
 const COLS: usize = 100;
@@ -64,6 +65,28 @@ impl Editor {
         self.cursor -= 1;
         self.doc.copy_within(self.cursor + 1..self.len, self.cursor);
         self.len -= 1;
+    }
+
+    fn move_left(&mut self) { self.cursor = self.cursor.saturating_sub(1); }
+    fn move_right(&mut self) { if self.cursor < self.len { self.cursor += 1; } }
+    fn move_vertical(&mut self, down: bool) {
+        let mut line_start = self.cursor;
+        while line_start > 0 && self.doc[line_start - 1] != b'\n' { line_start -= 1; }
+        let column = self.cursor - line_start;
+        if down {
+            let mut next = self.cursor;
+            while next < self.len && self.doc[next] != b'\n' { next += 1; }
+            if next == self.len { return; }
+            next += 1;
+            let mut end = next;
+            while end < self.len && self.doc[end] != b'\n' { end += 1; }
+            self.cursor = next + column.min(end - next);
+        } else if line_start > 0 {
+            let previous_end = line_start - 1;
+            let mut previous_start = previous_end;
+            while previous_start > 0 && self.doc[previous_start - 1] != b'\n' { previous_start -= 1; }
+            self.cursor = previous_start + column.min(previous_end - previous_start);
+        }
     }
 
     fn load(&mut self) {
@@ -121,11 +144,17 @@ pub extern "C" fn _start() {
         let n = unsafe { common::syscall(SYS_RECV, event.as_mut_ptr() as u64, event.len() as u64, 0, 0) };
         if n != 6 { continue; }
         match event[0] {
+            6 => unsafe { common::syscall(SYS_EXIT, 0, 0, 0, 0); },
             0 if event[1].is_ascii_graphic() || event[1] == b' ' => editor.insert(event[1]),
             1 => editor.backspace(),
             2 => editor.insert(b'\n'),
             4 if event[1] == b's' => editor.save(),
             4 if event[1] == b'o' => editor.load(),
+            7 => editor.move_left(),
+            8 => editor.move_right(),
+            9 => editor.move_vertical(false),
+            10 => editor.move_vertical(true),
+            11 => { for _ in 0..4 { editor.insert(b' '); } },
             _ => continue,
         }
         editor.render();

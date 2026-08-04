@@ -1,9 +1,11 @@
 use core::fmt;
 use core::fmt::Write as _;
+use alloc::vec::Vec;
 
 use crate::console;
 use crate::serial;
 use crate::vga;
+use crate::sync::SpinLock;
 
 macro_rules! print {
     ($($arg:tt)*) => {
@@ -30,6 +32,11 @@ macro_rules! println {
 // legacy VGA text writer. Single-core and never touched from interrupt
 // context, so a bare static pointer is sufficient here.
 static mut ACTIVE_CONSOLE: *mut console::Console = core::ptr::null_mut();
+static CAPTURE: SpinLock<Option<Vec<u8>>> = SpinLock::new(None);
+
+pub fn start_capture() { *CAPTURE.lock() = Some(Vec::with_capacity(8192)); }
+
+pub fn take_capture() -> Vec<u8> { CAPTURE.lock().take().unwrap_or_default() }
 
 pub fn set_console_sink(target: Option<&mut console::Console>) {
     unsafe {
@@ -43,6 +50,12 @@ pub fn set_console_sink(target: Option<&mut console::Console>) {
 pub fn print(args: fmt::Arguments) {
     let mut writer = serial::SerialWriter;
     let _ = writer.write_fmt(args);
+
+    if let Some(buffer) = CAPTURE.lock().as_mut() {
+        let mut capture = CaptureWriter { buffer };
+        let _ = capture.write_fmt(args);
+        return;
+    }
 
     unsafe {
         if let Some(console) = ACTIVE_CONSOLE.as_mut() {
@@ -84,6 +97,16 @@ pub fn sprint<'a>(buf: &'a mut [u8], args: fmt::Arguments) -> &'a str {
 struct StackStr<'a> {
     buffer: &'a mut [u8],
     len: usize,
+}
+
+struct CaptureWriter<'a> { buffer: &'a mut Vec<u8> }
+
+impl fmt::Write for CaptureWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let remaining = 8192usize.saturating_sub(self.buffer.len());
+        self.buffer.extend_from_slice(&s.as_bytes()[..s.len().min(remaining)]);
+        Ok(())
+    }
 }
 
 impl fmt::Write for StackStr<'_> {

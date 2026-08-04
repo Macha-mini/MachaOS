@@ -13,7 +13,8 @@ use gfx::Surface;
 const SYS_RECV: u64 = 5;
 const SYS_WIN_CREATE: u64 = 6;
 const SYS_WIN_UPDATE: u64 = 7;
-const SYS_CLOCK: u64 = 3;
+const SYS_EXIT: u64 = 1;
+const SYS_SHELL_EXEC: u64 = 16;
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 240;
 const COLS: usize = 100;
@@ -52,23 +53,13 @@ impl Terminal {
         self.put(b'\n');
         let line = &self.line[..self.len];
         if line == b"clear" || line == b"cls" { self.clear(); }
-        else if line == b"help" { self.print(b"help clear echo time version\n"); }
-        else if line == b"version" { self.print(b"MachaOS user terminal\n"); }
-        else if line == b"time" { self.print(b"ticks: "); self.print_u64(unsafe { common::syscall(SYS_CLOCK, 0, 0, 0, 0) }); self.put(b'\n'); }
-        else if line.starts_with(b"echo ") {
-            let end = self.len;
-            for i in 5..end { let byte = self.line[i]; self.put(byte); }
-            self.put(b'\n');
+        else if !line.is_empty() {
+            let mut output = [0u8; 8192];
+            let n = unsafe { common::syscall(SYS_SHELL_EXEC, self.line.as_ptr() as u64, self.len as u64, output.as_mut_ptr() as u64, output.len() as u64) };
+            if n != u64::MAX { self.print(&output[..(n as usize).min(output.len())]); }
         }
-        else if !line.is_empty() { self.print(b"unknown command\n"); }
         self.len = 0;
         self.prompt();
-    }
-    fn print_u64(&mut self, mut value: u64) {
-        let mut digits = [0u8; 20]; let mut len = 0;
-        if value == 0 { self.put(b'0'); return; }
-        while value != 0 { digits[len] = b'0' + (value % 10) as u8; len += 1; value /= 10; }
-        while len != 0 { len -= 1; self.put(digits[len]); }
     }
     fn render(&mut self) {
         let mut surface = SurfaceBuf { pixels: unsafe { &mut *core::ptr::addr_of_mut!(PIXELS) } };
@@ -91,6 +82,7 @@ pub extern "C" fn _start() {
         let n = unsafe { common::syscall(SYS_RECV, event.as_mut_ptr() as u64, event.len() as u64, 0, 0) };
         if n != 6 { continue; }
         match event[0] {
+            6 => unsafe { common::syscall(SYS_EXIT, 0, 0, 0, 0); },
             0 if event[1].is_ascii() && terminal.len < LINE_CAPACITY => { terminal.line[terminal.len] = event[1]; terminal.len += 1; terminal.put(event[1]); }
             1 if terminal.len > 0 => {
                 terminal.len -= 1;

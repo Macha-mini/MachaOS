@@ -49,6 +49,7 @@ pub(crate) const SYS_FB_INFO: u64 = 12;
 pub(crate) const SYS_FB_PRESENT: u64 = 13;
 pub(crate) const SYS_GETPID: u64 = 14;
 pub(crate) const SYS_WIN_FOCUS: u64 = 15;
+pub(crate) const SYS_SHELL_EXEC: u64 = 16;
 // Returned by write/read/send/recv when an argument (fd, or a pointer
 // range the calling process doesn't own) is rejected.
 const SYSCALL_ERROR: u64 = u64::MAX;
@@ -331,11 +332,8 @@ fn sys_recv(ptr: u64, maxlen: u64) -> u64 {
 const MAX_WINDOW_DIM: u64 = 2048;
 
 /// Creates (or, called again, replaces) the calling process's window.
-/// Actually creating it happens later, off `wm::queue_create`, in the
-/// desktop loop — the only place a `wm::WindowManager` is reachable from
-/// (see the module docs on `wm::WinCommand`) — so this always succeeds
-/// immediately from the caller's point of view; there's no way to report
-/// a compositor-side failure back through this call.
+/// The kernel window server allocates the surface immediately; the user
+/// compositor discovers it on its next metadata poll.
 fn sys_win_create(width: u64, height: u64, title_ptr: u64, title_len: u64) -> u64 {
     if width == 0 || height == 0 || width > MAX_WINDOW_DIM || height > MAX_WINDOW_DIM {
         return SYSCALL_ERROR;
@@ -349,11 +347,7 @@ fn sys_win_create(width: u64, height: u64, title_ptr: u64, title_len: u64) -> u6
         let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, title_len as usize) };
         alloc::string::String::from_utf8_lossy(bytes).into_owned()
     };
-    crate::wm::queue_create(crate::task::current_pid(), width as u32, height as u32, title.clone());
-    // The user compositor consumes the same request through the minimal
-    // kernel window server. The legacy queue remains for selftest mode.
-    let _ = crate::window_server::create(crate::task::current_pid(), width as u32, height as u32, title);
-    0
+    if crate::window_server::create(crate::task::current_pid(), width as u32, height as u32, title) { 0 } else { SYSCALL_ERROR }
 }
 
 /// Replaces the calling process's window pixels wholesale. `pixel_count`
@@ -371,12 +365,10 @@ fn sys_win_update(pixels_ptr: u64, pixel_count: u64) -> u64 {
     // every mapping's physical base is page-aligned, so the offset within
     // it preserves alignment exactly.
     let pixels = unsafe { core::slice::from_raw_parts(phys as *const u32, pixel_count as usize) }.to_vec();
-    crate::wm::queue_update(crate::task::current_pid(), pixels.clone());
-    let _ = crate::window_server::update(crate::task::current_pid(), pixels);
-    0
+    if crate::window_server::update(crate::task::current_pid(), pixels) { 0 } else { SYSCALL_ERROR }
 }
 
-const WINDOW_RECORD_SIZE: usize = 32;
+const WINDOW_RECORD_SIZE: usize = 64;
 
 /// Writes fixed-size window metadata records for the user compositor.
 fn sys_win_list(ptr: u64, max_records: u64) -> u64 {
@@ -395,6 +387,10 @@ fn sys_win_list(ptr: u64, max_records: u64) -> u64 {
             out[16..20].copy_from_slice(&window.width.to_le_bytes());
             out[20..24].copy_from_slice(&window.height.to_le_bytes());
             out[24..28].copy_from_slice(&(if focused == Some(window.pid) { 1u32 } else { 0 }).to_le_bytes());
+            let title = window.title.as_bytes();
+            let title_len = title.len().min(crate::window_server::TITLE_CAPACITY);
+            out[28..32].copy_from_slice(&(title_len as u32).to_le_bytes());
+            out[32..32 + title_len].copy_from_slice(&title[..title_len]);
             count += 1;
         }
     });
@@ -430,6 +426,20 @@ fn sys_fb_present(ptr: u64, pixel_count: u64) -> u64 {
 fn sys_win_focus(pid: u64) -> u64 {
     crate::window_server::focus(pid as usize);
     0
+}
+
+fn sys_shell_exec(line_ptr: u64, line_len: u64, out_ptr: u64, out_len: u64) -> u64 {
+    if line_len == 0 || line_len > 512 || out_len > 8192 { return SYSCALL_ERROR; }
+    let Some(line_phys) = resolve_user_buffer(line_ptr, line_len) else { return SYSCALL_ERROR };
+    let Some(out_phys) = resolve_user_buffer(out_ptr, out_len) else { return SYSCALL_ERROR };
+    let bytes = unsafe { core::slice::from_raw_parts(line_phys as *const u8, line_len as usize) };
+    let Ok(line) = core::str::from_utf8(bytes) else { return SYSCALL_ERROR };
+    crate::io::start_capture();
+    crate::shell::execute(line);
+    let output = crate::io::take_capture();
+    if output.len() > out_len as usize { return SYSCALL_ERROR; }
+    unsafe { core::ptr::copy_nonoverlapping(output.as_ptr(), out_phys as *mut u8, output.len()) };
+    output.len() as u64
 }
 
 const MAX_PATH_LEN: u64 = 256;
@@ -484,6 +494,7 @@ extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: 
         SYS_FB_PRESENT => sys_fb_present(arg1, arg2),
         SYS_GETPID => crate::task::current_pid() as u64,
         SYS_WIN_FOCUS => sys_win_focus(arg1),
+        SYS_SHELL_EXEC => sys_shell_exec(arg1, arg2, arg3, arg4),
         _ => SYSCALL_ERROR,
     }
 }
