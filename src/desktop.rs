@@ -16,6 +16,12 @@ pub fn run() -> ! {
     if let Err(e) = process::spawn(user_prog::PROG_CALCULATOR, "calculator") {
         io::print(format_args!("failed to launch Calculator: {}\n", e));
     }
+    if let Err(e) = process::spawn(user_prog::PROG_TERMINAL, "terminal") {
+        io::print(format_args!("failed to launch Terminal: {}\n", e));
+    }
+    if let Err(e) = process::spawn(user_prog::PROG_NOTEPAD, "notepad") {
+        io::print(format_args!("failed to launch Notepad: {}\n", e));
+    }
 
     loop {
         let mut dirty = false;

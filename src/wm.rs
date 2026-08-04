@@ -144,9 +144,8 @@ pub fn queue_update(pid: usize, pixels: Vec<u32>) {
 /// The 6-byte wire format `sys_recv` hands a process window's events back
 /// in: `[tag, data, x_lo, x_hi, y_lo, y_hi]`, x/y little-endian `u16`s
 /// (unused, zero, outside of `Click`). Tags: 0 Char (data = ASCII byte),
-/// 1 Backspace, 2 Enter, 3 Click (x/y = position local to the window's
-/// content area — the same coordinates a kernel-resident `AppKind` (e.g.
-/// `Editor`) would get passed directly).
+/// 1 Backspace, 2 Enter, 3 Click, 4 Ctrl (data = lowercase letter; x/y =
+/// position local to the window's content area for Click).
 const EVENT_SIZE: usize = 6;
 
 /// Translates the subset of `keyboard::Event` a process window
@@ -157,6 +156,7 @@ fn encode_key_event(event: &keyboard::Event) -> Option<[u8; EVENT_SIZE]> {
         keyboard::Event::Char(c) if c.is_ascii() => Some([0, c as u8, 0, 0, 0, 0]),
         keyboard::Event::Backspace => Some([1, 0, 0, 0, 0, 0]),
         keyboard::Event::Enter => Some([2, 0, 0, 0, 0, 0]),
+        keyboard::Event::Ctrl(c) if c.is_ascii() => Some([4, c as u8, 0, 0, 0, 0]),
         _ => None,
     }
 }
@@ -287,51 +287,9 @@ impl WindowManager {
             kind: AppKind::SysInfo { console: build_sysinfo_console() },
         };
 
-        let mut editor_console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
-        let editor_lines = vec![String::new()];
-        let mut editor_scroll = 0usize;
-        let mut editor_status = String::new();
-        editor_render(&mut editor_console, &editor_lines, 0, 0, &mut editor_scroll, &mut editor_status);
-        let (ex, ey) = clamp(margin, margin + 300);
-        let editor_window = Window {
-            title: "Notepad",
-            x: ex,
-            y: ey,
-            open: true,
-            minimized: false,
-            maximized: false,
-            resizable: true,
-            app_id: Some(AppId::Notepad),
-            restore_geometry: None,
-            kind: AppKind::Editor {
-                console: editor_console,
-                lines: editor_lines,
-                cursor_row: 0,
-                cursor_col: 0,
-                scroll_offset: editor_scroll,
-                status: editor_status,
-            },
-        };
-
-        let term_window = Window {
-            title: "Terminal",
-            x: margin,
-            y: margin,
-            open: true,
-            minimized: false,
-            maximized: false,
-            resizable: true,
-            app_id: Some(AppId::Terminal),
-            restore_geometry: None,
-            kind: AppKind::Terminal {
-                console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
-                editor: LineEditor::new(),
-            },
-        };
-
         let mut manager = Self {
-            windows: vec![sysinfo_window, editor_window, term_window],
-            focused: 2,
+            windows: vec![sysinfo_window],
+            focused: 0,
             cursor_x: (screen_w / 2) as i32,
             cursor_y: (screen_h / 2) as i32,
             screen_w,
@@ -346,12 +304,6 @@ impl WindowManager {
             remembered: [None; APP_ID_COUNT],
             wallpaper: load_wallpaper(screen_w, screen_h),
         };
-
-        if let AppKind::Terminal { console, .. } = &mut manager.windows[2].kind {
-            io::set_console_sink(Some(console));
-            print!("{}", shell::prompt());
-            io::set_console_sink(None);
-        }
 
         manager
     }
@@ -562,19 +514,8 @@ impl WindowManager {
     fn run_launcher_action(&mut self, action: LauncherAction) {
         match action {
             LauncherAction::Terminal => {
-                let idx = self.spawn_window(
-                    "Terminal",
-                    true,
-                    Some(AppId::Terminal),
-                    AppKind::Terminal {
-                        console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
-                        editor: LineEditor::new(),
-                    },
-                );
-                if let AppKind::Terminal { console, .. } = &mut self.windows[idx].kind {
-                    io::set_console_sink(Some(console));
-                    print!("{}", shell::prompt());
-                    io::set_console_sink(None);
+                if let Err(e) = process::spawn(crate::user_prog::PROG_TERMINAL, "terminal") {
+                    io::print(format_args!("failed to launch Terminal: {}\n", e));
                 }
             }
             LauncherAction::Calculator => {
@@ -587,17 +528,9 @@ impl WindowManager {
                 }
             }
             LauncherAction::Notepad => {
-                let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
-                let lines = vec![String::new()];
-                let mut scroll = 0usize;
-                let mut status = String::new();
-                editor_render(&mut console, &lines, 0, 0, &mut scroll, &mut status);
-                self.spawn_window(
-                    "Notepad",
-                    true,
-                    Some(AppId::Notepad),
-                    AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status },
-                );
+                if let Err(e) = process::spawn(crate::user_prog::PROG_NOTEPAD, "notepad") {
+                    io::print(format_args!("failed to launch Notepad: {}\n", e));
+                }
             }
             LauncherAction::SysInfo => {
                 self.spawn_window(

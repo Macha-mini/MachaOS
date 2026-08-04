@@ -41,6 +41,8 @@ pub(crate) const SYS_SEND: u64 = 4;
 pub(crate) const SYS_RECV: u64 = 5;
 pub(crate) const SYS_WIN_CREATE: u64 = 6;
 pub(crate) const SYS_WIN_UPDATE: u64 = 7;
+pub(crate) const SYS_FILE_READ: u64 = 8;
+pub(crate) const SYS_FILE_WRITE: u64 = 9;
 // Returned by write/read/send/recv when an argument (fd, or a pointer
 // range the calling process doesn't own) is rejected.
 const SYSCALL_ERROR: u64 = u64::MAX;
@@ -364,6 +366,40 @@ fn sys_win_update(pixels_ptr: u64, pixel_count: u64) -> u64 {
     0
 }
 
+const MAX_PATH_LEN: u64 = 256;
+const MAX_FILE_TRANSFER: u64 = 64 * 1024;
+
+/// Reads a whole file into a user buffer. This deliberately stays a small
+/// path-based API until the user-space filesystem layer has file descriptors.
+fn sys_file_read(path_ptr: u64, path_len: u64, buf_ptr: u64, buf_len: u64) -> u64 {
+    if path_len == 0 || path_len > MAX_PATH_LEN || buf_len > MAX_FILE_TRANSFER {
+        return SYSCALL_ERROR;
+    }
+    let Some(path_phys) = resolve_user_buffer(path_ptr, path_len) else { return SYSCALL_ERROR };
+    let Some(buf_phys) = resolve_user_buffer(buf_ptr, buf_len) else { return SYSCALL_ERROR };
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_phys as *const u8, path_len as usize) };
+    let Ok(path) = core::str::from_utf8(path_bytes) else { return SYSCALL_ERROR };
+    let Ok(data) = crate::fat::read_file(path) else { return SYSCALL_ERROR };
+    if data.len() > buf_len as usize { return SYSCALL_ERROR; }
+    unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_phys as *mut u8, data.len()) };
+    data.len() as u64
+}
+
+/// Replaces a whole file from a user buffer. The kernel validates both the
+/// path and payload before touching the filesystem.
+fn sys_file_write(path_ptr: u64, path_len: u64, buf_ptr: u64, len: u64) -> u64 {
+    if path_len == 0 || path_len > MAX_PATH_LEN || len > MAX_FILE_TRANSFER {
+        return SYSCALL_ERROR;
+    }
+    let Some(path_phys) = resolve_user_buffer(path_ptr, path_len) else { return SYSCALL_ERROR };
+    let Some(buf_phys) = resolve_user_buffer(buf_ptr, len) else { return SYSCALL_ERROR };
+    let path_bytes = unsafe { core::slice::from_raw_parts(path_phys as *const u8, path_len as usize) };
+    let Ok(path) = core::str::from_utf8(path_bytes) else { return SYSCALL_ERROR };
+    let bytes = unsafe { core::slice::from_raw_parts(buf_phys as *const u8, len as usize) };
+    if crate::fat::write_file(path, bytes).is_err() { return SYSCALL_ERROR; }
+    len
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     match num {
@@ -374,6 +410,8 @@ extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: 
         SYS_RECV => sys_recv(arg1, arg2),
         SYS_WIN_CREATE => sys_win_create(arg1, arg2, arg3, arg4),
         SYS_WIN_UPDATE => sys_win_update(arg1, arg2),
+        SYS_FILE_READ => sys_file_read(arg1, arg2, arg3, arg4),
+        SYS_FILE_WRITE => sys_file_write(arg1, arg2, arg3, arg4),
         _ => SYSCALL_ERROR,
     }
 }

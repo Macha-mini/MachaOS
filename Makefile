@@ -31,6 +31,8 @@ user:
 	cp user/target/x86_64-unknown-none/release/prog_ipc target/user-ipc.elf
 	cp user/target/x86_64-unknown-none/release/prog_window target/user-window.elf
 	cp user/target/x86_64-unknown-none/release/prog_calculator target/user-calculator.elf
+	cp user/target/x86_64-unknown-none/release/prog_terminal target/user-terminal.elf
+	cp user/target/x86_64-unknown-none/release/prog_notepad target/user-notepad.elf
 
 build: gen user
 	cargo build --release
