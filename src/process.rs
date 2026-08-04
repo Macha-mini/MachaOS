@@ -32,6 +32,12 @@ use crate::paging;
 use crate::pmm;
 use crate::syscall;
 use crate::task;
+use crate::vfs;
+
+/// fd 0/1/2 are reserved for stdin/stdout/stderr, which `syscall.rs`
+/// already serves directly (see `sys_write`/`sys_read`) rather than
+/// through a `FileHandle`; real files start at fd 3.
+const FIRST_FILE_FD: usize = 3;
 
 /// Virtual address of the `.result` page every test program writes its
 /// result to (see user/linker.ld — keep the two in sync).
@@ -39,6 +45,13 @@ pub const PROC_RESULT_VIRT: u64 = 0x2FF0000;
 
 /// No process segment may start below 2 MiB (kernel image, PMM, tables).
 const MIN_SEGMENT_VADDR: u64 = 2 * 1024 * 1024;
+
+/// Load bias applied to an ET_DYN (PIE) image's segments and entry point
+/// (see `elf::Program::is_pie`). 512 MiB: comfortably clear of the kernel
+/// heap, the 48 MiB convention MachaOS's own ET_EXEC test programs use
+/// (`user/linker.ld`), and the 256 MiB user-stack region below, with no
+/// attempt at ASLR (a fixed base is fine for a single-tenant loader).
+const PIE_LOAD_BASE: u64 = 0x2000_0000;
 
 /// Every process gets the same fixed ring-3 stack address (256 MiB — well
 /// clear of the 48 MiB test-program load address and the kernel's own
@@ -95,6 +108,10 @@ pub struct Process {
     pub(crate) exit_info: Option<ExitInfo>,
     /// Single-slot mailbox for `sys_send`/`sys_recv` (see `task::deliver_message`).
     pub(crate) inbox: Option<Vec<u8>>,
+    /// Open-file table for the (future) Linux ABI layer's
+    /// `openat`/`read`/`write`/`lseek`/`close`/`fstat` syscalls. Indices
+    /// 0..FIRST_FILE_FD stay `None` always — see `FIRST_FILE_FD`.
+    fds: Vec<Option<vfs::FileHandle>>,
 }
 
 impl Process {
@@ -115,11 +132,57 @@ impl Process {
             self.exit_info = Some(info);
         }
     }
+
+    /// Installs `handle` at the lowest free fd (never below
+    /// `FIRST_FILE_FD`), returning it.
+    pub fn alloc_fd(&mut self, handle: vfs::FileHandle) -> usize {
+        for (i, slot) in self.fds.iter_mut().enumerate().skip(FIRST_FILE_FD) {
+            if slot.is_none() {
+                *slot = Some(handle);
+                return i;
+            }
+        }
+        self.fds.push(Some(handle));
+        self.fds.len() - 1
+    }
+
+    pub fn fd_mut(&mut self, fd: usize) -> Option<&mut vfs::FileHandle> {
+        self.fds.get_mut(fd)?.as_mut()
+    }
+
+    /// Closes `fd`, flushing it (see `vfs::FileHandle::drop`). Returns
+    /// `false` for a reserved (<FIRST_FILE_FD) or already-closed fd.
+    pub fn close_fd(&mut self, fd: usize) -> bool {
+        if fd < FIRST_FILE_FD {
+            return false;
+        }
+        match self.fds.get_mut(fd) {
+            Some(slot @ Some(_)) => {
+                *slot = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Adds `PIE_LOAD_BASE` to every segment's `vaddr` and to `entry` in
+/// place, for an ET_DYN image whose addresses are otherwise relative to a
+/// link-time base of 0. A no-op for ET_EXEC (`is_pie == false`).
+fn apply_pie_bias(program: &mut elf::Program) {
+    if !program.is_pie {
+        return;
+    }
+    program.entry = program.entry.wrapping_add(PIE_LOAD_BASE);
+    for segment in &mut program.segments {
+        segment.vaddr = segment.vaddr.wrapping_add(PIE_LOAD_BASE);
+    }
 }
 
 /// Parses and loads `elf_bytes` as a new process, returning its pid.
 pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str> {
-    let program = elf::parse(elf_bytes)?;
+    let mut program = elf::parse(elf_bytes)?;
+    apply_pie_bias(&mut program);
     validate_segments(&program)?;
 
     let mut process = Process {
@@ -130,6 +193,7 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         state: ProcessState::Running,
         exit_info: None,
         inbox: None,
+        fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -294,12 +358,28 @@ fn load_segments(
         process.frames.push(phys + i * pmm::FRAME_SIZE);
     }
 
-    let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
-    if segments.iter().any(|s| s.writable) {
-        flags |= paging::PAGE_WRITABLE;
-    }
-    if !paging::map_range_in(pml4, overall_start, phys as u64, len, flags, &mut process.frames) {
-        return Err("failed to map segment");
+    // Map page by page rather than as one `flags` value for the whole
+    // block: real linkers (unlike rust-lld's output for MachaOS's own
+    // programs — see the doc comment above) page-align PT_LOAD segments
+    // so `.text` and `.data` never share a page, so this gives properly
+    // built binaries genuine per-segment R/W separation instead of the
+    // union of every segment's flags. A page straddling two segments
+    // (only happens for MachaOS's own tightly-packed test programs) still
+    // safely gets the union, same as before.
+    for i in 0..pages {
+        let page_vaddr = overall_start + i as u64 * paging::PAGE_SIZE;
+        let page_phys = (phys + i * pmm::FRAME_SIZE) as u64;
+        let page_end = page_vaddr + paging::PAGE_SIZE;
+        let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+        if segments
+            .iter()
+            .any(|s| s.writable && s.vaddr < page_end && s.vaddr + s.memsz > page_vaddr)
+        {
+            flags |= paging::PAGE_WRITABLE;
+        }
+        if !paging::map_range_in(pml4, page_vaddr, page_phys, paging::PAGE_SIZE, flags, &mut process.frames) {
+            return Err("failed to map segment");
+        }
     }
 
     unsafe {

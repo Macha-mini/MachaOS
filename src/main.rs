@@ -42,6 +42,7 @@ mod syscall;
 mod task;
 mod user_prog;
 mod users;
+mod vfs;
 mod vga;
 mod wm;
 
