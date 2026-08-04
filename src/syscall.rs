@@ -155,19 +155,26 @@ syscall_entry:
     jnz .Lsyscall_exit
 
     # SysV syscall args arrive in rdi/rsi/rdx/r10/r8/r9 (r10 instead of
-    # rcx, which `syscall` clobbers); shuffle num+5 args into the rdi..r9
-    # slots `extern "C" fn syscall_dispatch` expects (arg6, the least
-    # often needed of a real 6-argument Linux syscall like mmap's file
-    # offset, isn't forwarded — see linux_abi.rs). r11 is free to use as
-    # scratch here — its user value is already saved on the stack above.
+    # rcx, which `syscall` clobbers); shuffle num+6 args into what
+    # `extern "C" fn syscall_dispatch` expects — arg6 doesn't fit in a
+    # register alongside num+arg1..arg5 (7 values, 6 GP registers per the
+    # C calling convention), so it goes on the stack, pushed right before
+    # `call` like a normal 7th integer argument (the callee's own
+    # prologue reads it from there; this is all `call`'s caller has to
+    # do for a stack argument — the compiler-generated callee handles
+    # the rest). r11 is free to use as scratch here — its user value is
+    # already saved on the stack above.
+    push r9                 # arg6 (SysV's 7th integer arg goes on the stack)
     mov r11, rdx
-    mov rdx, rsi
-    mov rsi, rdi
-    mov rdi, rax
-    mov rcx, r11
-    mov r9, r8
-    mov r8, r10
+    mov rdx, rsi            # arg2 = a2
+    mov rsi, rdi            # arg1 = a1
+    mov rdi, rax            # num
+    mov rcx, r11            # arg3 = a3
+    mov r11, r8             # r11 = a5 (r8 is about to be overwritten by arg4)
+    mov r8, r10             # arg4 = a4
+    mov r9, r11             # arg5 = a5
     call syscall_dispatch
+    add rsp, 8              # pop arg6
 
     pop r11
     pop rcx
@@ -333,7 +340,7 @@ fn sys_recv(ptr: u64, maxlen: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
+extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> u64 {
     // A Linux-ABI process (see `process::Abi`) dispatches through an
     // entirely separate syscall table/numbering/error convention
     // (`linux_abi.rs`) instead of the native one below. `run_demo`'s
@@ -341,7 +348,7 @@ extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: 
     // for it and it always falls through to the native table, same as
     // today.
     if crate::task::current_process_abi() == Some(crate::process::Abi::Linux) {
-        return crate::linux_abi::syscall_dispatch(num, arg1, arg2, arg3, arg4, arg5);
+        return crate::linux_abi::syscall_dispatch(num, arg1, arg2, arg3, arg4, arg5, arg6);
     }
     match num {
         SYS_WRITE => sys_write(arg1, arg2, arg3),

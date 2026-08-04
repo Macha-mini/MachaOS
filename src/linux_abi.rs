@@ -7,25 +7,34 @@
 //! which checks the current process's `Abi` before falling into the
 //! native table.
 //!
-//! `syscall_entry`'s asm forwards `num` plus five arguments (registers
-//! only, no stack-passed args — see that file's comments) to whichever
-//! dispatch function handles a syscall. A real 6-argument syscall like
-//! `mmap` therefore never sees its 6th argument (the file offset) here;
-//! since this module only ever treats `mmap` as anonymous (no
-//! file-backed mapping support), that argument was never going to be
-//! used anyway.
+//! `syscall_entry`'s asm forwards `num` plus all six real Linux syscall
+//! arguments (five in registers, the sixth — e.g. `mmap`'s file offset —
+//! pushed on the stack the way a real 7-argument SysV call would be) to
+//! whichever dispatch function handles a syscall.
 //!
-//! Phase 3 adds the handful of extra syscalls a static**glibc** binary's
+//! Phase 3 adds the handful of extra syscalls a static **glibc** binary's
 //! startup wants beyond musl's smaller set: `futex` (glibc's malloc/loader
 //! locks take this path even single-threaded, at least once, to acquire
 //! an uncontended lock), `rseq` (glibc probes for it and falls back
 //! cleanly if it's refused), `prlimit64`, `sched_getaffinity`, `sysinfo`.
 //!
-//! KNOWN GAPS left for Phase 4 (and beyond):
+//! Phase 4 makes `mmap` genuinely file-backed (needed for `ld.so` to map
+//! a shared library's segments from their real file bytes rather than
+//! zeroed anonymous memory) and adds `PT_INTERP` support to
+//! `process::spawn_linux` so a dynamically-linked binary's *real*
+//! interpreter runs it, the same way an actual Linux kernel never
+//! implements the ELF relocator itself.
+//!
+//! KNOWN GAPS left beyond Phase 4:
 //! - No signal delivery: `rt_sigaction`/`rt_sigprocmask` just record
 //!   nothing and return success.
-//! - `mmap`/`openat` treat every request as anonymous/regular-file; no
-//!   shared mappings, no special file types.
+//! - File-backed `mmap` is read-only-effectively: writes to a
+//!   `MAP_PRIVATE` file mapping are never written back (copy-on-write
+//!   without the "write" part mattering to anything but the process's
+//!   own view, which is already true since frames aren't shared between
+//!   processes) — fine for loading code/rodata, which is all `ld.so`
+//!   needs this for. `MAP_SHARED` isn't distinguished from
+//!   `MAP_PRIVATE` at all.
 //! - `munmap` only reclaims a mapping it fully contains (see
 //!   `process::Process::munmap`); `mprotect` only ever grants/revokes
 //!   write access (no NX enforcement — `paging.rs` has none yet).
@@ -347,9 +356,14 @@ fn sys_brk(addr: u64) -> u64 {
 }
 
 const MAP_FIXED: u64 = 0x10;
+const MAP_ANONYMOUS: u64 = 0x20;
 const PROT_WRITE: u64 = 2;
 
-fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
+/// `fd`/`offset` only matter for a file-backed request (`MAP_ANONYMOUS`
+/// clear and `fd` a real, non-negative descriptor) — `ld.so` uses this to
+/// map each segment of a shared library it's loading straight from the
+/// library's own file bytes (see `process::Process::mmap_file`).
+fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
     if len == 0 {
         return err(EINVAL);
     }
@@ -358,7 +372,23 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
     };
     let at = if flags & MAP_FIXED != 0 { Some(addr) } else { None };
     let writable = prot & PROT_WRITE != 0;
-    with_process(|p| p.mmap_anon(pml4, at, len, writable)).flatten().unwrap_or(err(ENOMEM))
+
+    if flags & MAP_ANONYMOUS != 0 || (fd as i64) < 0 {
+        return with_process(|p| p.mmap_anon(pml4, at, len, writable)).flatten().unwrap_or(err(ENOMEM));
+    }
+
+    let content = with_process(|p| {
+        let h = p.fd_mut(fd as usize)?;
+        h.seek(vfs::SeekFrom::Start(offset));
+        let mut buf = alloc::vec![0u8; len as usize];
+        let n = h.read(&mut buf);
+        buf.truncate(n);
+        Some(buf)
+    });
+    match content {
+        Some(Some(bytes)) => with_process(|p| p.mmap_file(pml4, at, len, writable, &bytes)).flatten().unwrap_or(err(ENOMEM)),
+        _ => err(EBADF),
+    }
 }
 
 fn sys_munmap(addr: u64, len: u64) -> u64 {
@@ -551,14 +581,14 @@ fn sys_sysinfo(info_ptr: u64) -> u64 {
 }
 
 /// Dispatches one Linux-numbered syscall.
-pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, _arg5: u64) -> u64 {
+pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> u64 {
     match num {
         SYS_READ => sys_read(arg1, arg2, arg3),
         SYS_WRITE => sys_write(arg1, arg2, arg3),
         SYS_CLOSE => sys_close(arg1),
         SYS_FSTAT => sys_fstat(arg1, arg2),
         SYS_LSEEK => sys_lseek(arg1, arg2, arg3),
-        SYS_MMAP => sys_mmap(arg1, arg2, arg3, arg4),
+        SYS_MMAP => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
         SYS_MPROTECT => sys_mprotect(arg1, arg2, arg3),
         SYS_MUNMAP => sys_munmap(arg1, arg2),
         SYS_BRK => sys_brk(arg1),

@@ -325,14 +325,37 @@ impl Process {
         self.heap_end
     }
 
-    /// Linux anonymous `mmap`. `at`, when `Some`, is a `MAP_FIXED`
-    /// request (used verbatim, page-aligned down — ld.so needs this to
-    /// place a shared library's segments at a chosen base, see the
-    /// Phase 4 plan); `None` hands out the next free address in the
-    /// bump-allocated arena `MMAP_BASE..MMAP_CEILING`. Always backed by
-    /// freshly zeroed frames (no lazy/demand-paged anonymous memory —
-    /// see Phase 1's plan notes on why that was deferred).
+    /// Linux anonymous `mmap`: freshly zeroed frames, no initial content.
+    /// See `mmap_with_content` for the shared implementation.
     pub fn mmap_anon(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool) -> Option<u64> {
+        self.mmap_with_content(pml4, at, len, writable, None)
+    }
+
+    /// Linux file-backed `mmap`: same as `mmap_anon`, except the mapped
+    /// frames start with `content`'s bytes (zero-padded if `content` is
+    /// shorter than `len`, e.g. a segment's `memsz` exceeding its
+    /// `filesz` — the same BSS handling `load_segments` does for the
+    /// main ELF's own segments) instead of being all zero. `ld.so` needs
+    /// this for real — mapping a shared library's segments from zeroed
+    /// memory would load a library that's all zero bytes.
+    ///
+    /// Copies `content` in eagerly at mmap time rather than mapping the
+    /// file's own pages directly (real `MAP_PRIVATE` semantics): no
+    /// meaningful difference for a read-only/COW mapping, since each
+    /// process already gets its own physical frames either way (`fork`
+    /// isn't implemented, so nothing could ever share these frames'
+    /// backing across processes regardless).
+    pub fn mmap_file(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool, content: &[u8]) -> Option<u64> {
+        self.mmap_with_content(pml4, at, len, writable, Some(content))
+    }
+
+    /// `at`, when `Some`, is a `MAP_FIXED` request (used verbatim,
+    /// page-aligned down — `ld.so` needs this to place a shared
+    /// library's segments at a chosen base); `None` hands out the next
+    /// free address in the bump-allocated arena `MMAP_BASE..MMAP_CEILING`.
+    /// No lazy/demand-paged anonymous memory — see Phase 1's plan notes
+    /// on why that was deferred.
+    fn mmap_with_content(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool, content: Option<&[u8]>) -> Option<u64> {
         let len = align_up(len.max(1), paging::PAGE_SIZE);
         let addr = match at {
             Some(a) => a & !(paging::PAGE_SIZE - 1),
@@ -351,6 +374,10 @@ impl Process {
         }
         unsafe {
             core::ptr::write_bytes(phys as *mut u8, 0, len as usize);
+            if let Some(data) = content {
+                let n = data.len().min(len as usize);
+                core::ptr::copy_nonoverlapping(data.as_ptr(), phys as *mut u8, n);
+            }
         }
         let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
         if writable {
