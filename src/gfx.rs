@@ -42,6 +42,70 @@ pub fn fill_rect_gradient_v(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h
     }
 }
 
+/// Horizontal inset for a given scanline of a rectangle with rounded
+/// corners of radius `r`: `0` in the middle rows, growing toward the
+/// corners so the painted width narrows to an arc there.
+fn rounded_inset(row: u32, h: u32, r: u32) -> u32 {
+    if r == 0 {
+        0
+    } else if row < r {
+        r - 1 - row
+    } else if row >= h - r {
+        row - (h - r)
+    } else {
+        0
+    }
+}
+
+/// Like `fill_rect`, but with the four corners clipped to a circular arc
+/// of radius `r` (which reveals whatever is behind the rect there, so
+/// buttons look "pill-shaped" over any background).
+pub fn fill_rounded_rect(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32, r: u32, color: u32) {
+    if h == 0 {
+        return;
+    }
+    for row in 0..h {
+        let inset = rounded_inset(row, h, r);
+        let inner = w.saturating_sub(2 * inset);
+        if inner >= 2 {
+            fill_rect(surface, x + inset, y + row, inner, 1, color);
+        }
+    }
+}
+
+/// `fill_rounded_rect` with the vertical-gradient coloring of
+/// `fill_rect_gradient_v`.
+pub fn fill_rounded_rect_gradient_v(
+    surface: &mut dyn Surface,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    r: u32,
+    top: u32,
+    bottom: u32,
+) {
+    if h == 0 {
+        return;
+    }
+    let denom = (h - 1).max(1) as i32;
+    let channel = |c: u32, shift: u32| ((c >> shift) & 0xFF) as i32;
+    for row in 0..h {
+        let mut color = 0u32;
+        for shift in [16u32, 8, 0] {
+            let a = channel(top, shift);
+            let b = channel(bottom, shift);
+            let v = a + (b - a) * row as i32 / denom;
+            color |= (v as u32 & 0xFF) << shift;
+        }
+        let inset = rounded_inset(row, h, r);
+        let inner = w.saturating_sub(2 * inset);
+        if inner >= 2 {
+            fill_rect(surface, x + inset, y + row, inner, 1, color);
+        }
+    }
+}
+
 pub fn draw_char(surface: &mut dyn Surface, x: u32, y: u32, ch: u8, fg: u32, bg: Option<u32>) {
     let glyph = font::glyph(ch);
     for (row, bits) in glyph.iter().enumerate() {

@@ -24,46 +24,102 @@ use crate::multiboot;
 use crate::shell::{self, Feed, LineEditor};
 use crate::task;
 
-const TITLE_BAR_HEIGHT: u32 = 20;
-const TASKBAR_HEIGHT: u32 = 28;
-const CLOSE_BUTTON_SIZE: u32 = 14;
-const MINIMIZE_BUTTON_SIZE: u32 = 14;
-const MAXIMIZE_BUTTON_SIZE: u32 = 14;
+const TITLE_BAR_HEIGHT: u32 = 22;
+const TASKBAR_HEIGHT: u32 = 30;
+const CLOSE_BUTTON_SIZE: u32 = 16;
+const MINIMIZE_BUTTON_SIZE: u32 = 16;
+const MAXIMIZE_BUTTON_SIZE: u32 = 16;
+const BUTTON_RADIUS: u32 = 4;
 const RESIZE_GRIP_SIZE: u32 = 12;
 const MIN_COLS: usize = 20;
 const MIN_ROWS: usize = 5;
 const DESKTOP_BG_TOP: u32 = 0x00_3A5680;
 const DESKTOP_BG_BOTTOM: u32 = 0x00_1B2A42;
-const TITLE_FOCUSED: u32 = 0x00_2C5F9E;
-const TITLE_UNFOCUSED: u32 = 0x00_45505C;
-const TITLE_HIGHLIGHT: u32 = 0x00_5B8FD4;
-const WINDOW_BORDER_FOCUSED: u32 = 0x00_7FB2E5;
-const WINDOW_BORDER: u32 = 0x00_223143;
-const WINDOW_SHADOW: u32 = 0x00_121D28;
-const WINDOW_SHADOW_OFFSET: u32 = 6;
-const TASKBAR_BG: u32 = 0x00_15202B;
+
+// Title bar
+const TITLE_FOCUSED_TOP: u32 = 0x00_4481C8;
+const TITLE_FOCUSED_BOTTOM: u32 = 0x00_1D4A7C;
+const TITLE_UNFOCUSED_TOP: u32 = 0x00_4D5863;
+const TITLE_UNFOCUSED_BOTTOM: u32 = 0x00_313A43;
+const TITLE_HILITE: u32 = 0x00_9CC9F2;
+const TITLE_TEXT: u32 = 0x00_FFFFFF;
+const TITLE_TEXT_UNFOCUSED: u32 = 0x00_B6C2CD;
+const TITLE_TEXT_SHADOW: u32 = 0x00_0F2A45;
+const TITLE_UNDERLINE: u32 = 0x00_0F1E2E;
+
+// Window frame and drop shadow (drawn as three nested offsets, darkest
+// furthest from the window, so the edge fades out like a soft shadow)
+const WINDOW_BORDER_FOCUSED: u32 = 0x00_74B3E9;
+const WINDOW_BORDER: u32 = 0x00_2A3642;
+const WINDOW_SHADOW_OUTER: u32 = 0x00_070C12;
+const WINDOW_SHADOW_MID: u32 = 0x00_0E161F;
+const WINDOW_SHADOW_INNER: u32 = 0x00_18232F;
+
+// Title bar buttons
+const BTN_CLOSE_BASE: u32 = 0x00_C04E45;
+const BTN_CLOSE_HOVER: u32 = 0x00_E2685E;
+const BTN_CLOSE_HILITE: u32 = 0x00_E2877E;
+const BTN_NEUTRAL_BASE: u32 = 0x00_39454F;
+const BTN_NEUTRAL_HOVER: u32 = 0x00_505D6B;
+const BTN_NEUTRAL_HILITE: u32 = 0x00_55626F;
+const BTN_GLYPH: u32 = 0x00_FFFFFF;
+const BTN_GLYPH_SHADOW: u32 = 0x00_1A1A1A;
+const RESIZE_GRIP_COLOR: u32 = 0x00_9AABBB;
+
+// Taskbar
+const TASKBAR_BG_TOP: u32 = 0x00_25313E;
+const TASKBAR_BG_BOTTOM: u32 = 0x00_121B24;
 const TASKBAR_TOP_LINE: u32 = 0x00_3E5878;
-const TASKBAR_BUTTON_FOCUSED: u32 = 0x00_3C6EA8;
-const TASKBAR_BUTTON: u32 = 0x00_263340;
-const TASKBAR_BUTTON_MINIMIZED: u32 = 0x00_18222C;
-const CLOSE_BUTTON_COLOR: u32 = 0x00_B33A3A;
-const MINIMIZE_BUTTON_COLOR: u32 = 0x00_4A4A2E;
-const MAXIMIZE_BUTTON_COLOR: u32 = 0x00_2F5C55;
-const RESIZE_GRIP_COLOR: u32 = 0x00_6E7C8C;
+const TASKBAR_DIVIDER: u32 = 0x00_33414F;
+const TASKBAR_TEXT: u32 = 0x00_DBE6F0;
+const TASKBAR_TEXT_DIM: u32 = 0x00_9AA8B5;
+
+// Start button
+const START_BUTTON_WIDTH: u32 = 90;
+const START_BTN_TOP: u32 = 0x00_3A6A9C;
+const START_BTN_BOTTOM: u32 = 0x00_21456E;
+const START_BTN_HOVER_TOP: u32 = 0x00_4478AE;
+const START_BTN_HOVER_BOTTOM: u32 = 0x00_295180;
+const START_BTN_EDGE: u32 = 0x00_12253C;
+const START_LOGO_BG: u32 = 0x00_1C3A5E;
+const START_LOGO_GLYPH: u32 = 0x00_8FD0FF;
+
+// Taskbar window buttons
+const TB_BTN_FOCUSED_TOP: u32 = 0x00_3C6EA8;
+const TB_BTN_FOCUSED_BOTTOM: u32 = 0x00_244A78;
+const TB_BTN_TOP: u32 = 0x00_2A3642;
+const TB_BTN_BOTTOM: u32 = 0x00_1C262F;
+const TB_BTN_HOVER_TOP: u32 = 0x00_35424F;
+const TB_BTN_HOVER_BOTTOM: u32 = 0x00_25303A;
+const TB_BTN_MIN_TOP: u32 = 0x00_1B242D;
+const TB_BTN_MIN_BOTTOM: u32 = 0x00_131A22;
+const TB_BTN_EDGE: u32 = 0x00_0E141B;
+const TB_ACCENT: u32 = 0x00_6FB1E8;
+
+// Launcher popup
+const LAUNCHER_BG: u32 = 0x00_1B2530;
+const LAUNCHER_BORDER: u32 = 0x00_74B3E9;
+const LAUNCHER_HEADER_TOP: u32 = 0x00_2C4E7A;
+const LAUNCHER_HEADER_BOTTOM: u32 = 0x00_1D3A5E;
+const LAUNCHER_HEADER_TEXT: u32 = 0x00_FFFFFF;
+const LAUNCHER_ITEM_HOVER_TOP: u32 = 0x00_2D4967;
+const LAUNCHER_ITEM_HOVER_BOTTOM: u32 = 0x00_223B54;
+const LAUNCHER_TEXT: u32 = 0x00_DAE5EE;
+const LAUNCHER_TEXT_DIM: u32 = 0x00_93A2B0;
+const LAUNCHER_ACCENT: u32 = 0x00_6FB1E8;
+const LAUNCHER_WIDTH: u32 = 280;
+const LAUNCHER_HEADER_H: u32 = 18;
+const LAUNCHER_ITEM_HEIGHT: u32 = 30;
+const LAUNCHER_SHADOW: u32 = 0x00_070C12;
+// Where taskbar window buttons begin, past the Start button.
+const WINDOW_BUTTONS_START_X: i32 = 8 + START_BUTTON_WIDTH as i32 + 10;
+
+// Console / editor content colors
 const CONSOLE_FG: u32 = 0x00_E0E0E0;
 const CONSOLE_BG: u32 = 0x00_10161C;
 const EDITOR_CURSOR_COLOR: u32 = 0x00_FFCC66;
 const EDITOR_STATUS_BG: u32 = 0x00_1A2430;
 const EDITOR_STATUS_FG: u32 = 0x00_8FB8D8;
-
-const START_BUTTON_WIDTH: u32 = 90;
-const START_BUTTON_BG: u32 = 0x00_2F4A73;
-const LAUNCHER_BG: u32 = 0x00_1C2733;
-const LAUNCHER_ITEM_HOVER: u32 = 0x00_35506E;
-const LAUNCHER_WIDTH: u32 = 280;
-const LAUNCHER_ITEM_HEIGHT: u32 = 30;
-// Where taskbar window buttons begin, past the Start button.
-const WINDOW_BUTTONS_START_X: i32 = 8 + START_BUTTON_WIDTH as i32 + 10;
 
 #[derive(Clone)]
 enum LauncherAction {
@@ -448,7 +504,8 @@ impl WindowManager {
     }
 
     fn launcher_popup_rect(&self) -> (i32, i32, u32, u32) {
-        let popup_h = LAUNCHER_ITEM_HEIGHT * self.launcher_items.len().max(1) as u32 + 8;
+        let items_h = LAUNCHER_ITEM_HEIGHT * self.launcher_items.len().max(1) as u32;
+        let popup_h = LAUNCHER_HEADER_H + items_h + 6;
         let popup_y = self.screen_h as i32 - TASKBAR_HEIGHT as i32 - popup_h as i32;
         (8, popup_y, LAUNCHER_WIDTH, popup_h)
     }
@@ -462,8 +519,11 @@ impl WindowManager {
         {
             return None;
         }
-        let rel_y = (self.cursor_y - py - 4).max(0) as u32;
-        let idx = (rel_y / LAUNCHER_ITEM_HEIGHT) as usize;
+        let rel_y = self.cursor_y - py - LAUNCHER_HEADER_H as i32 - 2;
+        if rel_y < 0 {
+            return None;
+        }
+        let idx = (rel_y as u32 / LAUNCHER_ITEM_HEIGHT) as usize;
         if idx < self.launcher_items.len() {
             Some(idx)
         } else {
@@ -566,20 +626,46 @@ impl WindowManager {
 
     fn draw_launcher(&self, surface: &mut dyn Surface) {
         let (px, py, pw, ph) = self.launcher_popup_rect();
-        let bx = (px - 1).max(0) as u32;
-        let by = (py - 1).max(0) as u32;
-        gfx::fill_rect(surface, bx, by, pw + 2, ph + 2, WINDOW_BORDER_FOCUSED);
-        gfx::fill_rect(surface, px as u32, py as u32, pw, ph, LAUNCHER_BG);
+        let px = px as u32;
+        let py = py as u32;
+
+        gfx::fill_rect(surface, px + 4, py + 4, pw, ph, LAUNCHER_SHADOW);
+        gfx::fill_rounded_rect(surface, px - 1, py - 1, pw + 2, ph + 2, 7, LAUNCHER_BORDER);
+        gfx::fill_rounded_rect(surface, px, py, pw, ph, 6, LAUNCHER_BG);
+        gfx::fill_rounded_rect_gradient_v(
+            surface,
+            px,
+            py,
+            pw,
+            LAUNCHER_HEADER_H,
+            6,
+            LAUNCHER_HEADER_TOP,
+            LAUNCHER_HEADER_BOTTOM,
+        );
+        gfx::fill_rect(surface, px, py + LAUNCHER_HEADER_H, pw, 1, 0x00_14263C);
+        gfx::draw_string(surface, px + 10, py + 5, "Applications", LAUNCHER_HEADER_TEXT, None);
+
+        let item_y0 = py + LAUNCHER_HEADER_H + 2;
         for (i, (label, _)) in self.launcher_items.iter().enumerate() {
-            let iy = py as u32 + 4 + i as u32 * LAUNCHER_ITEM_HEIGHT;
+            let iy = item_y0 + i as u32 * LAUNCHER_ITEM_HEIGHT;
             let hovered = self.cursor_y >= iy as i32
                 && self.cursor_y < (iy + LAUNCHER_ITEM_HEIGHT) as i32
-                && self.cursor_x >= px
-                && self.cursor_x < px + pw as i32;
+                && self.cursor_x >= px as i32 + 2
+                && self.cursor_x < px as i32 + pw as i32 - 2;
             if hovered {
-                gfx::fill_rect(surface, px as u32 + 2, iy, pw - 4, LAUNCHER_ITEM_HEIGHT - 2, LAUNCHER_ITEM_HOVER);
+                gfx::fill_rect(surface, px + 3, iy + 3, 2, LAUNCHER_ITEM_HEIGHT - 6, LAUNCHER_ACCENT);
+                gfx::fill_rect_gradient_v(
+                    surface,
+                    px + 2,
+                    iy,
+                    pw - 4,
+                    LAUNCHER_ITEM_HEIGHT,
+                    LAUNCHER_ITEM_HOVER_TOP,
+                    LAUNCHER_ITEM_HOVER_BOTTOM,
+                );
             }
-            gfx::draw_string(surface, px as u32 + 10, iy + 8, label, 0x00_FFFFFF, None);
+            let text_color = if hovered { LAUNCHER_TEXT } else { LAUNCHER_TEXT_DIM };
+            gfx::draw_string(surface, px + 12, iy + 11, label, text_color, None);
         }
     }
 
@@ -802,7 +888,7 @@ impl WindowManager {
             }
             for (i, window) in self.windows.iter().enumerate() {
                 if window.open && !window.minimized {
-                    draw_window(surface, window, i == self.focused);
+                    draw_window(surface, window, i == self.focused, self.cursor_x, self.cursor_y);
                 }
             }
             self.draw_taskbar(surface);
@@ -816,28 +902,51 @@ impl WindowManager {
 
     fn draw_taskbar(&self, surface: &mut dyn Surface) {
         let y = self.screen_h - TASKBAR_HEIGHT;
-        gfx::fill_rect(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, TASKBAR_BG);
+        gfx::fill_rect_gradient_v(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, TASKBAR_BG_TOP, TASKBAR_BG_BOTTOM);
         gfx::fill_rect(surface, 0, y, self.screen_w, 1, TASKBAR_TOP_LINE);
 
-        let start_color = if self.launcher_open { TASKBAR_BUTTON_FOCUSED } else { START_BUTTON_BG };
-        gfx::fill_rect(surface, 8, y + 4, START_BUTTON_WIDTH, TASKBAR_HEIGHT - 8, start_color);
-        gfx::draw_string(surface, 8 + 6, y + 8, "Apps", 0x00_FFFFFF, None);
+        // Start button: gradient pill with a small logo tile.
+        let start_hovered = self.start_button_hit();
+        let (start_top, start_bottom) = if start_hovered || self.launcher_open {
+            (START_BTN_HOVER_TOP, START_BTN_HOVER_BOTTOM)
+        } else {
+            (START_BTN_TOP, START_BTN_BOTTOM)
+        };
+        gfx::fill_rounded_rect_gradient_v(surface, 8, y + 3, START_BUTTON_WIDTH, TASKBAR_HEIGHT - 6, 5, start_top, start_bottom);
+        gfx::fill_rect(surface, 9, y + TASKBAR_HEIGHT - 4, START_BUTTON_WIDTH - 2, 1, START_BTN_EDGE);
+        gfx::fill_rounded_rect(surface, 8 + 5, y + 7, 16, 16, 3, START_LOGO_BG);
+        gfx::draw_string(surface, 8 + 9, y + 11, "M", START_LOGO_GLYPH, None);
+        gfx::draw_string(surface, 8 + 27, y + 11, "Apps", 0x00_FFFFFF, None);
 
+        let btn_h = TASKBAR_HEIGHT - 6;
         let mut x = WINDOW_BUTTONS_START_X as u32;
         for (i, window) in self.windows.iter().enumerate() {
             if !window.open {
                 continue;
             }
             let label_w = taskbar_label_width(window.title) as u32;
-            let color = if i == self.focused {
-                TASKBAR_BUTTON_FOCUSED
+            let focused = i == self.focused;
+            let hovered = self.cursor_x >= x as i32
+                && self.cursor_x < (x + label_w) as i32
+                && self.cursor_y >= y as i32 + 3
+                && self.cursor_y < y as i32 + TASKBAR_HEIGHT as i32 - 3;
+            let (top, bottom) = if focused {
+                (TB_BTN_FOCUSED_TOP, TB_BTN_FOCUSED_BOTTOM)
             } else if window.minimized {
-                TASKBAR_BUTTON_MINIMIZED
+                (TB_BTN_MIN_TOP, TB_BTN_MIN_BOTTOM)
+            } else if hovered {
+                (TB_BTN_HOVER_TOP, TB_BTN_HOVER_BOTTOM)
             } else {
-                TASKBAR_BUTTON
+                (TB_BTN_TOP, TB_BTN_BOTTOM)
             };
-            gfx::fill_rect(surface, x, y + 4, label_w, TASKBAR_HEIGHT - 8, color);
-            gfx::draw_string(surface, x + 6, y + 8, window.title, 0x00_FFFFFF, None);
+            gfx::fill_rounded_rect_gradient_v(surface, x, y + 3, label_w, btn_h, BUTTON_RADIUS, top, bottom);
+            gfx::fill_rect(surface, x + 1, y + 3 + btn_h - 1, label_w - 2, 1, TB_BTN_EDGE);
+            if focused {
+                // Small accent pill on the top edge marks the active window.
+                gfx::fill_rounded_rect(surface, x + 3, y + 2, label_w - 6, 3, 2, TB_ACCENT);
+            }
+            let text_color = if window.minimized { TASKBAR_TEXT_DIM } else { TASKBAR_TEXT };
+            gfx::draw_string(surface, x + 6, y + 11, window.title, text_color, None);
             x += label_w + 6;
         }
 
@@ -852,7 +961,8 @@ impl WindowManager {
             secs % 60
         );
         let clock_w = (clock.len() * font::GLYPH_WIDTH) as u32;
-        gfx::draw_string(surface, self.screen_w - clock_w - 12, y + 8, &clock, 0x00_FFFFFF, None);
+        let clock_x = self.screen_w - clock_w - 12;
+        gfx::draw_string(surface, clock_x, y + 11, &clock, TASKBAR_TEXT, None);
 
         // Background counter tasks keep running (preemptively, via the
         // scheduler in task.rs) whether or not anyone is looking at the
@@ -863,7 +973,9 @@ impl WindowManager {
             .collect::<Vec<_>>();
         let bg = format!("bg: {} {} {}", counters[0], counters[1], counters[2]);
         let bg_w = (bg.len() * font::GLYPH_WIDTH) as u32;
-        gfx::draw_string(surface, self.screen_w - clock_w - bg_w - 24, y + 8, &bg, 0x00_9FCB6B, None);
+        let bg_x = clock_x - bg_w - 16;
+        gfx::draw_string(surface, bg_x, y + 11, &bg, 0x00_86C77B, None);
+        gfx::fill_rect(surface, bg_x - 9, y + 4, 1, TASKBAR_HEIGHT - 8, TASKBAR_DIVIDER);
     }
 }
 
@@ -1042,54 +1154,138 @@ fn title_button_positions(wx: i32, content_w: u32, resizable: bool) -> (i32, Opt
     (minimize_x, maximize_x, close_x)
 }
 
-fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool) {
+/// 1px-thick diagonal line from (x0, y0) down-right to (x1, y1),
+/// inclusive (x1 >= x0, y1 >= y0).
+fn draw_diagonal(surface: &mut dyn Surface, x0: u32, y0: u32, x1: u32, y1: u32, color: u32) {
+    let (mut x, mut y) = (x0, y0);
+    loop {
+        surface.put_pixel(x, y, color);
+        if x >= x1 || y >= y1 {
+            break;
+        }
+        x += 1;
+        y += 1;
+    }
+}
+
+/// Close glyph: a thick X filling an `s`x`s` box at (x, y).
+fn draw_close_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
+    for i in 0..s {
+        surface.put_pixel(x + i, y + i, color);
+        surface.put_pixel(x + i + 1, y + i, color);
+        surface.put_pixel(x + s - 1 - i, y + i, color);
+        if i + 2 <= s {
+            surface.put_pixel(x + s - 2 - i, y + i, color);
+        }
+    }
+}
+
+/// Minimize glyph: a thick bottom bar.
+fn draw_minimize_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
+    gfx::fill_rect(surface, x, y + s - 2, s, 2, color);
+}
+
+/// Maximize glyph: a square outline with a thick top edge.
+fn draw_maximize_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
+    gfx::fill_rect(surface, x, y, s, 2, color);
+    gfx::fill_rect(surface, x, y, 1, s, color);
+    gfx::fill_rect(surface, x + s - 1, y, 1, s, color);
+    gfx::fill_rect(surface, x, y + s - 1, s, 1, color);
+}
+
+/// Restore glyph (shown on a maximized window's maximize button): a
+/// small square behind a slightly larger one, offset to the bottom-right.
+fn draw_restore_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
+    gfx::fill_rect(surface, x, y, s - 1, 2, color);
+    gfx::fill_rect(surface, x, y, 1, s - 1, color);
+    let (ox, oy) = (x + 2, y + 2);
+    let os = s - 2;
+    gfx::fill_rect(surface, ox, oy, os, 2, color);
+    gfx::fill_rect(surface, ox, oy, 1, os, color);
+    gfx::fill_rect(surface, ox + os - 1, oy, 1, os, color);
+    gfx::fill_rect(surface, ox, oy + os - 1, os, 1, color);
+}
+
+/// One rounded title-bar button: gradient-free flat base with a 1px
+/// inner top highlight, brightening on hover. The glyph is drawn by the
+/// caller afterwards.
+fn draw_title_button(surface: &mut dyn Surface, x: u32, y: u32, hovered: bool, base: u32, hover: u32, hilite: u32) {
+    let color = if hovered { hover } else { base };
+    gfx::fill_rounded_rect(surface, x, y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, BUTTON_RADIUS, color);
+    gfx::fill_rect(surface, x + 1, y + 1, CLOSE_BUTTON_SIZE - 2, 1, hilite);
+}
+
+fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool, cursor_x: i32, cursor_y: i32) {
     let (content_w, content_h) = window.content_size();
     let x = window.x as u32;
     let y = window.y as u32;
     let total_h = TITLE_BAR_HEIGHT + content_h;
 
-    // Drop shadow first, so the window itself paints over the part that
-    // overlaps it; then a 1px border frame just outside the window edge.
-    gfx::fill_rect(surface, x + WINDOW_SHADOW_OFFSET, y + WINDOW_SHADOW_OFFSET, content_w, total_h, WINDOW_SHADOW);
+    // Soft drop shadow: three nested offsets, darkest furthest away.
+    gfx::fill_rect(surface, x + 6, y + 6, content_w, total_h, WINDOW_SHADOW_OUTER);
+    gfx::fill_rect(surface, x + 4, y + 4, content_w, total_h, WINDOW_SHADOW_MID);
+    gfx::fill_rect(surface, x + 2, y + 2, content_w, total_h, WINDOW_SHADOW_INNER);
     let border_color = if focused { WINDOW_BORDER_FOCUSED } else { WINDOW_BORDER };
     let bx = x.saturating_sub(1);
     let by = y.saturating_sub(1);
     gfx::fill_rect(surface, bx, by, content_w + 2, total_h + 2, border_color);
 
-    let title_color = if focused { TITLE_FOCUSED } else { TITLE_UNFOCUSED };
-    gfx::fill_rect(surface, x, y, content_w, TITLE_BAR_HEIGHT, title_color);
+    // Title bar: gradient, bright top edge when focused, text with a
+    // soft drop shadow, dark underline separating it from the content.
+    let (title_top, title_bottom) = if focused {
+        (TITLE_FOCUSED_TOP, TITLE_FOCUSED_BOTTOM)
+    } else {
+        (TITLE_UNFOCUSED_TOP, TITLE_UNFOCUSED_BOTTOM)
+    };
+    gfx::fill_rect_gradient_v(surface, x, y, content_w, TITLE_BAR_HEIGHT, title_top, title_bottom);
     if focused {
-        gfx::fill_rect(surface, x, y, content_w, 1, TITLE_HIGHLIGHT);
+        gfx::fill_rect(surface, x, y, content_w, 1, TITLE_HILITE);
     }
-    gfx::draw_string(surface, x + 4, y + 6, window.title, 0x00_FFFFFF, None);
+    let title_color = if focused { TITLE_TEXT } else { TITLE_TEXT_UNFOCUSED };
+    let ty = y + (TITLE_BAR_HEIGHT - font::GLYPH_HEIGHT as u32) / 2;
+    gfx::draw_string(surface, x + 5, ty + 1, window.title, TITLE_TEXT_SHADOW, None);
+    gfx::draw_string(surface, x + 5, ty, window.title, title_color, None);
+    gfx::fill_rect(surface, x, y + TITLE_BAR_HEIGHT - 1, content_w, 1, TITLE_UNDERLINE);
 
     let (minimize_x, maximize_x, close_x) = title_button_positions(window.x, content_w, window.resizable);
 
-    gfx::fill_rect(surface, close_x as u32, y + 3, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_COLOR);
-    gfx::draw_string(surface, close_x as u32 + 3, y + 4, "x", 0x00_FFFFFF, None);
+    // Buttons: hover state tracks the cursor so they brighten on mouseover.
+    let in_button_row = cursor_y >= y as i32 + 3 && cursor_y < y as i32 + 3 + CLOSE_BUTTON_SIZE as i32;
+    let hover_min = in_button_row && cursor_x >= minimize_x && cursor_x < minimize_x + MINIMIZE_BUTTON_SIZE as i32;
+    let hover_close = in_button_row && cursor_x >= close_x && cursor_x < close_x + CLOSE_BUTTON_SIZE as i32;
+
+    let minimize_x = minimize_x as u32;
+    draw_title_button(surface, minimize_x, y + 3, hover_min, BTN_NEUTRAL_BASE, BTN_NEUTRAL_HOVER, BTN_NEUTRAL_HILITE);
+    draw_minimize_icon(surface, minimize_x + 4, y + 6, 8, BTN_GLYPH_SHADOW);
+    draw_minimize_icon(surface, minimize_x + 4, y + 5, 8, BTN_GLYPH);
 
     if let Some(max_x) = maximize_x {
         let max_x = max_x as u32;
-        gfx::fill_rect(surface, max_x, y + 3, MAXIMIZE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, MAXIMIZE_BUTTON_COLOR);
-        // A small square outline reads as "maximize" without needing a
-        // dedicated glyph in the 8x8 font.
-        let (ix, iy, is) = (max_x + 4, y + 6, 6u32);
-        gfx::fill_rect(surface, ix, iy, is, 1, 0x00_FFFFFF);
-        gfx::fill_rect(surface, ix, iy + is - 1, is, 1, 0x00_FFFFFF);
-        gfx::fill_rect(surface, ix, iy, 1, is, 0x00_FFFFFF);
-        gfx::fill_rect(surface, ix + is - 1, iy, 1, is, 0x00_FFFFFF);
+        let hover_max = in_button_row && cursor_x >= max_x as i32 && cursor_x < max_x as i32 + MAXIMIZE_BUTTON_SIZE as i32;
+        draw_title_button(surface, max_x, y + 3, hover_max, BTN_NEUTRAL_BASE, BTN_NEUTRAL_HOVER, BTN_NEUTRAL_HILITE);
+        let icon_x = max_x + 4;
+        if window.maximized {
+            draw_restore_icon(surface, icon_x, y + 7, 8, BTN_GLYPH_SHADOW);
+            draw_restore_icon(surface, icon_x, y + 6, 8, BTN_GLYPH);
+        } else {
+            draw_maximize_icon(surface, icon_x, y + 7, 8, BTN_GLYPH_SHADOW);
+            draw_maximize_icon(surface, icon_x, y + 6, 8, BTN_GLYPH);
+        }
     }
 
-    let minimize_x = minimize_x as u32;
-    gfx::fill_rect(surface, minimize_x, y + 3, MINIMIZE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, MINIMIZE_BUTTON_COLOR);
-    gfx::draw_string(surface, minimize_x + 3, y + 4, "_", 0x00_FFFFFF, None);
+    let close_x = close_x as u32;
+    draw_title_button(surface, close_x, y + 3, hover_close, BTN_CLOSE_BASE, BTN_CLOSE_HOVER, BTN_CLOSE_HILITE);
+    draw_close_icon(surface, close_x + 4, y + 7, 8, BTN_GLYPH_SHADOW);
+    draw_close_icon(surface, close_x + 4, y + 6, 8, BTN_GLYPH);
 
     gfx::blit(surface, x, y + TITLE_BAR_HEIGHT, window.content_pixels(), content_w, content_h);
 
     if window.resizable && !window.maximized {
         let grip_x = x + content_w - RESIZE_GRIP_SIZE;
         let grip_y = y + TITLE_BAR_HEIGHT + content_h - RESIZE_GRIP_SIZE;
-        gfx::fill_rect(surface, grip_x, grip_y, RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x, grip_y + 7, grip_x + 6, grip_y + 1, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x + 2, grip_y + 9, grip_x + 8, grip_y + 3, RESIZE_GRIP_COLOR);
+        draw_diagonal(surface, grip_x + 4, grip_y + 11, grip_x + 10, grip_y + 5, RESIZE_GRIP_COLOR);
     }
 }
 
@@ -1114,13 +1310,31 @@ const CURSOR_BITS: [u16; 16] = [
 ];
 
 fn draw_cursor(surface: &mut dyn Surface, x: i32, y: i32) {
+    // Paint the shape eight times offset by one pixel in black first, so
+    // the white cursor stays visible over bright parts of the wallpaper.
+    for (dx, dy) in [
+        (-1i32, -1i32),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ] {
+        paint_cursor_shape(surface, x + dx, y + dy, 0x00_000000);
+    }
+    paint_cursor_shape(surface, x, y, 0x00_FFFFFF);
+}
+
+fn paint_cursor_shape(surface: &mut dyn Surface, x: i32, y: i32, color: u32) {
     for (row, bits) in CURSOR_BITS.iter().enumerate() {
         for col in 0..CURSOR_W {
             if bits & (1 << (CURSOR_W - 1 - col)) != 0 {
                 let px = x + col as i32;
                 let py = y + row as i32;
                 if px >= 0 && py >= 0 {
-                    surface.put_pixel(px as u32, py as u32, 0x00_FFFFFF);
+                    surface.put_pixel(px as u32, py as u32, color);
                 }
             }
         }
