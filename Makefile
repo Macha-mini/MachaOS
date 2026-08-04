@@ -1,0 +1,60 @@
+TOOLCHAIN_BIN := $(shell ls -d $(HOME)/.rustup/toolchains/nightly*/lib/rustlib/*apple-darwin/bin 2>/dev/null | head -1)
+export PATH := $(TOOLCHAIN_BIN):$(HOME)/.cargo/bin:$(PATH)
+
+QEMU := qemu-system-x86_64
+KERNEL := target/x86_64-unknown-none/release/machaos
+GRUB_MKRESCUE := $(shell command -v i686-elf-grub-mkrescue 2>/dev/null || command -v grub-mkrescue 2>/dev/null)
+GRUB_CFG ?= boot/grub/grub.cfg
+ISO_DIR := target/machaos-iso
+ISO := target/machaos.iso
+TEST_LOG := /tmp/machaos-selftest.log
+
+.PHONY: all build gen iso run run-nographic test clean
+
+all: build
+
+gen:
+	python3 tools/gen_isr.py
+
+build: gen
+	cargo build --release
+
+iso: build
+	@test -n "$(GRUB_MKRESCUE)" || (echo "x86_64-elf-grub-mkrescue or grub-mkrescue is required"; exit 1)
+	rm -rf $(ISO_DIR)
+	mkdir -p $(ISO_DIR)/boot/grub
+	cp $(KERNEL) $(ISO_DIR)/boot/machaos
+	cp $(GRUB_CFG) $(ISO_DIR)/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(ISO) $(ISO_DIR)
+
+run: iso
+	$(QEMU) -cdrom $(ISO) -serial stdio
+
+run-nographic: iso
+	$(QEMU) -cdrom $(ISO) -boot d -display none -serial stdio
+
+test: GRUB_CFG=boot/grub/grub-selftest.cfg
+test: iso
+	@rm -f $(TEST_LOG)
+	@echo "== running MachaOS selftest in QEMU =="
+	@$(QEMU) -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) \
+		-device isa-debug-exit,iobase=0xf4,iosize=0x04 &
+	@for i in $$(seq 1 60); do \
+		sleep 1; \
+		if grep -q "SELFTEST OK" $(TEST_LOG) 2>/dev/null; then \
+			echo "== PASS: selftest completed =="; \
+			cat $(TEST_LOG); \
+			exit 0; \
+		fi; \
+		if ! pgrep -q qemu-system-x86_64; then \
+			echo "== FAIL: QEMU exited before the selftest finished =="; \
+			cat $(TEST_LOG); \
+			exit 1; \
+		fi; \
+	done; \
+	echo "== FAIL: selftest timed out =="; \
+	cat $(TEST_LOG); \
+	exit 1
+
+clean:
+	cargo clean

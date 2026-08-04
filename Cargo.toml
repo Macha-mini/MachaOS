@@ -1,0 +1,15 @@
+[package]
+name = "machaos"
+version = "0.1.0"
+edition = "2024"
+description = "MachaOS - a small x86_64 operating system written in Rust"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+strip = true
