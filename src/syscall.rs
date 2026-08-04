@@ -257,7 +257,7 @@ pub fn write_count() -> u64 {
 /// addresses the kernel mapped itself, so those are trusted as-is.
 pub(crate) fn resolve_user_buffer(ptr: u64, len: u64) -> Option<u64> {
     if crate::task::current_is_process() {
-        crate::process::translate(crate::task::current_pid(), ptr, len)
+        crate::process::resolve_syscall_ptr(crate::task::current_pid(), ptr, len)
     } else if paging::is_identity_mapped(ptr, len) {
         Some(ptr)
     } else {

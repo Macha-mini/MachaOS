@@ -157,6 +157,21 @@ pub struct Process {
     /// `USER_STACK_BASE` and moves down as `try_grow_stack` maps more of
     /// the reserved growth region below it.
     stack_low: u64,
+    /// Physical base of this process's entire `USER_STACK_MAX_PAGES`
+    /// stack allocation (see `init_stack_backing`), reserved as one
+    /// contiguous block up front at spawn even though most of it isn't
+    /// page-table-mapped for ring-3 access yet. That's deliberate: the
+    /// kernel's own `Mapping`/`translate` bookkeeping (used to validate
+    /// a *syscall* pointer via direct physical access — entirely
+    /// separate from what's page-table-present for the process's own
+    /// ring-3 accesses) registers the whole range as a single `Mapping`
+    /// from the start, so a syscall output buffer straddling two
+    /// separate `try_grow_stack` calls still resolves as one contiguous
+    /// range. Per-event physical allocation (the original design) broke
+    /// this the first time a real dynamically-linked binary's `ld.so`
+    /// passed `fstat` a stack buffer straddling exactly such a boundary
+    /// — caught by testing against one, not a hypothetical.
+    stack_phys_base: u64,
     /// Which syscall table this process's syscalls dispatch to. See `Abi`.
     pub(crate) abi: Abi,
     /// Fixed once at spawn, just past the highest loaded segment
@@ -230,6 +245,36 @@ impl Process {
         }
     }
 
+    /// Reserves this process's entire growable stack region
+    /// (`[USER_STACK_LOW_LIMIT, USER_STACK_TOP)`, `USER_STACK_MAX_PAGES`
+    /// pages) as one contiguous physical block and registers it as a
+    /// single `Mapping`, up front — see `stack_phys_base`'s doc comment
+    /// for why. Must run (via `setup_user_stack`/`setup_linux_stack`)
+    /// before any `try_grow_stack` call.
+    fn init_stack_backing(&mut self) -> Result<(), &'static str> {
+        let pages = USER_STACK_MAX_PAGES as usize;
+        let phys = pmm::alloc_contiguous(pages).ok_or("out of memory")?;
+        for i in 0..pages {
+            self.frames.push(phys + i * pmm::FRAME_SIZE);
+        }
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, pages * pmm::FRAME_SIZE);
+        }
+        self.stack_phys_base = phys as u64;
+        self.mappings.push(Mapping {
+            vaddr: USER_STACK_LOW_LIMIT,
+            phys: phys as u64,
+            len: USER_STACK_MAX_PAGES * paging::PAGE_SIZE,
+        });
+        Ok(())
+    }
+
+    /// Physical address backing `vaddr` within the growable stack region,
+    /// given `init_stack_backing` already ran.
+    fn stack_phys_for(&self, vaddr: u64) -> u64 {
+        self.stack_phys_base + (vaddr - USER_STACK_LOW_LIMIT)
+    }
+
     /// Grows the ring-3 stack down to cover `fault_addr`, if it is a
     /// legitimate "touched just below the current floor" access: still
     /// inside the reserved growth region (`>= USER_STACK_LOW_LIMIT`) but
@@ -240,37 +285,28 @@ impl Process {
     /// probing) is covered in one fault instead of needing one fault per
     /// page. Returns `false` (leaving the fault to kill the process, same
     /// as before this existed) for anything outside that region.
+    ///
+    /// Only installs page-table entries — the physical backing is
+    /// already there (`init_stack_backing`) and already registered as
+    /// part of the one whole-region `Mapping`, so there's no new frame
+    /// allocation or `Mapping` to push here.
     fn try_grow_stack(&mut self, pml4: u64, fault_addr: u64) -> bool {
         if fault_addr >= self.stack_low || fault_addr < USER_STACK_LOW_LIMIT {
             return false;
         }
         let new_low = fault_addr & !(paging::PAGE_SIZE - 1);
         let grow_len = self.stack_low - new_low;
-        let pages = (grow_len / paging::PAGE_SIZE) as usize;
-        let Some(phys) = pmm::alloc_contiguous(pages) else {
-            return false;
-        };
-        for i in 0..pages {
-            self.frames.push(phys + i * pmm::FRAME_SIZE);
-        }
-        unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, grow_len as usize);
-        }
+        let phys = self.stack_phys_for(new_low);
         if !paging::map_range_in(
             pml4,
             new_low,
-            phys as u64,
+            phys,
             grow_len,
             paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
             &mut self.frames,
         ) {
             return false;
         }
-        self.mappings.push(Mapping {
-            vaddr: new_low,
-            phys: phys as u64,
-            len: grow_len,
-        });
         self.stack_low = new_low;
         true
     }
@@ -523,6 +559,7 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         inbox: None,
         fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
         stack_low: USER_STACK_BASE,
+        stack_phys_base: 0, // set by init_stack_backing below
         abi: Abi::Native,
         heap_start: 0,
         heap_end: 0,
@@ -580,6 +617,7 @@ pub fn spawn_linux(elf_bytes: &[u8], name: &'static str, argv: &[&str], envp: &[
         inbox: None,
         fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
         stack_low: USER_STACK_BASE,
+        stack_phys_base: 0, // set by init_stack_backing below
         abi: Abi::Linux,
         heap_start,
         heap_end: heap_start,
@@ -853,34 +891,24 @@ const fn align_up(value: u64, align: u64) -> u64 {
 /// closing `ret`, it lands on `mov eax, SYS_EXIT; syscall` instead of
 /// falling into kernel code it has no ring-3 access to.
 fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str> {
+    // Registers the whole growable region as a single Mapping (see
+    // `stack_phys_base`'s doc comment for why that matters for a
+    // syscall pointer's validation, not just ring-3 access) — that's
+    // what makes the standalone `process.mappings.push` a previous
+    // version of this function did here unnecessary now.
+    process.init_stack_backing()?;
     let stack_len = USER_STACK_PAGES * paging::PAGE_SIZE;
-    let stack_phys = pmm::alloc_contiguous(USER_STACK_PAGES as usize).ok_or("out of memory")?;
-    for i in 0..USER_STACK_PAGES as usize {
-        process.frames.push(stack_phys + i * pmm::FRAME_SIZE);
-    }
-    unsafe {
-        core::ptr::write_bytes(stack_phys as *mut u8, 0, stack_len as usize);
-    }
+    let stack_phys = process.stack_phys_for(USER_STACK_BASE);
     if !paging::map_range_in(
         pml4,
         USER_STACK_BASE,
-        stack_phys as u64,
+        stack_phys,
         stack_len,
         paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
         &mut process.frames,
     ) {
         return Err("failed to map user stack");
     }
-    // Without this, `process::translate` (which every syscall pointer
-    // argument goes through — see resolve_user_buffer in syscall.rs) has
-    // no record of the stack at all, so a process passing a pointer to
-    // one of its own stack-local buffers to e.g. sys_recv would always be
-    // rejected as if it were an invalid pointer.
-    process.mappings.push(Mapping {
-        vaddr: USER_STACK_BASE,
-        phys: stack_phys as u64,
-        len: stack_len,
-    });
 
     let stub_phys = alloc_frame(process)?;
     unsafe {
@@ -912,7 +940,7 @@ fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str
     // USER_STACK_BASE is actually mapped) isn't active yet — CR3 only
     // switches to it when the scheduler first runs this process.
     let initial_rsp = USER_STACK_TOP - 8;
-    let offset = (initial_rsp - USER_STACK_BASE) as usize;
+    let offset = initial_rsp - USER_STACK_BASE;
     unsafe {
         core::ptr::write_unaligned((stack_phys + offset) as *mut u64, USER_EXIT_STUB_VIRT);
     }
@@ -930,8 +958,17 @@ mod auxv {
     pub const AT_PHNUM: u64 = 5;
     pub const AT_PAGESZ: u64 = 6;
     pub const AT_BASE: u64 = 7;
+    pub const AT_FLAGS: u64 = 8;
     pub const AT_ENTRY: u64 = 9;
+    pub const AT_UID: u64 = 11;
+    pub const AT_EUID: u64 = 12;
+    pub const AT_GID: u64 = 13;
+    pub const AT_EGID: u64 = 14;
+    pub const AT_HWCAP: u64 = 16;
+    pub const AT_CLKTCK: u64 = 17;
+    pub const AT_SECURE: u64 = 23;
     pub const AT_RANDOM: u64 = 25;
+    pub const AT_HWCAP2: u64 = 26;
     pub const AT_EXECFN: u64 = 31;
 }
 
@@ -982,13 +1019,41 @@ fn setup_linux_stack(
     }
     let execfn_off = argv_offsets.first().copied();
 
-    let phdr_start = program.phoff as usize;
-    let phdr_len = program.phentsize as usize * program.phnum as usize;
-    let phdr_bytes = elf_bytes
-        .get(phdr_start..phdr_start + phdr_len)
-        .ok_or("program header table outside file")?;
-    let phdr_off = data.len() as u64;
-    data.extend_from_slice(phdr_bytes);
+    // AT_PHDR: a normal toolchain's output (hello, busybox, ...) covers
+    // the program header table within its own first PT_LOAD segment —
+    // the same thing a real Linux kernel's loader assumes: it never
+    // copies phdrs elsewhere, just adds the segment's load bias to
+    // `e_phoff`. `program.segments` here already carries that bias (see
+    // `apply_pie_bias`/`spawn_linux`), so this can point straight at the
+    // real, already-mapped bytes. MachaOS's own minimal test binaries
+    // (`user/linker.ld` places `.result` before anything else) are the
+    // exception — nothing covers file offset `phoff` there — so those
+    // fall back to embedding a copy in this stack blob instead, same as
+    // before this comment. Getting this wrong isn't just cosmetic: a
+    // real ld.so uses AT_PHDR to work out the main binary's own load
+    // bias (comparing it against the phdrs' link-time vaddr), so a
+    // wrong AT_PHDR sends it looking for the binary's other segments
+    // (e.g. its PT_NOTE) at a wildly wrong address — this was a real
+    // bug caught by testing against a real dynamically-linked binary,
+    // not a hypothetical.
+    let phoff = program.phoff;
+    let phdr_len = (program.phentsize as u64) * (program.phnum as u64);
+    let phdr_in_segment = program
+        .segments
+        .iter()
+        .find(|s| s.file_offset <= phoff && phoff + phdr_len <= s.file_offset + s.filesz)
+        .map(|s| s.vaddr + (phoff - s.file_offset));
+    let phdr_blob_off = match phdr_in_segment {
+        Some(_) => None,
+        None => {
+            let phdr_bytes = elf_bytes
+                .get(phoff as usize..(phoff + phdr_len) as usize)
+                .ok_or("program header table outside file")?;
+            let off = data.len() as u64;
+            data.extend_from_slice(phdr_bytes);
+            Some(off)
+        }
+    };
 
     // 16 bytes for AT_RANDOM. Not cryptographically random — there's no
     // HW RNG driver yet — just distinct-enough bytes to fill the ABI
@@ -1007,12 +1072,27 @@ fn setup_linux_stack(
         (auxv::AT_PHNUM, program.phnum as u64),
         (auxv::AT_PAGESZ, paging::PAGE_SIZE),
         (auxv::AT_BASE, at_base),
+        (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, program.entry),
-        (auxv::AT_PHDR, 0),
+        (auxv::AT_UID, 0),
+        (auxv::AT_EUID, 0),
+        (auxv::AT_GID, 0),
+        (auxv::AT_EGID, 0),
+        // 0: no CPU feature bits reported. A real ld.so's IFUNC
+        // resolvers (glibc picks CPU-optimized memcpy/strlen/... this
+        // way) use this to choose an implementation; 0 steers every
+        // resolver at the most conservative/baseline one rather than
+        // risking a resolver branching on an unset bit it assumed would
+        // be there.
+        (auxv::AT_HWCAP, 0),
+        (auxv::AT_HWCAP2, 0),
+        (auxv::AT_CLKTCK, 100), // matches pit.rs's 100 Hz timer
+        (auxv::AT_SECURE, 0),
+        (auxv::AT_PHDR, phdr_in_segment.unwrap_or(0)),
         (auxv::AT_RANDOM, 0),
     ];
-    let phdr_idx = 5;
-    let random_idx = 6;
+    let phdr_idx = auxv_pairs.len() - 2;
+    let random_idx = auxv_pairs.len() - 1;
     let execfn_idx = execfn_off.map(|_| {
         auxv_pairs.push((auxv::AT_EXECFN, 0));
         auxv_pairs.len() - 1
@@ -1029,7 +1109,9 @@ fn setup_linux_stack(
     let final_rsp = (USER_STACK_TOP - total_len) & !0xF; // 16-byte align, per the SysV ABI
     let data_vaddr = final_rsp + table_len;
 
-    auxv_pairs[phdr_idx].1 = data_vaddr + phdr_off;
+    if let Some(off) = phdr_blob_off {
+        auxv_pairs[phdr_idx].1 = data_vaddr + off;
+    }
     auxv_pairs[random_idx].1 = data_vaddr + random_off;
     if let (Some(idx), Some(off)) = (execfn_idx, execfn_off) {
         auxv_pairs[idx].1 = data_vaddr + off;
@@ -1053,34 +1135,31 @@ fn setup_linux_stack(
 
     // ---- map the region and write both blobs into it ----
     let region_start = final_rsp & !(paging::PAGE_SIZE - 1);
-    let region_len = align_up(USER_STACK_TOP - region_start, paging::PAGE_SIZE);
-    let pages = (region_len / paging::PAGE_SIZE) as usize;
-    let phys = pmm::alloc_contiguous(pages).ok_or("out of memory")?;
-    for i in 0..pages {
-        process.frames.push(phys + i * pmm::FRAME_SIZE);
+    if region_start < USER_STACK_LOW_LIMIT {
+        return Err("linux stack layout too large");
     }
+    let region_len = align_up(USER_STACK_TOP - region_start, paging::PAGE_SIZE);
+    // Registers the whole growable region as a single Mapping (see
+    // `stack_phys_base`'s doc comment for why that matters for a
+    // syscall pointer's validation, not just ring-3 access).
+    process.init_stack_backing()?;
+    let phys = process.stack_phys_for(region_start);
     unsafe {
-        core::ptr::write_bytes(phys as *mut u8, 0, region_len as usize);
-        let table_phys = phys + (final_rsp - region_start) as usize;
+        let table_phys = phys + (final_rsp - region_start);
         core::ptr::copy_nonoverlapping(table.as_ptr(), table_phys as *mut u8, table.len());
-        let data_phys = phys + (data_vaddr - region_start) as usize;
+        let data_phys = phys + (data_vaddr - region_start);
         core::ptr::copy_nonoverlapping(data.as_ptr(), data_phys as *mut u8, data.len());
     }
     if !paging::map_range_in(
         pml4,
         region_start,
-        phys as u64,
+        phys,
         region_len,
         paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
         &mut process.frames,
     ) {
         return Err("failed to map linux-style stack");
     }
-    process.mappings.push(Mapping {
-        vaddr: region_start,
-        phys: phys as u64,
-        len: region_len,
-    });
     process.stack_low = region_start;
     Ok(final_rsp)
 }
@@ -1129,14 +1208,15 @@ fn redirect_to_exit(frame: &mut interrupts::InterruptFrame) {
 /// Called from the #PF handler when the faulting task is a process.
 pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
     task::mark_current_exited(ExitInfo::PageFault { cr2 });
+    let rip = frame.rip;
     redirect_to_exit(frame);
 
     let mut buf = [0u8; 160];
     let message = io::sprint(
         &mut buf,
         format_args!(
-            "[PROC] killed by page fault at {:#x} (error {:#x})\n",
-            cr2, frame.error_code
+            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x})\n",
+            cr2, frame.error_code, rip
         ),
     );
     io::exception_print(message);
@@ -1210,6 +1290,43 @@ pub fn translate(pid: usize, vaddr: u64, len: u64) -> Option<u64> {
     let mappings = task::process_mappings(pid)?;
     let mapping = mappings.iter().find(|m| m.vaddr <= vaddr && end <= m.vaddr + m.len)?;
     Some(mapping.phys + (vaddr - mapping.vaddr))
+}
+
+/// Like `translate`, but for a syscall pointer specifically: if
+/// `[vaddr, vaddr+len)` isn't mapped yet, and `pid` is the *current*
+/// process, grows the stack to cover it first (`Process::try_grow_stack`)
+/// before giving up.
+///
+/// A real Linux `copy_to_user` writing to a stack buffer the caller has
+/// never touched — `struct stat st; fstat(fd, &st);` is the ordinary
+/// case, not an edge case — takes a real page fault the same as any
+/// other user-mode access and demand-pages it in right there. This
+/// kernel's syscall handlers instead write through the *physical*
+/// address `translate` resolves, bypassing the process's own page table
+/// (and so its #PF handler) entirely — which means an address legitimately
+/// within the stack's reserved growth region, just not grown into yet,
+/// previously came back EFAULT instead of succeeding. Caught by testing
+/// against a real dynamically-linked binary (`ld.so`'s own `fstat` on a
+/// stack-local buffer), not a hypothetical.
+///
+/// Doesn't handle a range that straddles the *old* stack floor (partly
+/// already mapped, partly needing growth) — `translate` after growing
+/// still needs a single `Mapping` to cover the whole range, and growth
+/// creates its own separate entry rather than merging into the adjacent
+/// one. Narrow gap: only matters for a buffer landing exactly on that
+/// boundary, and the common case (the whole buffer newly needed) works.
+pub fn resolve_syscall_ptr(pid: usize, vaddr: u64, len: u64) -> Option<u64> {
+    if let Some(phys) = translate(pid, vaddr, len) {
+        return Some(phys);
+    }
+    if pid != task::current_pid() {
+        return None;
+    }
+    let cr3 = task::current_process_cr3()?;
+    if !task::with_current_process_mut(|process| process.try_grow_stack(cr3, vaddr))? {
+        return None;
+    }
+    translate(pid, vaddr, len)
 }
 
 /// Delivers a message to `pid`'s inbox from kernel context (as opposed to

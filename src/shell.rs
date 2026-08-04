@@ -1137,6 +1137,35 @@ pub fn selftest() -> ! {
         Err(_) => println!("[SKIP] /bin/busybox.elf not present (run `make disk-linux` to fetch it)"),
     }
 
+    // Process management, part 6: a real *dynamically-linked* glibc
+    // binary (GNU Hello), if present — exercises Phase 4's PT_INTERP
+    // handling for real: the process's actual entry point is the real
+    // /lib64/ld-linux-x86-64.so.2, which is expected to mmap and relocate
+    // the real /lib/x86_64-linux-gnu/libc.so.6 itself before ever
+    // reaching hello's own main. Not fetched by any Makefile target
+    // (getting a real glibc + ld.so pair needs extracting Debian
+    // packages, done by hand for this — see the Phase 4 commit) and not
+    // a hard selftest failure either way: testing against the real
+    // binary is what found and fixed several real gaps (AT_PHDR for a
+    // binary whose phdrs are covered by its own segment, pread64,
+    // fstat's AT_EMPTY_PATH form, a syscall pointer landing in the
+    // stack's not-yet-grown region), but ld.so does not yet run hello to
+    // completion — it gets past opening/reading libc.so.6 and into
+    // symbol version processing before faulting, a gap left for
+    // follow-up work rather than this session's remaining time.
+    match fat::read_file("/bin/hello.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "hello", &["hello"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("hello spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(info) => println!("[INFO] real dynamically-linked hello binary: {}", process::describe_exit(&info)),
+                None => println!("[INFO] real dynamically-linked hello binary: did not exit within 5s"),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/hello.elf not present"),
+    }
+
     // Ring 3 round trip: run a hand-assembled user-mode program (mapped
     // PAGE_USER, entered via `enter_usermode`'s iretq) that calls the
     // sys_write syscall once per character and then sys_exit. Reaching the

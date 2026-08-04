@@ -42,6 +42,17 @@
 //!   doc comment) — fine for the single-threaded, uncontended-lock case
 //!   glibc's own startup hits, but `clone`/real threading aren't
 //!   implemented at all, so this is the extent of it for now.
+//! - A real dynamically-linked glibc binary (tested against GNU Hello +
+//!   a real `ld.so`/`libc.so.6` pair — see the Phase 4 commit and
+//!   `shell.rs`'s selftest hook) doesn't run to completion yet: `ld.so`
+//!   gets through opening/reading `libc.so.6` and into symbol version
+//!   processing, then faults, without ever calling `mmap` on that fd —
+//!   so something in between (most likely `.dynamic`/version-section
+//!   parsing reading data this kernel didn't supply correctly) is still
+//!   missing or wrong. Testing against that real binary is exactly what
+//!   found and fixed the AT_PHDR/`pread64`/`AT_EMPTY_PATH`/stack-buffer
+//!   bugs the rest of this file's history documents; this is the next
+//!   one, left for follow-up rather than resolved here.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -87,6 +98,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_CLOSE: u64 = 3;
 const SYS_FSTAT: u64 = 5;
 const SYS_LSEEK: u64 = 8;
+const SYS_PREAD64: u64 = 17;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
 const SYS_MUNMAP: u64 = 11;
@@ -272,6 +284,34 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
     .unwrap_or(err(EBADF))
 }
 
+/// `pread64`: reads without disturbing the fd's own cursor (real `pread`
+/// semantics) — `ld.so` uses this to peek at an ELF header before
+/// deciding how to `mmap` the rest of the file, and would otherwise have
+/// its later sequential reads thrown off by this one. Implemented on top
+/// of `FileHandle`'s cursor-based `read`/`seek` (there's no separate
+/// positioned-read primitive in vfs.rs) by saving and restoring the
+/// cursor around a normal seek + read.
+fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> u64 {
+    if fd < 3 {
+        return err(ESPIPE);
+    }
+    let Some(phys) = resolve(buf, count) else {
+        return err(EFAULT);
+    };
+    with_process(|p| {
+        let Some(h) = p.fd_mut(fd as usize) else {
+            return err(EBADF);
+        };
+        let saved = h.seek(vfs::SeekFrom::Current(0));
+        h.seek(vfs::SeekFrom::Start(offset));
+        let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+        let n = h.read(out);
+        h.seek(vfs::SeekFrom::Start(saved));
+        n as u64
+    })
+    .unwrap_or(err(EBADF))
+}
+
 const S_IFREG: u32 = 0o100000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
@@ -311,7 +351,19 @@ fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     }
 }
 
-fn sys_newfstatat(_dirfd: u64, pathname: u64, statbuf: u64, _flags: u64) -> u64 {
+const AT_EMPTY_PATH: u64 = 0x1000;
+
+/// `ld.so` (and modern glibc's plain `fstat` wrapper) commonly calls this
+/// as `newfstatat(fd, "", statbuf, AT_EMPTY_PATH)` — "stat the fd itself,
+/// ignore pathname" — rather than plain `fstat`. Handling only the
+/// path-based form (and, worse, trying to resolve/read `pathname` even
+/// when the caller never meant it to be read) made this fail with EFAULT
+/// against a real dynamically-linked binary: caught by testing against
+/// one, not a hypothetical gap.
+fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> u64 {
+    if flags & AT_EMPTY_PATH != 0 {
+        return sys_fstat(dirfd, statbuf);
+    }
     let Some(path) = read_cstr(pathname, 256) else {
         return err(EFAULT);
     };
@@ -588,6 +640,7 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_CLOSE => sys_close(arg1),
         SYS_FSTAT => sys_fstat(arg1, arg2),
         SYS_LSEEK => sys_lseek(arg1, arg2, arg3),
+        SYS_PREAD64 => sys_pread64(arg1, arg2, arg3, arg4),
         SYS_MMAP => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
         SYS_MPROTECT => sys_mprotect(arg1, arg2, arg3),
         SYS_MUNMAP => sys_munmap(arg1, arg2),
