@@ -3,10 +3,12 @@
 A small x86_64 Multiboot kernel written in Rust. It currently includes:
 
 - Multiboot 1 boot entry and 32-bit to long-mode transition
-- VGA text output and COM1 serial logging
-- GDT, TSS, IST, IDT, exception handlers, PIC, PIT, and keyboard IRQs
-- A lock-protected 1 MiB free-list heap allocator
-- CPUID information and a small interactive shell
+- A statically identity-mapped 4 GiB address space (2 MiB pages)
+- A linear VBE framebuffer desktop (1024x768x32, requested via the Multiboot video header) with a window manager: draggable/closable windows, a taskbar, and a mouse cursor, alongside VGA text output and COM1 serial logging
+- GDT, TSS, IST, IDT, exception handlers, PIC, PIT, PS/2 keyboard, and PS/2 mouse IRQs
+- A lock-protected 8 MiB free-list heap allocator
+- CPUID information and a small interactive shell, running inside a Terminal window on the desktop
+- A graphical (and text-mode) panic screen
 - QEMU self-test coverage for heap allocation, interrupts, and CPU information
 
 ## Requirements
@@ -45,6 +47,18 @@ make test
 
 The kernel binary is written to `target/x86_64-unknown-none/release/machaos` and the GRUB ISO to `target/machaos.iso`.
 
+## Desktop
+
+On normal boot, MachaOS switches to a 1024x768 graphical desktop with two
+windows: a **Terminal** (the interactive shell) and a **System Info** panel.
+Click a title bar to focus/raise a window and drag it around; click the red
+`x` to close it. The taskbar at the bottom lists open windows and shows
+uptime. If no linear framebuffer is available, MachaOS falls back to the
+plain VGA text shell automatically.
+
 ## Shell
 
-After normal boot, type `help` at the `machaos>` prompt. Available commands: `help`, `clear`/`cls`, `echo`, `time`, `uptime`, `meminfo`, `heap`, `cpuinfo`, `version`/`ver`, `reboot`, `shutdown`, `crash`, `breakpoint`, `fault`, and `panic`.
+Type `help` at the `machaos>` prompt (inside the Terminal window, or at the
+text-mode fallback). Available commands: `help`, `clear`/`cls`, `echo`,
+`time`, `uptime`, `meminfo`, `heap`, `cpuinfo`, `version`/`ver`, `reboot`,
+`shutdown`, `crash`, `breakpoint`, `fault`, `panic`, and `mousetest`.

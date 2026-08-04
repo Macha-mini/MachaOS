@@ -68,6 +68,7 @@ pub fn register_default_handlers() {
     set_handler(14, Some(page_fault));
     set_handler(32, Some(timer));
     set_handler(33, Some(keyboard));
+    set_handler(44, Some(mouse));
 }
 
 fn exception(name: &str, frame: &InterruptFrame) -> ! {
@@ -190,6 +191,11 @@ fn timer(_frame: &InterruptFrame) {
 fn keyboard(_frame: &InterruptFrame) {
     crate::keyboard::irq();
     pic::eoi(1);
+}
+
+fn mouse(_frame: &InterruptFrame) {
+    crate::mouse::irq();
+    pic::eoi(12);
 }
 
 pub fn halt() {

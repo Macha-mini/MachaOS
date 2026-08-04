@@ -5,15 +5,22 @@
 extern crate alloc;
 
 mod allocator;
+mod console;
 mod cpuid;
+mod desktop;
+mod fb;
+mod font;
 mod gdt;
+mod gfx;
 mod idt;
 mod interrupts;
 #[macro_use]
 mod io;
 mod isr_table;
 mod keyboard;
+mod mouse;
 mod multiboot;
+mod paging;
 mod pic;
 mod pit;
 mod port;
@@ -21,6 +28,7 @@ mod serial;
 mod shell;
 mod sync;
 mod vga;
+mod wm;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -30,9 +38,18 @@ global_asm!(
 .section .multiboot, "a"
 .align 4
 multiboot_header:
-    .long 0x1BADB002
-    .long 0x00000003
-    .long 0xE4524FFB
+    .long 0x1BADB002   # magic
+    .long 0x00000007   # flags: align | meminfo | video request(bit2)
+    .long 0xE4524FF7   # checksum = -(magic+flags)
+    .long 0x00000000   # header_addr (unused, flags[16] not set)
+    .long 0x00000000   # load_addr
+    .long 0x00000000   # load_end_addr
+    .long 0x00000000   # bss_end_addr
+    .long 0x00000000   # entry_addr
+    .long 0x00000000   # mode_type = 0 (linear graphics), offset 32 per spec
+    .long 1024         # width
+    .long 768          # height
+    .long 32           # depth
 
 .section .bss
 .balign 4096
@@ -41,7 +58,7 @@ page_table_pml4:
 page_table_pdp:
     .skip 4096
 page_table_pd:
-    .skip 4096
+    .skip 4096 * 4
 stack_bottom:
     .skip 65536
     .balign 16
@@ -69,13 +86,19 @@ boot:
     orl $0x3, %eax
     movl %eax, 0(%edi)
 
+    leal page_table_pdp, %edi
     leal page_table_pd, %eax
     orl $0x3, %eax
-    movl %eax, 0x1000(%edi)
+    movl $4, %ecx
+1:
+    movl %eax, 0(%edi)
+    addl $4096, %eax
+    addl $8, %edi
+    loop 1b
 
     leal page_table_pd, %edi
     xorl %eax, %eax
-    movl $8, %ecx
+    movl $2048, %ecx
 1:
     movl %eax, %esi
     shll $21, %esi
@@ -186,6 +209,16 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     println!("[OK] programming PIT timer at 100 Hz...");
     pit::init();
 
+    println!("[OK] enabling PS/2 mouse (IRQ12)...");
+    mouse::init();
+
+    if fb::init(&info) {
+        let (width, height) = fb::dimensions();
+        println!("[OK] graphics mode: {}x{}x32", width, height);
+    } else {
+        println!("[WARN] no usable linear framebuffer; staying in VGA text mode");
+    }
+
     let vendor = cpuid::vendor_id();
     println!(
         "[OK] CPU: {} ({} logical cores)",
@@ -198,6 +231,8 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     let features = cpuid::features();
     println!("     features: {}", features.join(" "));
 
+    interrupts::enable_interrupts();
+
     let selftest_mode = info
         .cmdline()
         .is_some_and(|cmdline| cmdline.split_whitespace().any(|word| word == "selftest"));
@@ -206,27 +241,56 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     }
 
     println!();
-    println!("System ready. Type 'help' for available commands.");
+    println!("System ready.");
     println!();
 
-    interrupts::enable_interrupts();
-    shell::run();
+    if fb::is_graphics_mode() {
+        desktop::run();
+    } else {
+        println!("No usable framebuffer; falling back to the text shell.");
+        println!("Type 'help' for available commands.");
+        println!();
+        shell::run();
+    }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     let mut buf = [0u8; 256];
-    io::exception_print(io::sprint(
-        &mut buf,
-        format_args!("\nKERNEL PANIC: {}\n", info.message()),
-    ));
-    if let Some(location) = info.location() {
-        let mut buf = [0u8; 128];
-        io::exception_print(io::sprint(
-            &mut buf,
-            format_args!("  at {}:{}\n", location.file(), location.line()),
-        ));
+    let message = io::sprint(&mut buf, format_args!("KERNEL PANIC: {}", info.message()));
+    io::exception_print("\n");
+    io::exception_print(message);
+    io::exception_print("\n");
+
+    let mut loc_buf = [0u8; 128];
+    let location = info.location().map(|location| {
+        io::sprint(
+            &mut loc_buf,
+            format_args!("  at {}:{}", location.file(), location.line()),
+        )
+    });
+    if let Some(location) = location {
+        io::exception_print(location);
+        io::exception_print("\n");
     }
     io::exception_print("System halted.\n");
+
+    if fb::is_graphics_mode() {
+        // No locks, no heap: the allocator or another CPU-visible lock
+        // holder may be in a bad state, but a panic never returns so
+        // there is no concurrent access to race against.
+        fb::emergency_fill(0x00_7F0000);
+        fb::emergency_draw_string(16, 16, message, 0x00_FFFFFF);
+        if let Some(location) = location {
+            fb::emergency_draw_string(16, 16 + font::GLYPH_HEIGHT as u32 + 4, location, 0x00_FFFFFF);
+        }
+        fb::emergency_draw_string(
+            16,
+            16 + 2 * (font::GLYPH_HEIGHT as u32 + 4),
+            "System halted.",
+            0x00_FFFFFF,
+        );
+    }
+
     interrupts::halt_forever()
 }

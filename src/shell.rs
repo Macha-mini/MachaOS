@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::{cpuid, interrupts, keyboard, multiboot, port, serial, vga};
+use crate::{cpuid, interrupts, io, keyboard, mouse, multiboot, port, serial, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
 
@@ -63,7 +63,7 @@ pub fn execute(line: &str) {
 
     match command {
         "help" => cmd_help(),
-        "clear" | "cls" => vga::clear(),
+        "clear" | "cls" => io::clear_active(),
         "echo" => {
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
@@ -107,6 +107,7 @@ pub fn execute(line: &str) {
             fault_demo();
         }
         "panic" => panic!("user-requested kernel panic"),
+        "mousetest" => cmd_mousetest(),
         _ => println!("unknown command: '{}' (type 'help')", command),
     }
 }
@@ -128,6 +129,7 @@ fn cmd_help() {
     println!("  breakpoint  trigger an int3 breakpoint");
     println!("  fault       trigger a page fault");
     println!("  panic       trigger a kernel panic");
+    println!("  mousetest   poll the PS/2 mouse for a few seconds");
 }
 
 fn cmd_meminfo() {
@@ -218,6 +220,21 @@ fn cmd_cpuinfo() {
     println!("features: {}", features.join(" "));
 }
 
+fn cmd_mousetest() {
+    println!("polling PS/2 mouse for 5 seconds...");
+    let deadline = interrupts::ticks() + 500;
+    while interrupts::ticks() < deadline {
+        while let Some(event) = mouse::next_event() {
+            println!(
+                "mouse: dx={} dy={} left={} right={} middle={}",
+                event.dx, event.dy, event.left, event.right, event.middle
+            );
+        }
+        interrupts::halt();
+    }
+    println!("mousetest done");
+}
+
 fn reboot() -> ! {
     unsafe { port::outb(0x64, 0xFE) } // 8042 reset
     interrupts::halt_forever()
@@ -270,4 +287,53 @@ pub fn selftest() -> ! {
     println!("[SELFTEST OK]");
     unsafe { port::outb(0xF4, 0) }
     interrupts::halt_forever()
+}
+
+/// Non-blocking, one-character-at-a-time line editor. The GUI desktop
+/// loop (`desktop.rs`) feeds it keyboard events for whichever terminal
+/// window has focus, since (unlike `read_line`'s blocking loop) it must
+/// keep returning control so the compositor and other windows keep
+/// running between keystrokes.
+pub struct LineEditor {
+    line: String,
+}
+
+pub enum Feed {
+    Pending,
+    Line(String),
+}
+
+impl LineEditor {
+    pub const fn new() -> Self {
+        Self { line: String::new() }
+    }
+
+    pub fn feed(&mut self, event: keyboard::Event) -> Feed {
+        match event {
+            keyboard::Event::Char(c) => {
+                if self.line.len() < 256 {
+                    self.line.push(c);
+                    print!("{}", c);
+                }
+                Feed::Pending
+            }
+            keyboard::Event::Backspace => {
+                if self.line.pop().is_some() {
+                    print!("\x08");
+                }
+                Feed::Pending
+            }
+            keyboard::Event::Enter => {
+                println!();
+                Feed::Line(core::mem::take(&mut self.line))
+            }
+            keyboard::Event::Tab => {
+                for _ in 0..4 {
+                    self.line.push(' ');
+                    print!(" ");
+                }
+                Feed::Pending
+            }
+        }
+    }
 }

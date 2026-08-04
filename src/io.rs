@@ -1,6 +1,7 @@
 use core::fmt;
 use core::fmt::Write as _;
 
+use crate::console;
 use crate::serial;
 use crate::vga;
 
@@ -22,10 +23,45 @@ macro_rules! println {
     };
 }
 
+// Where `print!`/`println!` output goes on screen, in addition to always
+// mirroring to serial. `desktop.rs` points this at whichever window's
+// console currently owns keyboard focus before feeding it input; `None`
+// (the default, and what non-GUI boots always use) falls back to the
+// legacy VGA text writer. Single-core and never touched from interrupt
+// context, so a bare static pointer is sufficient here.
+static mut ACTIVE_CONSOLE: *mut console::Console = core::ptr::null_mut();
+
+pub fn set_console_sink(target: Option<&mut console::Console>) {
+    unsafe {
+        ACTIVE_CONSOLE = match target {
+            Some(console) => console as *mut console::Console,
+            None => core::ptr::null_mut(),
+        };
+    }
+}
+
 pub fn print(args: fmt::Arguments) {
-    vga::write_fmt(args);
     let mut writer = serial::SerialWriter;
     let _ = writer.write_fmt(args);
+
+    unsafe {
+        if let Some(console) = ACTIVE_CONSOLE.as_mut() {
+            let _ = console.write_fmt(args);
+            return;
+        }
+    }
+    vga::write_fmt(args);
+}
+
+/// Clears whichever surface `print!`/`println!` currently target.
+pub fn clear_active() {
+    unsafe {
+        if let Some(console) = ACTIVE_CONSOLE.as_mut() {
+            console.clear();
+            return;
+        }
+    }
+    vga::clear();
 }
 
 /// Prints from exception/panic context: always to serial, best-effort to VGA

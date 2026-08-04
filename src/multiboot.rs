@@ -50,9 +50,47 @@ impl MultibootInfo {
         }
     }
 
+    pub fn framebuffer(&self) -> Option<FramebufferInfo> {
+        if self.flags() & (1 << 12) == 0 {
+            return None;
+        }
+        let addr = self.read_u64(88);
+        let pitch = self.read_u32(96);
+        let width = self.read_u32(100);
+        let height = self.read_u32(104);
+        let bpp = self.read_u8(108);
+        if addr == 0 || width == 0 || height == 0 || bpp == 0 {
+            return None;
+        }
+        Some(FramebufferInfo {
+            addr,
+            pitch,
+            width,
+            height,
+            bpp,
+        })
+    }
+
     fn read_u32(&self, offset: usize) -> u32 {
         unsafe { core::ptr::read_unaligned((self.addr + offset) as *const u32) }
     }
+
+    fn read_u64(&self, offset: usize) -> u64 {
+        unsafe { core::ptr::read_unaligned((self.addr + offset) as *const u64) }
+    }
+
+    fn read_u8(&self, offset: usize) -> u8 {
+        unsafe { core::ptr::read_unaligned((self.addr + offset) as *const u8) }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FramebufferInfo {
+    pub addr: u64,
+    pub pitch: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bpp: u8,
 }
 
 fn cstr(addr: usize) -> &'static str {
