@@ -18,6 +18,21 @@ pub const MAX_PHYS_MEM: usize = 256 * 1024 * 1024;
 const FRAME_COUNT: usize = MAX_PHYS_MEM / FRAME_SIZE; // 65536
 const BITMAP_BYTES: usize = FRAME_COUNT / 8; // 8192
 
+/// Reserved (never handed out by `frame_alloc`/`alloc_contiguous`) below
+/// this physical address, on top of the kernel image itself. The kernel
+/// heap (`allocator::init`) is identity-mapped — its physical address
+/// *is* its virtual one, and every process's page table deep-copies the
+/// kernel's own identity map — so wherever the heap's frames land is
+/// unusable to every process as well, not just the kernel. Reserving
+/// this low range keeps the heap's first-fit allocation from landing on
+/// it, freeing it up for two conventions that both need to be down here:
+/// MachaOS's own native-ABI test programs (`user/linker.ld`, 48 MiB) and
+/// the address most real (non-PIE) Linux binaries are linked to load at
+/// (traditionally 0x400000 = 4 MiB) — see `process::validate_segments`,
+/// which rejects anything overlapping wherever the heap (now above this
+/// line) actually ends up, with a 1 MiB margin on both sides.
+pub const LOW_RESERVED_END: usize = 64 * 1024 * 1024;
+
 // All frames start marked "in use"; `init` clears exactly the usable
 // ones. Access is single-threaded in practice (boot init, and later
 // syscall/kernel paths that take the spin lock), but the lock documents
@@ -109,6 +124,7 @@ pub fn init(info: &MultibootInfo) {
     let kernel_start = core::ptr::addr_of!(_kernel_start) as usize;
     let kernel_end = core::ptr::addr_of!(_kernel_end) as usize;
     mark_reserved(kernel_start, kernel_end - kernel_start);
+    mark_reserved(0, LOW_RESERVED_END);
 }
 
 /// Allocates a single 4 KiB frame, returning its physical address.

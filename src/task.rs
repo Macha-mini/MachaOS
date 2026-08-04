@@ -151,6 +151,10 @@ const QUANTUM_TICKS: u64 = 5; // 50ms at the 100Hz PIT rate
 /// stack frames, well under 100 bytes) with room to spare.
 const RING3_PARK_RESERVE: u64 = 1024;
 
+/// IA32_FS_BASE — see `scheduler_tick`'s save/restore of
+/// `process::Process::fs_base` around a task switch.
+const MSR_FS_BASE: u32 = 0xC000_0100;
+
 // Built once in `init()` before interrupts are enabled, then mutated from
 // `scheduler_tick()` (timer-interrupt context) or from `push_task` /
 // `remove_process` with interrupts disabled. See the module docs.
@@ -264,7 +268,21 @@ pub fn scheduler_tick() {
         }
     }
     let Some(next) = next else { return }; // kernel tasks are always runnable
+
+    // FS_BASE (the Linux ABI's TLS base — see `process::Process::fs_base`'s
+    // doc comment) is a single CPU-global MSR, not part of what
+    // `context_switch` itself saves/restores in callee-saved registers.
+    // Save the outgoing process's (a no-op — reads back whatever was last
+    // written — for one that never called arch_prctl) and restore the
+    // incoming one's before switching, or a second Linux process's TLS
+    // would silently clobber the first's the moment they're interleaved.
+    if let Some(process) = tasks[current].process.as_mut() {
+        process.fs_base = unsafe { crate::syscall::rdmsr(MSR_FS_BASE) };
+    }
     CURRENT.store(next, Ordering::Relaxed);
+    if let Some(process) = tasks[next].process.as_ref() {
+        unsafe { crate::syscall::wrmsr(MSR_FS_BASE, process.fs_base) };
+    }
 
     if paging::read_cr3() != tasks[next].cr3 {
         paging::write_cr3(tasks[next].cr3);

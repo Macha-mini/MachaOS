@@ -47,7 +47,7 @@ const FD_STDIN: u64 = 0;
 const FD_STDOUT: u64 = 1;
 const FD_STDERR: u64 = 2;
 
-unsafe fn rdmsr(msr: u32) -> u64 {
+pub(crate) unsafe fn rdmsr(msr: u32) -> u64 {
     let (lo, hi): (u32, u32);
     core::arch::asm!(
         "rdmsr",
@@ -59,7 +59,7 @@ unsafe fn rdmsr(msr: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-unsafe fn wrmsr(msr: u32, value: u64) {
+pub(crate) unsafe fn wrmsr(msr: u32, value: u64) {
     core::arch::asm!(
         "wrmsr",
         in("ecx") msr,
@@ -98,6 +98,23 @@ extern "C" fn ring3_load_return_rsp() -> u64 {
     crate::task::current_ring3_return_rsp()
 }
 
+/// Whether `num` should take the "never returns to ring 3" unwind path
+/// (`.Lsyscall_exit` in `syscall_entry`) instead of an ordinary dispatch
+/// call. What counts as "exit" depends on the calling process's ABI: the
+/// native ABI only has `SYS_EXIT` (1); a Linux-ABI process's `exit` is 60
+/// and `exit_group` is 231 (Linux syscall 1 is `write`). Called from the
+/// asm before either dispatch table ever sees `num`, so a Linux process's
+/// real `write(1, ...)` isn't mistaken for exiting.
+#[unsafe(no_mangle)]
+extern "C" fn is_exit_syscall(num: u64) -> u64 {
+    let exit = if crate::task::current_process_abi() == Some(crate::process::Abi::Linux) {
+        num == crate::linux_abi::SYS_EXIT || num == crate::linux_abi::SYS_EXIT_GROUP
+    } else {
+        num == SYS_EXIT
+    };
+    exit as u64
+}
+
 global_asm!(
     r#"
 .section .text
@@ -110,24 +127,45 @@ syscall_entry:
     mov rsp, [rip + SYSCALL_KERNEL_RSP]
     push rcx
     push r11
-    # SYS_EXIT (1) is checked here, before rax (the syscall number) gets
-    # shuffled into an argument register below, and handled without ever
-    # calling syscall_dispatch: unlike every other syscall it never
-    # returns to user mode, so its "return value" can't just be a normal
-    # sentinel returned from dispatch (that would collide with a genuine
-    # error return, e.g. -1 from a bad sys_write fd).
-    cmp rax, 1
-    je .Lsyscall_exit
+    # Whether `rax` (the syscall number) means "exit" depends on the
+    # calling process's ABI (`is_exit_syscall` — native SYS_EXIT is 1;
+    # Linux's is 60/231, since Linux syscall 1 is `write`), so this can't
+    # be a bare immediate compare the way it used to be. Preserve every
+    # argument register across the call (an ordinary C function, free to
+    # clobber all of them) since we still need them after, whichever way
+    # it decides.
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    push r10
+    push r8
+    push r9
+    mov rdi, rax
+    call is_exit_syscall
+    mov r11, rax
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    test r11, r11
+    jnz .Lsyscall_exit
 
     # SysV syscall args arrive in rdi/rsi/rdx/r10/r8/r9 (r10 instead of
-    # rcx, which `syscall` clobbers); shuffle num+4 args into the rdi..r8
-    # slots `extern "C" fn syscall_dispatch` expects. r11 is free to use
-    # as scratch here — its user value is already saved on the stack above.
+    # rcx, which `syscall` clobbers); shuffle num+5 args into the rdi..r9
+    # slots `extern "C" fn syscall_dispatch` expects (arg6, the least
+    # often needed of a real 6-argument Linux syscall like mmap's file
+    # offset, isn't forwarded — see linux_abi.rs). r11 is free to use as
+    # scratch here — its user value is already saved on the stack above.
     mov r11, rdx
     mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
     mov rcx, r11
+    mov r9, r8
     mov r8, r10
     call syscall_dispatch
 
@@ -210,7 +248,7 @@ pub fn write_count() -> u64 {
 /// arbitrary kernel memory on its behalf via a syscall. `run_demo` is the
 /// only caller that isn't a process; its pointers are already kernel
 /// addresses the kernel mapped itself, so those are trusted as-is.
-fn resolve_user_buffer(ptr: u64, len: u64) -> Option<u64> {
+pub(crate) fn resolve_user_buffer(ptr: u64, len: u64) -> Option<u64> {
     if crate::task::current_is_process() {
         crate::process::translate(crate::task::current_pid(), ptr, len)
     } else if paging::is_identity_mapped(ptr, len) {
@@ -295,7 +333,7 @@ fn sys_recv(ptr: u64, maxlen: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> u64 {
     // A Linux-ABI process (see `process::Abi`) dispatches through an
     // entirely separate syscall table/numbering/error convention
     // (`linux_abi.rs`) instead of the native one below. `run_demo`'s
@@ -303,7 +341,7 @@ extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: 
     // for it and it always falls through to the native table, same as
     // today.
     if crate::task::current_process_abi() == Some(crate::process::Abi::Linux) {
-        return crate::linux_abi::syscall_dispatch(num, arg1, arg2, arg3, arg4);
+        return crate::linux_abi::syscall_dispatch(num, arg1, arg2, arg3, arg4, arg5);
     }
     match num {
         SYS_WRITE => sys_write(arg1, arg2, arg3),
@@ -321,8 +359,9 @@ pub fn init() {
     // GDT layout change can't silently desync the two.
     debug_assert_eq!(crate::gdt::USER_DATA | 3, 0x33);
     debug_assert_eq!(crate::gdt::USER_CODE | 3, 0x3B);
-    // `syscall_entry` hardcodes `cmp rax, 1` to special-case SYS_EXIT
-    // before it's even dispatched (see the asm comment above).
+    // `is_exit_syscall` hardcodes this value for the native ABI's half of
+    // the exit check `syscall_entry` runs before either dispatch table
+    // ever sees a syscall number.
     debug_assert_eq!(SYS_EXIT, 1);
 
     unsafe {

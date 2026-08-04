@@ -946,14 +946,14 @@ pub fn selftest() -> ! {
     crate::process::reap(pid);
 
     // Process management, part 2c: Linux-style initial stack layout.
-    // `process::spawn_linux_test` builds a real argv/argc/envp/auxv stack
+    // `process::spawn_linux` builds a real argv/argc/envp/auxv stack
     // (`process::setup_linux_stack`) instead of the native ABI's single
     // return-address slot; the embedded ELF reads it straight off its
     // entry `rsp` (the way a real libc's `_start` does) and reports which
     // of 13 checks (argc, argv[], envp[], the auxv terminator, and each
     // auxv value including a round trip through the copied program
     // header table) passed as a bitmask.
-    let pid = crate::process::spawn_linux_test(
+    let pid = crate::process::spawn_linux(
         crate::user_prog::PROG_LINUX_STACK,
         "linux-stack",
         &["prog_linux_stack", "hello"],
@@ -971,20 +971,22 @@ pub fn selftest() -> ! {
     crate::process::reap(pid);
 
     // Process management, part 2d: Linux syscall dispatch routing.
-    // `process::Abi::Linux` (also set by `spawn_linux_test`) makes
+    // `process::Abi::Linux` (also set by `spawn_linux`) makes
     // `syscall::syscall_dispatch` route to `linux_abi::syscall_dispatch`
     // instead of the native table; the embedded ELF calls Linux syscall
-    // 39 (getpid, wired up for real in the skeleton) and an unrecognized
-    // number, checking the second comes back as `-ENOSYS` per the real
-    // Linux errno convention rather than the native ABI's error sentinel.
-    let pid = crate::process::spawn_linux_test(crate::user_prog::PROG_LINUX_SYSCALL, "linux-syscall", &[], &[])
+    // 39 (getpid), an unrecognized number (expecting `-ENOSYS` per the
+    // real Linux errno convention), and Linux syscall 1 (`write`, not
+    // the native ABI's exit — proves `syscall_entry`'s ABI-aware exit
+    // check keeps the two numbering schemes from colliding), then exits
+    // via the real Linux `exit` (60).
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_SYSCALL, "linux-syscall", &[], &[])
         .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
     match crate::process::wait(pid, 100) {
         Some(process::ExitInfo::Normal) => println!("[OK] Linux syscall dispatch process exited normally"),
         other => selftest_fail(&format!("linux-syscall process gave unexpected exit: {:?}", other)),
     }
     match crate::process::read_result(pid) {
-        Some(0b11) => println!("[OK] Linux syscall dispatch: getpid succeeded, unknown syscall returned -ENOSYS"),
+        Some(0b111) => println!("[OK] Linux syscall dispatch: getpid, -ENOSYS, and real write(1, ...) all correct"),
         other => selftest_fail(&format!("linux-syscall process result mismatch: {:?}", other)),
     }
     crate::process::reap(pid);

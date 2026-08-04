@@ -1,61 +1,466 @@
-//! Linux x86_64 syscall ABI layer — a skeleton. Per the approved Linux
-//! ABI emulation plan, Phase 1 only needs the dispatch-routing mechanism
-//! and the errno return convention to exist and be selectable per
-//! process; Phase 2 is where real syscalls (openat/mmap/brk/futex/...)
-//! get implemented here.
+//! Linux x86_64 syscall ABI layer. Phase 2 of the approved Linux ABI
+//! emulation plan: enough real syscalls for a statically-linked musl
+//! binary's startup and basic I/O to work.
 //!
 //! Selected per-process via `process::Abi::Linux` (see
-//! `process::spawn_linux_test`, currently the only path that sets it)
-//! and dispatched by `syscall::syscall_dispatch`, which checks the
-//! current process's `Abi` before falling into the native table.
+//! `process::spawn_linux`) and dispatched by `syscall::syscall_dispatch`,
+//! which checks the current process's `Abi` before falling into the
+//! native table.
 //!
-//! Reuses the same argument registers MachaOS's own `syscall_entry` asm
-//! already decodes (rdi/rsi/rdx/r10/r8/r9 on the user side) — this
-//! happens to be identical to the real Linux x86-64 syscall ABI's
-//! argument registers, so no asm changes were needed to add this second
-//! table. That asm currently only forwards the first *four* of them
-//! (num, arg1..arg4) to whichever dispatch function ends up handling a
-//! syscall; a real syscall like `mmap` needs six. Widening that is
-//! Phase 2's problem, once a syscall that actually needs args 5/6 is
-//! implemented here — this skeleton's own `getpid` needs none, and an
-//! unrecognized number just returns `-ENOSYS` regardless of its
-//! arguments.
+//! `syscall_entry`'s asm forwards `num` plus five arguments (registers
+//! only, no stack-passed args — see that file's comments) to whichever
+//! dispatch function handles a syscall. A real 6-argument syscall like
+//! `mmap` therefore never sees its 6th argument (the file offset) here;
+//! since this module only ever treats `mmap` as anonymous (no
+//! file-backed mapping support), that argument was never going to be
+//! used anyway.
 //!
-//! KNOWN GAP for Phase 2: `syscall_entry`'s asm special-cases syscall
-//! number 1 as the *native* SYS_EXIT before any dispatch table (native
-//! or Linux) ever sees it (see syscall.rs's module docs) — but Linux
-//! syscall 1 is `write`, not `exit` (`exit` is 60, `exit_group` is 231).
-//! A Linux-ABI process calling `write` today would be silently hijacked
-//! into the native exit path instead of reaching this module. Fixing
-//! that needs the asm itself to check the current process's `Abi` before
-//! deciding what "1" means; not addressed here since no Linux process
-//! can meaningfully reach syscall number 1 yet (nothing in this skeleton
-//! implements `write`).
+//! KNOWN GAPS left for Phase 3/4:
+//! - No signal delivery: `rt_sigaction`/`rt_sigprocmask` just record
+//!   nothing and return success.
+//! - `mmap`/`openat` treat every request as anonymous/regular-file; no
+//!   shared mappings, no special file types.
+//! - `munmap` only reclaims a mapping it fully contains (see
+//!   `process::Process::munmap`); `mprotect` only ever grants/revokes
+//!   write access (no NX enforcement — `paging.rs` has none yet).
+//! - `futex`/`clone`/threading aren't implemented at all (Phase 3).
 
-/// Function not implemented — returned (as `-ENOSYS`, the raw `syscall`
-/// return value a real libc's wrapper turns into "return -1, set
-/// `errno = ENOSYS`") for any syscall number this skeleton doesn't
-/// recognize.
+use alloc::format;
+use alloc::string::{String, ToString};
+
+use crate::vfs;
+
+// ---- errno -----------------------------------------------------------
+
+const EBADF: i32 = 9;
+const EFAULT: i32 = 14;
+const EEXIST: i32 = 17;
+const ENOTDIR: i32 = 20;
+const EINVAL: i32 = 22;
+const ENOTTY: i32 = 25;
+const ESPIPE: i32 = 29;
 const ENOSYS: i32 = 38;
-
-const SYS_GETPID: u64 = 39;
+const ENOENT: i32 = 2;
+const EIO: i32 = 5;
+const ENOMEM: i32 = 12;
 
 /// Negates and sign-extends `errno` into the raw `u64` a syscall returns
 /// on failure, matching the real Linux convention (small negative values
-/// close to 0, e.g. `-38` for `ENOSYS`, rather than MachaOS's native ABI's
-/// `u64::MAX` sentinel — see `syscall::SYSCALL_ERROR`).
+/// close to 0, e.g. `-38` for `ENOSYS`) rather than MachaOS's native
+/// ABI's `u64::MAX` sentinel (`syscall::SYSCALL_ERROR`).
 fn err(errno: i32) -> u64 {
     (-(errno as i64)) as u64
 }
 
-/// Dispatches one Linux-numbered syscall. `getpid` is wired up for real
-/// (proving argument-free syscalls round-trip correctly through this
-/// table); everything else — the vast majority of a real libc's startup
-/// requirements (`arch_prctl`, `brk`, `mmap`, `openat`, ...) — returns
-/// `ENOSYS` until Phase 2 implements it.
-pub fn syscall_dispatch(num: u64, _arg1: u64, _arg2: u64, _arg3: u64, _arg4: u64) -> u64 {
+fn vfs_err(e: vfs::VfsError) -> u64 {
+    match e {
+        vfs::VfsError::NotFound => err(ENOENT),
+        vfs::VfsError::NotDir | vfs::VfsError::IsDir => err(ENOTDIR),
+        vfs::VfsError::AlreadyExists => err(EEXIST),
+        _ => err(EIO),
+    }
+}
+
+// ---- syscall numbers (x86_64) -----------------------------------------
+
+const SYS_READ: u64 = 0;
+const SYS_WRITE: u64 = 1;
+const SYS_CLOSE: u64 = 3;
+const SYS_FSTAT: u64 = 5;
+const SYS_LSEEK: u64 = 8;
+const SYS_MMAP: u64 = 9;
+const SYS_MPROTECT: u64 = 10;
+const SYS_MUNMAP: u64 = 11;
+const SYS_BRK: u64 = 12;
+const SYS_RT_SIGACTION: u64 = 13;
+const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_IOCTL: u64 = 16;
+const SYS_WRITEV: u64 = 20;
+const SYS_GETPID: u64 = 39;
+pub const SYS_EXIT: u64 = 60;
+const SYS_UNAME: u64 = 63;
+const SYS_ARCH_PRCTL: u64 = 158;
+const SYS_SET_TID_ADDRESS: u64 = 218;
+const SYS_CLOCK_GETTIME: u64 = 228;
+pub const SYS_EXIT_GROUP: u64 = 231;
+const SYS_OPENAT: u64 = 257;
+const SYS_NEWFSTATAT: u64 = 262;
+const SYS_SET_ROBUST_LIST: u64 = 273;
+const SYS_GETRANDOM: u64 = 318;
+
+// ---- helpers ------------------------------------------------------------
+
+/// Runs `f` on the current process. Only meaningful for a syscall (the
+/// current task is always a process when `syscall_dispatch` is reached
+/// through the normal `syscall` path), so `unwrap_or`'s fallback below
+/// only matters for `run_demo`'s non-process caller, which never routes
+/// here in the first place (see `syscall::syscall_dispatch`).
+fn with_process<R>(f: impl FnOnce(&mut crate::process::Process) -> R) -> Option<R> {
+    crate::task::with_current_process_mut(f)
+}
+
+fn resolve(ptr: u64, len: u64) -> Option<u64> {
+    crate::syscall::resolve_user_buffer(ptr, len)
+}
+
+/// Reads a NUL-terminated string from user memory, byte at a time (each
+/// byte independently validated against the process's mappings — simple
+/// and safe, and paths are short, so the extra per-byte lookup cost
+/// doesn't matter).
+fn read_cstr(ptr: u64, max_len: usize) -> Option<String> {
+    let mut bytes = alloc::vec::Vec::new();
+    for i in 0..max_len as u64 {
+        let phys = resolve(ptr + i, 1)?;
+        let b = unsafe { core::ptr::read(phys as *const u8) };
+        if b == 0 {
+            return core::str::from_utf8(&bytes).ok().map(|s| s.to_string());
+        }
+        bytes.push(b);
+    }
+    None
+}
+
+/// Normalizes a syscall path argument to the absolute form the FAT32 VFS
+/// expects. There's no per-process current-working-directory tracked for
+/// a Linux process yet, so a relative path is just anchored at the root
+/// — fine for the common case (a program given an absolute path, or run
+/// from what it assumes is `/`), wrong for genuine relative-to-cwd use;
+/// `dirfd` (openat/newfstatat's first argument) is likewise ignored
+/// rather than honored when it isn't `AT_FDCWD`.
+fn normalize_path(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    }
+}
+
+fn translate_open_flags(linux_flags: u64) -> u32 {
+    let mut f = 0u32;
+    match linux_flags & 0b11 {
+        1 => f |= vfs::O_WRONLY,
+        2 => f |= vfs::O_RDWR,
+        _ => {}
+    }
+    if linux_flags & 0o100 != 0 {
+        f |= vfs::O_CREAT;
+    }
+    if linux_flags & 0o1000 != 0 {
+        f |= vfs::O_TRUNC;
+    }
+    if linux_flags & 0o2000 != 0 {
+        f |= vfs::O_APPEND;
+    }
+    f
+}
+
+// ---- file I/O -----------------------------------------------------------
+
+fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
+    let Some(phys) = resolve(buf, count) else {
+        return err(EFAULT);
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, count as usize) };
+    if fd == 1 || fd == 2 {
+        for &b in bytes {
+            crate::io::print(core::format_args!("{}", b as char));
+        }
+        return bytes.len() as u64;
+    }
+    if fd < 3 {
+        return err(EBADF); // fd 0 (stdin) isn't writable
+    }
+    with_process(|p| match p.fd_mut(fd as usize) {
+        Some(h) => match h.write(bytes) {
+            Ok(n) => n as u64,
+            Err(e) => vfs_err(e),
+        },
+        None => err(EBADF),
+    })
+    .unwrap_or(err(EBADF))
+}
+
+fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
+    let Some(phys) = resolve(buf, count) else {
+        return err(EFAULT);
+    };
+    if fd == 0 {
+        let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+        let mut n = 0usize;
+        while n < out.len() {
+            match crate::keyboard::next_event() {
+                Some(crate::keyboard::Event::Char(c)) => {
+                    out[n] = c as u8;
+                    n += 1;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        return n as u64;
+    }
+    if fd < 3 {
+        return err(EBADF); // fd 1/2 (stdout/stderr) aren't readable
+    }
+    with_process(|p| match p.fd_mut(fd as usize) {
+        Some(h) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            h.read(out) as u64
+        }
+        None => err(EBADF),
+    })
+    .unwrap_or(err(EBADF))
+}
+
+fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
+    let Some(path) = read_cstr(pathname, 256) else {
+        return err(EFAULT);
+    };
+    let path = normalize_path(&path);
+    let vfs_flags = translate_open_flags(flags);
+    match vfs::FileHandle::open(&path, vfs_flags) {
+        Ok(handle) => with_process(|p| p.alloc_fd(handle) as u64).unwrap_or(err(EBADF)),
+        Err(e) => vfs_err(e),
+    }
+}
+
+fn sys_close(fd: u64) -> u64 {
+    if fd < 3 {
+        return 0; // stdio: no real fd table entry to remove
+    }
+    with_process(|p| if p.close_fd(fd as usize) { 0 } else { err(EBADF) }).unwrap_or(err(EBADF))
+}
+
+fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
+    if fd < 3 {
+        return err(ESPIPE);
+    }
+    let from = match whence {
+        0 => vfs::SeekFrom::Start(offset),
+        1 => vfs::SeekFrom::Current(offset as i64),
+        2 => vfs::SeekFrom::End(offset as i64),
+        _ => return err(EINVAL),
+    };
+    with_process(|p| match p.fd_mut(fd as usize) {
+        Some(h) => h.seek(from),
+        None => err(EBADF),
+    })
+    .unwrap_or(err(EBADF))
+}
+
+const S_IFREG: u32 = 0o100000;
+const S_IFDIR: u32 = 0o040000;
+const S_IFCHR: u32 = 0o020000;
+const STAT_SIZE: u64 = 144; // sizeof(struct stat), x86_64 Linux
+
+/// Writes a (mostly zeroed, minimally plausible) Linux `struct stat` to
+/// `buf_ptr`: only the fields a typical startup path or `ls`-like
+/// listing actually inspects (`st_mode`, `st_size`, `st_blksize`,
+/// `st_blocks`) are filled in; timestamps and ownership stay zero.
+fn write_stat(buf_ptr: u64, mode: u32, size: u64) -> u64 {
+    let Some(phys) = resolve(buf_ptr, STAT_SIZE) else {
+        return err(EFAULT);
+    };
+    unsafe {
+        let p = phys as *mut u8;
+        core::ptr::write_bytes(p, 0, STAT_SIZE as usize);
+        core::ptr::write_unaligned(p.add(16) as *mut u64, 1); // st_nlink
+        core::ptr::write_unaligned(p.add(24) as *mut u32, mode); // st_mode
+        core::ptr::write_unaligned(p.add(48) as *mut u64, size); // st_size
+        core::ptr::write_unaligned(p.add(56) as *mut u64, 4096); // st_blksize
+        core::ptr::write_unaligned(p.add(64) as *mut u64, size.div_ceil(512)); // st_blocks
+    }
+    0
+}
+
+fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
+    if fd < 3 {
+        return write_stat(statbuf, S_IFCHR | 0o666, 0);
+    }
+    let stat = with_process(|p| p.fd_mut(fd as usize).map(|h| h.stat()));
+    match stat {
+        Some(Some(st)) => {
+            let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
+            write_stat(statbuf, mode, st.size)
+        }
+        _ => err(EBADF),
+    }
+}
+
+fn sys_newfstatat(_dirfd: u64, pathname: u64, statbuf: u64, _flags: u64) -> u64 {
+    let Some(path) = read_cstr(pathname, 256) else {
+        return err(EFAULT);
+    };
+    let path = normalize_path(&path);
+    match vfs::FileHandle::open(&path, 0) {
+        Ok(h) => {
+            let st = h.stat();
+            let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
+            write_stat(statbuf, mode, st.size)
+        }
+        Err(e) => vfs_err(e),
+    }
+}
+
+fn sys_writev(fd: u64, iov: u64, iovcnt: u64) -> u64 {
+    let mut total = 0u64;
+    for i in 0..iovcnt {
+        let Some(entry) = resolve(iov + i * 16, 16) else {
+            return err(EFAULT);
+        };
+        let base = unsafe { core::ptr::read_unaligned(entry as *const u64) };
+        let len = unsafe { core::ptr::read_unaligned((entry as *const u8).add(8) as *const u64) };
+        if len == 0 {
+            continue;
+        }
+        let n = sys_write(fd, base, len);
+        if (n as i64) < 0 {
+            return n;
+        }
+        total += n;
+    }
+    total
+}
+
+// ---- memory ---------------------------------------------------------------
+
+fn sys_brk(addr: u64) -> u64 {
+    let Some(pml4) = crate::task::current_process_cr3() else {
+        return 0;
+    };
+    with_process(|p| p.brk(pml4, addr)).unwrap_or(0)
+}
+
+const MAP_FIXED: u64 = 0x10;
+const PROT_WRITE: u64 = 2;
+
+fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64) -> u64 {
+    if len == 0 {
+        return err(EINVAL);
+    }
+    let Some(pml4) = crate::task::current_process_cr3() else {
+        return err(ENOMEM);
+    };
+    let at = if flags & MAP_FIXED != 0 { Some(addr) } else { None };
+    let writable = prot & PROT_WRITE != 0;
+    with_process(|p| p.mmap_anon(pml4, at, len, writable)).flatten().unwrap_or(err(ENOMEM))
+}
+
+fn sys_munmap(addr: u64, len: u64) -> u64 {
+    let Some(pml4) = crate::task::current_process_cr3() else {
+        return err(EINVAL);
+    };
+    if with_process(|p| p.munmap(pml4, addr, len)).unwrap_or(false) {
+        0
+    } else {
+        err(EINVAL)
+    }
+}
+
+fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
+    let Some(pml4) = crate::task::current_process_cr3() else {
+        return err(EINVAL);
+    };
+    let writable = prot & PROT_WRITE != 0;
+    if with_process(|p| p.mprotect(pml4, addr, len, writable)).unwrap_or(false) {
+        0
+    } else {
+        err(EINVAL)
+    }
+}
+
+// ---- TLS (arch_prctl) -------------------------------------------------
+
+const ARCH_SET_FS: u64 = 0x1002;
+const MSR_FS_BASE: u32 = 0xC000_0100;
+
+fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
+    match code {
+        ARCH_SET_FS => {
+            unsafe {
+                crate::syscall::wrmsr(MSR_FS_BASE, addr);
+            }
+            with_process(|p| p.fs_base = addr);
+            0
+        }
+        _ => err(EINVAL),
+    }
+}
+
+// ---- misc startup/runtime syscalls ---------------------------------------
+
+fn sys_uname(buf: u64) -> u64 {
+    const FIELD: usize = 65;
+    const TOTAL: u64 = FIELD as u64 * 6;
+    let Some(phys) = resolve(buf, TOTAL) else {
+        return err(EFAULT);
+    };
+    let write_field = |offset: usize, s: &[u8]| unsafe {
+        core::ptr::write_bytes((phys as *mut u8).add(offset), 0, FIELD);
+        core::ptr::copy_nonoverlapping(s.as_ptr(), (phys as *mut u8).add(offset), s.len());
+    };
+    write_field(0, b"Linux");
+    write_field(FIELD, b"machaos");
+    write_field(FIELD * 2, b"6.1.0-machaos");
+    write_field(FIELD * 3, b"#1 SMP");
+    write_field(FIELD * 4, b"x86_64");
+    write_field(FIELD * 5, b"");
+    0
+}
+
+fn sys_getrandom(buf: u64, buflen: u64, _flags: u64) -> u64 {
+    let Some(phys) = resolve(buf, buflen) else {
+        return err(EFAULT);
+    };
+    let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, buflen as usize) };
+    // Not cryptographically random — no HW RNG driver exists yet — just
+    // distinct-enough bytes to satisfy a libc that refuses to start
+    // without them (musl's stack-protector canary, malloc hardening).
+    let mut seed = crate::interrupts::ticks() ^ buf;
+    for (i, b) in out.iter_mut().enumerate() {
+        seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i as u64);
+        *b = (seed >> 33) as u8;
+    }
+    buflen
+}
+
+fn sys_clock_gettime(_clockid: u64, ts: u64) -> u64 {
+    let Some(phys) = resolve(ts, 16) else {
+        return err(EFAULT);
+    };
+    let ticks = crate::interrupts::ticks(); // 100 Hz (see pit.rs)
+    unsafe {
+        core::ptr::write_unaligned(phys as *mut u64, ticks / 100);
+        core::ptr::write_unaligned((phys as *mut u8).add(8) as *mut u64, (ticks % 100) * 10_000_000);
+    }
+    0
+}
+
+/// Dispatches one Linux-numbered syscall.
+pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, _arg5: u64) -> u64 {
     match num {
+        SYS_READ => sys_read(arg1, arg2, arg3),
+        SYS_WRITE => sys_write(arg1, arg2, arg3),
+        SYS_CLOSE => sys_close(arg1),
+        SYS_FSTAT => sys_fstat(arg1, arg2),
+        SYS_LSEEK => sys_lseek(arg1, arg2, arg3),
+        SYS_MMAP => sys_mmap(arg1, arg2, arg3, arg4),
+        SYS_MPROTECT => sys_mprotect(arg1, arg2, arg3),
+        SYS_MUNMAP => sys_munmap(arg1, arg2),
+        SYS_BRK => sys_brk(arg1),
+        SYS_RT_SIGACTION => 0,   // no signal delivery — see module docs
+        SYS_RT_SIGPROCMASK => 0, // ditto
+        SYS_IOCTL => err(ENOTTY), // every fd reports "not a tty"
+        SYS_WRITEV => sys_writev(arg1, arg2, arg3),
         SYS_GETPID => crate::task::current_pid() as u64,
+        SYS_UNAME => sys_uname(arg1),
+        SYS_ARCH_PRCTL => sys_arch_prctl(arg1, arg2),
+        SYS_SET_TID_ADDRESS => crate::task::current_pid() as u64,
+        SYS_CLOCK_GETTIME => sys_clock_gettime(arg1, arg2),
+        SYS_OPENAT => sys_openat(arg1, arg2, arg3, arg4),
+        SYS_NEWFSTATAT => sys_newfstatat(arg1, arg2, arg3, arg4),
+        SYS_SET_ROBUST_LIST => 0,
+        SYS_GETRANDOM => sys_getrandom(arg1, arg2, arg3),
         _ => err(ENOSYS),
     }
 }

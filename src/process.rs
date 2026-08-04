@@ -72,6 +72,16 @@ const USER_STACK_LOW_LIMIT: u64 = USER_STACK_TOP - USER_STACK_MAX_PAGES * paging
 /// page isn't PAGE_USER anyway). Holds `mov eax, SYS_EXIT; syscall`.
 const USER_EXIT_STUB_VIRT: u64 = USER_STACK_TOP;
 
+/// Anonymous-mmap arena for the Linux ABI's `mmap` (see
+/// `Process::mmap_anon`): a non-`MAP_FIXED` request gets the next free
+/// address starting here and growing up, well clear of `PIE_LOAD_BASE`
+/// (512 MiB) and any realistically-sized set of loaded segments, with
+/// 2 GiB of room before `MMAP_CEILING` — comfortably under
+/// `paging::IDENTITY_MAP_END` (4 GiB), the hard limit every virtual
+/// address in this kernel is under regardless of process.
+const MMAP_BASE: u64 = 0x4000_0000;
+const MMAP_CEILING: u64 = 0xC000_0000;
+
 /// One mapped chunk of a process's address space: virtual range
 /// `[vaddr, vaddr+len)` backed by the physical range starting at `phys`.
 #[derive(Clone, Copy)]
@@ -140,6 +150,24 @@ pub struct Process {
     stack_low: u64,
     /// Which syscall table this process's syscalls dispatch to. See `Abi`.
     pub(crate) abi: Abi,
+    /// Fixed once at spawn, just past the highest loaded segment
+    /// (page-aligned) — the Linux ABI's `brk(0)` starting point. See
+    /// `Process::brk`.
+    heap_start: u64,
+    /// Current program break (`brk`'s logical, possibly non-page-aligned
+    /// value — see `Process::brk`).
+    heap_end: u64,
+    /// Next address `Process::mmap_anon` hands out for a non-`MAP_FIXED`
+    /// request.
+    mmap_next: u64,
+    /// This process's `FS_BASE` MSR value (TLS base, set via
+    /// `arch_prctl(ARCH_SET_FS, ...)` — see `linux_abi.rs`), saved and
+    /// restored by `task::scheduler_tick` around a task switch. `FS_BASE`
+    /// is a single CPU-global MSR, not part of the register set
+    /// `context_switch` already saves/restores, so without this a second
+    /// process also using TLS would silently stomp the first's base the
+    /// moment the scheduler interleaves them.
+    pub(crate) fs_base: u64,
 }
 
 impl Process {
@@ -237,6 +265,164 @@ impl Process {
         self.stack_low = new_low;
         true
     }
+
+    /// Translates `[vaddr, vaddr+len)` against this process's own
+    /// mappings directly, without the `pid` indirection `process::translate`
+    /// needs (that one goes through `task::process_mappings`, for callers
+    /// that only have a pid — `Abi::Linux` syscall handlers always have
+    /// `&mut self` already via `task::with_current_process_mut`).
+    fn translate_local(&self, vaddr: u64, len: u64) -> Option<u64> {
+        let end = vaddr.checked_add(len)?;
+        let mapping = self.mappings.iter().find(|m| m.vaddr <= vaddr && end <= m.vaddr + m.len)?;
+        Some(mapping.phys + (vaddr - mapping.vaddr))
+    }
+
+    /// Linux `brk`: `requested == 0` (or `< heap_start`) is the "query
+    /// current break" form and changes nothing. Otherwise maps whatever
+    /// additional whole pages `requested` needs beyond what's already
+    /// mapped (shrinking just moves the logical boundary down — the
+    /// pages already mapped for it stay mapped, simpler than unmapping
+    /// them and harmless at this scale) and returns the new break; on
+    /// allocation failure, returns the unchanged old break, matching
+    /// real `brk`'s "never returns -1" convention (a caller compares the
+    /// return value to what it asked for to detect failure).
+    pub fn brk(&mut self, pml4: u64, requested: u64) -> u64 {
+        if requested < self.heap_start {
+            return self.heap_end;
+        }
+        let old_mapped = align_up(self.heap_end.max(self.heap_start) - self.heap_start, paging::PAGE_SIZE);
+        let new_mapped = align_up(requested - self.heap_start, paging::PAGE_SIZE);
+        if new_mapped > old_mapped {
+            let grow_len = new_mapped - old_mapped;
+            let pages = (grow_len / paging::PAGE_SIZE) as usize;
+            let Some(phys) = pmm::alloc_contiguous(pages) else {
+                return self.heap_end;
+            };
+            for i in 0..pages {
+                self.frames.push(phys + i * pmm::FRAME_SIZE);
+            }
+            unsafe {
+                core::ptr::write_bytes(phys as *mut u8, 0, grow_len as usize);
+            }
+            let map_at = self.heap_start + old_mapped;
+            if !paging::map_range_in(
+                pml4,
+                map_at,
+                phys as u64,
+                grow_len,
+                paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+                &mut self.frames,
+            ) {
+                return self.heap_end;
+            }
+            self.mappings.push(Mapping {
+                vaddr: map_at,
+                phys: phys as u64,
+                len: grow_len,
+            });
+        }
+        self.heap_end = requested;
+        self.heap_end
+    }
+
+    /// Linux anonymous `mmap`. `at`, when `Some`, is a `MAP_FIXED`
+    /// request (used verbatim, page-aligned down — ld.so needs this to
+    /// place a shared library's segments at a chosen base, see the
+    /// Phase 4 plan); `None` hands out the next free address in the
+    /// bump-allocated arena `MMAP_BASE..MMAP_CEILING`. Always backed by
+    /// freshly zeroed frames (no lazy/demand-paged anonymous memory —
+    /// see Phase 1's plan notes on why that was deferred).
+    pub fn mmap_anon(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool) -> Option<u64> {
+        let len = align_up(len.max(1), paging::PAGE_SIZE);
+        let addr = match at {
+            Some(a) => a & !(paging::PAGE_SIZE - 1),
+            None => {
+                let a = self.mmap_next;
+                if a.checked_add(len)? > MMAP_CEILING {
+                    return None;
+                }
+                a
+            }
+        };
+        let pages = (len / paging::PAGE_SIZE) as usize;
+        let phys = pmm::alloc_contiguous(pages)?;
+        for i in 0..pages {
+            self.frames.push(phys + i * pmm::FRAME_SIZE);
+        }
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, len as usize);
+        }
+        let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+        if writable {
+            flags |= paging::PAGE_WRITABLE;
+        }
+        if !paging::map_range_in(pml4, addr, phys as u64, len, flags, &mut self.frames) {
+            return None;
+        }
+        self.mappings.push(Mapping {
+            vaddr: addr,
+            phys: phys as u64,
+            len,
+        });
+        if at.is_none() {
+            self.mmap_next = addr + len;
+        }
+        Some(addr)
+    }
+
+    /// Linux `munmap`. Only reclaims mappings *fully* contained in
+    /// `[addr, addr+len)` — unmapping just part of an existing mapping
+    /// (splitting it into a kept and a freed piece) isn't implemented;
+    /// a partially-overlapping range is left mapped as-is (safe, if
+    /// imprecise, and not a shape `mmap_anon`'s own callers produce).
+    pub fn munmap(&mut self, pml4: u64, addr: u64, len: u64) -> bool {
+        let len = align_up(len.max(1), paging::PAGE_SIZE);
+        let start = addr & !(paging::PAGE_SIZE - 1);
+        let end = start + len;
+        let mut i = 0;
+        while i < self.mappings.len() {
+            let m = self.mappings[i];
+            if m.vaddr >= start && m.vaddr + m.len <= end {
+                paging::unmap_range_in(pml4, m.vaddr, m.len);
+                let pages = (m.len / paging::PAGE_SIZE) as usize;
+                for p in 0..pages {
+                    pmm::frame_free(m.phys as usize + p * pmm::FRAME_SIZE);
+                }
+                self.frames.retain(|&f| (f as u64) < m.phys || (f as u64) >= m.phys + m.len);
+                self.mappings.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        true
+    }
+
+    /// Linux `mprotect`. Re-maps each page already owned in
+    /// `[addr, addr+len)` at its existing physical address with the new
+    /// permission (`map_range_in` overwrites a PTE unconditionally, so
+    /// this needs no fresh frames) — read/write only; there's no
+    /// executable-bit enforcement to change since `paging.rs` has no NX
+    /// support yet (see `elf::Segment::executable`'s doc comment). Fails
+    /// if any page in the range isn't currently owned by this process.
+    pub fn mprotect(&mut self, pml4: u64, addr: u64, len: u64, writable: bool) -> bool {
+        let len = align_up(len.max(1), paging::PAGE_SIZE);
+        let start = addr & !(paging::PAGE_SIZE - 1);
+        let mut v = start;
+        while v < start + len {
+            let Some(phys) = self.translate_local(v, paging::PAGE_SIZE) else {
+                return false;
+            };
+            let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+            if writable {
+                flags |= paging::PAGE_WRITABLE;
+            }
+            if !paging::map_range_in(pml4, v, phys, paging::PAGE_SIZE, flags, &mut self.frames) {
+                return false;
+            }
+            v += paging::PAGE_SIZE;
+        }
+        true
+    }
 }
 
 /// Called from the #PF handler (see `interrupts::page_fault`) before it
@@ -302,6 +488,10 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
         stack_low: USER_STACK_BASE,
         abi: Abi::Native,
+        heap_start: 0,
+        heap_end: 0,
+        mmap_next: MMAP_BASE,
+        fs_base: 0,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -323,26 +513,26 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
     Ok(task::spawn_process(process_entry_trampoline, name, pml4, process))
 }
 
-/// Test-only entry point for the Linux ABI groundwork: otherwise
-/// identical to `spawn`, but builds an argv/envp/auxv stack
-/// (`setup_linux_stack`) instead of the native ABI's single "return to
-/// the exit trampoline" slot, and routes the process's syscalls through
-/// the (currently skeletal — see `linux_abi.rs`) Linux syscall table
-/// instead of the native one (`Abi::Linux`). Not wired to any real ELF
-/// launch path (that's Phase 2's job, once `linux_abi.rs` has enough
-/// syscalls implemented to run something) — this exists so the stack
-/// layout and dispatch-routing mechanism can each be built and verified
-/// now against real test programs
-/// (`user/src/bin/prog_linux_stack.rs`, `prog_linux_syscall.rs`).
-pub fn spawn_linux_test(
-    elf_bytes: &[u8],
-    name: &'static str,
-    argv: &[&str],
-    envp: &[&str],
-) -> Result<usize, &'static str> {
+/// Entry point for a Linux-ABI process: otherwise identical to `spawn`,
+/// but builds an argv/envp/auxv stack (`setup_linux_stack`) instead of
+/// the native ABI's single "return to the exit trampoline" slot, and
+/// routes the process's syscalls through the Linux syscall table
+/// (`linux_abi.rs`) instead of the native one (`Abi::Linux`). Used both
+/// by the Phase 1/2 test programs and by `shell.rs`'s `runlinux` command.
+pub fn spawn_linux(elf_bytes: &[u8], name: &'static str, argv: &[&str], envp: &[&str]) -> Result<usize, &'static str> {
     let mut program = elf::parse(elf_bytes)?;
     apply_pie_bias(&mut program);
     validate_segments(&program)?;
+
+    // brk(0) starts just past the highest loaded segment, page-aligned,
+    // with a one-page gap so the heap can never be mistaken for part of
+    // the last segment.
+    let heap_start = program
+        .segments
+        .iter()
+        .map(|s| align_up(s.vaddr + s.memsz, paging::PAGE_SIZE) + paging::PAGE_SIZE)
+        .max()
+        .ok_or("no loadable segments")?;
 
     let mut process = Process {
         entry: program.entry as usize,
@@ -355,6 +545,10 @@ pub fn spawn_linux_test(
         fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
         stack_low: USER_STACK_BASE,
         abi: Abi::Linux,
+        heap_start,
+        heap_end: heap_start,
+        mmap_next: MMAP_BASE,
+        fs_base: 0,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -690,7 +884,7 @@ fn setup_linux_stack(
     // the pointer/auxv table's size — computed next — fixes where this
     // blob starts). ----
     let mut data: Vec<u8> = Vec::new();
-    let mut push_cstr = |data: &mut Vec<u8>, s: &[u8]| -> u64 {
+    let push_cstr = |data: &mut Vec<u8>, s: &[u8]| -> u64 {
         let offset = data.len() as u64;
         data.extend_from_slice(s);
         data.push(0);

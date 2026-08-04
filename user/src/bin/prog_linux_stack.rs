@@ -21,7 +21,7 @@ mod common;
 use core::arch::global_asm;
 use core::sync::atomic::Ordering;
 
-const SYS_EXIT: u64 = 1;
+const SYS_EXIT: u64 = 60; // Linux x86_64 numbering (syscall_entry now checks the process's Abi)
 
 const AT_NULL: u64 = 0;
 const AT_PHDR: u64 = 3;

@@ -176,6 +176,39 @@ pub fn map_range_in(
     true
 }
 
+/// Clears the mapping for each 4 KiB page in `[virt, virt+len)` in the
+/// address space rooted at `pml4_base` (the counterpart to
+/// `map_range_in`, for a process's private table — `unmap_page` below is
+/// kernel-map-only). Does not free the physical frames; the caller owns
+/// them (see `process::Process::munmap`). Returns false for a
+/// misaligned/invalid range.
+pub fn unmap_range_in(pml4_base: u64, virt: u64, len: u64) -> bool {
+    if virt % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || len == 0 || virt.checked_add(len).is_none() || virt + len > IDENTITY_MAP_END
+    {
+        return false;
+    }
+    let mut v = virt;
+    let end = virt + len;
+    while v < end {
+        // entry_flags = 0 (no USER promotion needed to clear an entry)
+        // and no frame list: if a bare 2 MiB entry is still in the way
+        // here, `pt_entry_ptr_in` splits it (installing a full page
+        // table) same as `map_range_in` would, but every page this
+        // kernel ever hands to a process first goes through
+        // `map_range_in` (which does track that split's frame) before
+        // anything could `unmap_range_in` it — so in practice this path
+        // only ever clears an already-4-KiB entry.
+        if let Some(entry) = unsafe { pt_entry_ptr_in(pml4_base, v, 0, None) } {
+            unsafe {
+                *entry = 0;
+            }
+            invlpg(v);
+        }
+        v += PAGE_SIZE;
+    }
+    true
+}
+
 /// Identity-maps `virt` to `phys` as a single 4 KiB page in the kernel's
 /// own address space. Both must be 4 KiB aligned and below
 /// `IDENTITY_MAP_END`. `flags` is a subset of PAGE_* attributes
