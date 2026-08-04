@@ -113,6 +113,18 @@ pub fn present() {
     }
 }
 
+/// Copies a validated user compositor frame into the kernel back buffer and
+/// presents it. The compositor never receives the MMIO framebuffer mapping.
+pub fn present_pixels(pixels: &[u32]) -> bool {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else { return false };
+    if pixels.len() != state.back_buffer.len() { return false; }
+    state.back_buffer.copy_from_slice(pixels);
+    drop(guard);
+    present();
+    true
+}
+
 /// Lock-free, back-buffer-free pixel write straight to MMIO. Only safe to
 /// call from the panic handler, where nothing else can be concurrently
 /// touching the framebuffer.

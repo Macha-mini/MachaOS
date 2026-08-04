@@ -38,6 +38,7 @@ mod task;
 mod user_prog;
 mod vga;
 mod wm;
+mod window_server;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;

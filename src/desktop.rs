@@ -1,13 +1,30 @@
-//! The GUI main loop: drains mouse/keyboard events into the window
-//! manager, recomposites when something changed, and otherwise halts
-//! until the next interrupt (timer, keyboard, or mouse).
+//! The GUI main loop: captures kernel input and forwards it to the user-space
+//! compositor. The compositor owns focus, hit-testing, and final composition;
+//! this kernel loop only handles interrupt queues and scheduling.
 
-use crate::{fb, interrupts, io, keyboard, mouse, process, user_prog, wm};
+use crate::{interrupts, io, keyboard, mouse, process, user_prog};
+
+fn encode_key(event: keyboard::Event) -> Option<[u8; 6]> {
+    match event {
+        keyboard::Event::Char(c) if c.is_ascii() => Some([0, c as u8, 0, 0, 0, 0]),
+        keyboard::Event::Backspace => Some([1, 0, 0, 0, 0, 0]),
+        keyboard::Event::Enter => Some([2, 0, 0, 0, 0, 0]),
+        keyboard::Event::Ctrl(c) if c.is_ascii() => Some([4, c as u8, 0, 0, 0, 0]),
+        _ => None,
+    }
+}
+
+fn encode_mouse(event: mouse::MouseEvent) -> [u8; 6] {
+    let [dx0, dx1] = (event.dx as i16).to_le_bytes();
+    let [dy0, dy1] = (event.dy as i16).to_le_bytes();
+    [5, dx0, dx1, dy0, dy1, event.left as u8]
+}
 
 pub fn run() -> ! {
-    let (screen_w, screen_h) = fb::dimensions();
-    let mut manager = wm::WindowManager::new(screen_w, screen_h);
-    manager.composite();
+    let compositor = match process::spawn(user_prog::PROG_COMPOSITOR, "compositor") {
+        Ok(pid) => pid,
+        Err(e) => { io::print(format_args!("failed to launch compositor: {}\n", e)); loop { interrupts::halt(); } }
+    };
 
     // Calculator runs as a real ring-3 process now (user/src/bin/prog_calculator.rs),
     // not kernel-resident `AppKind` state — its window shows up a frame or
@@ -24,23 +41,14 @@ pub fn run() -> ! {
     }
 
     loop {
-        let mut dirty = false;
         while let Some(event) = mouse::next_event() {
-            manager.handle_mouse(event);
-            dirty = true;
+            let encoded = encode_mouse(event);
+            process::send_from_kernel(compositor, &encoded);
         }
         while let Some(event) = keyboard::next_event() {
-            manager.handle_key(event);
-            dirty = true;
-        }
-        // Requests queued by sys_win_create/sys_win_update (and processes
-        // that exited since the last pass) — this loop is the only place
-        // a `WindowManager` is reachable from, so it's the only place
-        // either can be applied. See wm.rs's module docs on `WinCommand`.
-        dirty |= manager.drain_commands();
-        dirty |= manager.reap_exited_process_windows();
-        if dirty || manager.clock_tick_due() {
-            manager.composite();
+            if let Some(encoded) = encode_key(event) {
+                process::send_from_kernel(compositor, &encoded);
+            }
         }
         interrupts::halt();
     }

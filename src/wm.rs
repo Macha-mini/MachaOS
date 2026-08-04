@@ -8,6 +8,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::console::Console;
 use crate::cpuid;
@@ -113,6 +114,9 @@ enum WinCommand {
 }
 
 static PENDING_COMMANDS: SpinLock<Vec<WinCommand>> = SpinLock::new(Vec::new());
+// The old in-kernel manager is retained only by the kernel selftest. Normal
+// graphics boot uses user/src/bin/prog_compositor.rs instead.
+static LEGACY_MANAGER_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Bound on queued-but-undrained commands, so a process spamming
 /// sys_win_update faster than the desktop loop drains it grows memory
@@ -133,11 +137,13 @@ fn take_pending_commands() -> Vec<WinCommand> {
 
 /// Queues a window-creation request for `pid` (see `sys_win_create`).
 pub fn queue_create(pid: usize, width: u32, height: u32, title: String) {
+    if !LEGACY_MANAGER_ENABLED.load(Ordering::Acquire) { return; }
     push_command(WinCommand::Create { pid, width, height, title });
 }
 
 /// Queues a pixel-buffer replacement for `pid`'s window (see `sys_win_update`).
 pub fn queue_update(pid: usize, pixels: Vec<u32>) {
+    if !LEGACY_MANAGER_ENABLED.load(Ordering::Acquire) { return; }
     push_command(WinCommand::Update { pid, pixels });
 }
 
@@ -269,6 +275,7 @@ pub struct WindowManager {
 
 impl WindowManager {
     pub fn new(screen_w: u32, screen_h: u32) -> Self {
+        LEGACY_MANAGER_ENABLED.store(true, Ordering::Release);
         let margin = 40i32;
         let max_x = screen_w as i32 - 100;
         let max_y = screen_h as i32 - TASKBAR_HEIGHT as i32 - 100;

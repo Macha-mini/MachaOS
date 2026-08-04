@@ -10,3 +10,4 @@ pub static PROG_WINDOW: &[u8] = include_bytes!("../target/user-window.elf");
 pub static PROG_CALCULATOR: &[u8] = include_bytes!("../target/user-calculator.elf");
 pub static PROG_TERMINAL: &[u8] = include_bytes!("../target/user-terminal.elf");
 pub static PROG_NOTEPAD: &[u8] = include_bytes!("../target/user-notepad.elf");
+pub static PROG_COMPOSITOR: &[u8] = include_bytes!("../target/user-compositor.elf");
