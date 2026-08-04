@@ -126,6 +126,31 @@ impl Task {
 const STACK_SIZE: usize = 16 * 1024;
 const QUANTUM_TICKS: u64 = 5; // 50ms at the 100Hz PIT rate
 
+/// Bytes of headroom kept below `kernel_stack_top` when programming
+/// TSS.RSP0 for a task (see `scheduler_tick`'s `set_kernel_stack` call).
+///
+/// A process's `enter_usermode` (syscall.rs) "parks" a return chain —
+/// `process_entry_trampoline` -> `run_ring3` -> `enter_usermode`'s own
+/// 6 pushed registers, plus each frame's own return address — on this
+/// same 16 KiB buffer, at whatever depth that short call chain reaches,
+/// then does its `iretq` into ring 3. That parked chain isn't touched
+/// again until the process's `exit` syscall unwinds it (`.Lsyscall_exit`
+/// in syscall.rs). But every *other* trip through ring 0 while the
+/// process runs — any interrupt or exception, not just ones that kill
+/// the process — gets its stack frame from TSS.RSP0, which if pointed
+/// at the literal top would land *above* the parked chain and grow
+/// straight through it. A shallow handler (the timer tick) or one that
+/// never returns to ring 3 (`kill_current`, which redirects rip to
+/// `exit_self` instead of resuming) never surfaced this. A #PF that
+/// resolves and resumes ring 3 — `process::handle_fault`'s stack-growth
+/// path — calls deep enough (`pmm::alloc_contiguous`, `paging::map_range_in`)
+/// to overwrite it, corrupting the very state `exit` later needs,
+/// which showed up as `exit`'s `ret` landing on garbage. This reserve
+/// keeps every such trip through ring 0 confined below the parked chain
+/// instead. Comfortably covers that chain's actual depth (a handful of
+/// stack frames, well under 100 bytes) with room to spare.
+const RING3_PARK_RESERVE: u64 = 1024;
+
 // Built once in `init()` before interrupts are enabled, then mutated from
 // `scheduler_tick()` (timer-interrupt context) or from `push_task` /
 // `remove_process` with interrupts disabled. See the module docs.
@@ -244,7 +269,7 @@ pub fn scheduler_tick() {
     if paging::read_cr3() != tasks[next].cr3 {
         paging::write_cr3(tasks[next].cr3);
     }
-    crate::gdt::set_kernel_stack(tasks[next].kernel_stack_top);
+    crate::gdt::set_kernel_stack(tasks[next].kernel_stack_top - RING3_PARK_RESERVE);
     let new_rsp = tasks[next].context.rsp;
     let old_rsp_ptr = &mut tasks[current].context.rsp as *mut usize;
     unsafe {
@@ -296,6 +321,28 @@ pub fn current_process_user_rsp() -> u64 {
         .as_ref()
         .expect("current task is not a process")
         .user_rsp
+}
+
+/// The current task's CR3 (its own PML4), if it is a process — `None` for
+/// a kernel task. Used by `process::handle_fault` to map a new page into
+/// the *faulting* process's address space regardless of which task's
+/// stack the #PF handler happens to be running on.
+pub fn current_process_cr3() -> Option<u64> {
+    let task = &tasks()[CURRENT.load(Ordering::Relaxed)];
+    task.process.as_ref().map(|_| task.cr3)
+}
+
+/// Runs `f` on the current task's process, if it is one. Used by
+/// `process::handle_fault` to grow the ring-3 stack from inside the #PF
+/// handler, where the fault could interrupt any point in the process's
+/// execution — the same non-reentrancy argument `deliver_message`'s doc
+/// comment makes applies here (interrupts are already disabled for the
+/// whole handler).
+pub fn with_current_process_mut<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_mut()
+        .map(f)
 }
 
 /// Saves the current task's kernel-side resume point for when its process

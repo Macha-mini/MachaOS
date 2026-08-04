@@ -58,8 +58,14 @@ const PIE_LOAD_BASE: u64 = 0x2000_0000;
 /// territory) since each process has its own private page table, so
 /// there's no collision between processes reusing it.
 const USER_STACK_TOP: u64 = 0x1000_0000;
-const USER_STACK_PAGES: u64 = 8; // 32 KiB
+const USER_STACK_PAGES: u64 = 8; // 32 KiB mapped up front at spawn
 const USER_STACK_BASE: u64 = USER_STACK_TOP - USER_STACK_PAGES * paging::PAGE_SIZE;
+/// Hard floor stack growth (see `Process::try_grow_stack`) will map down
+/// to: 1 MiB total, comfortably more than the 32 KiB mapped at spawn but
+/// still small enough that a genuinely wild pointer several pages below
+/// the current floor reliably lands outside it and stays fatal.
+const USER_STACK_MAX_PAGES: u64 = 256; // 1 MiB
+const USER_STACK_LOW_LIMIT: u64 = USER_STACK_TOP - USER_STACK_MAX_PAGES * paging::PAGE_SIZE;
 /// One page right above the stack: where the ELF's `_start` lands when it
 /// `ret`s normally, since ring-3 code can't `ret` straight into the
 /// kernel's `exit_self` (no privilege change on a bare `ret`, and that
@@ -112,6 +118,10 @@ pub struct Process {
     /// `openat`/`read`/`write`/`lseek`/`close`/`fstat` syscalls. Indices
     /// 0..FIRST_FILE_FD stay `None` always — see `FIRST_FILE_FD`.
     fds: Vec<Option<vfs::FileHandle>>,
+    /// Lowest address currently mapped for the ring-3 stack; starts at
+    /// `USER_STACK_BASE` and moves down as `try_grow_stack` maps more of
+    /// the reserved growth region below it.
+    stack_low: u64,
 }
 
 impl Process {
@@ -164,6 +174,84 @@ impl Process {
             _ => false,
         }
     }
+
+    /// Grows the ring-3 stack down to cover `fault_addr`, if it is a
+    /// legitimate "touched just below the current floor" access: still
+    /// inside the reserved growth region (`>= USER_STACK_LOW_LIMIT`) but
+    /// below `stack_low`. Maps every page from `fault_addr`'s page up to
+    /// (not including) the previous floor — not just the single faulting
+    /// page — so a deep one-shot descent (a large stack-local array, or a
+    /// callee that skips the compiler's usual page-at-a-time stack
+    /// probing) is covered in one fault instead of needing one fault per
+    /// page. Returns `false` (leaving the fault to kill the process, same
+    /// as before this existed) for anything outside that region.
+    fn try_grow_stack(&mut self, pml4: u64, fault_addr: u64) -> bool {
+        if fault_addr >= self.stack_low || fault_addr < USER_STACK_LOW_LIMIT {
+            return false;
+        }
+        let new_low = fault_addr & !(paging::PAGE_SIZE - 1);
+        let grow_len = self.stack_low - new_low;
+        let pages = (grow_len / paging::PAGE_SIZE) as usize;
+        let Some(phys) = pmm::alloc_contiguous(pages) else {
+            return false;
+        };
+        for i in 0..pages {
+            self.frames.push(phys + i * pmm::FRAME_SIZE);
+        }
+        unsafe {
+            core::ptr::write_bytes(phys as *mut u8, 0, grow_len as usize);
+        }
+        if !paging::map_range_in(
+            pml4,
+            new_low,
+            phys as u64,
+            grow_len,
+            paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+            &mut self.frames,
+        ) {
+            return false;
+        }
+        self.mappings.push(Mapping {
+            vaddr: new_low,
+            phys: phys as u64,
+            len: grow_len,
+        });
+        self.stack_low = new_low;
+        true
+    }
+}
+
+/// Called from the #PF handler (see `interrupts::page_fault`) before it
+/// falls back to `kill_current`: `true` means `cr2` was a legitimate
+/// stack-growth touch that's now mapped in, so the CPU will simply
+/// re-execute the faulting instruction once the handler returns. `false`
+/// covers everything else (no current process, or an address outside the
+/// growth region), which stays fatal exactly as before this existed.
+///
+/// Deliberately ignores `error_code`'s present bit rather than requiring
+/// a clean not-present fault: `build_address_space` deep-copies the
+/// kernel's boot identity map, which covers this whole region as
+/// ordinary (non-`PAGE_USER`) 2 MiB pages, and `setup_user_stack`'s
+/// initial mapping already forced a split of the 2 MiB block the top of
+/// the growth region sits in — see `pt_entry_ptr_in`'s note on how a
+/// split inherits the original entry's flags into every leaf it doesn't
+/// explicitly overwrite. So a first ring-3 touch just below the current
+/// floor, but still inside a block that's been through such a split,
+/// finds an *already-present*, kernel-only page there rather than a
+/// missing one: present=1, user=1, and thus a protection-violation
+/// error code, even though it's exactly the legitimate growth case
+/// `try_grow_stack`'s own address-range check exists to recognize. Since
+/// [`USER_STACK_LOW_LIMIT`, `USER_STACK_TOP`) is reserved exclusively for
+/// this stack (`validate_segments` rejects any ELF segment landing
+/// there), any fault in that range — present or not — can only be this
+/// case or a genuine bug in an already-mapped page, and the latter still
+/// correctly falls through to `false` via `try_grow_stack`'s
+/// `fault_addr >= self.stack_low` check.
+pub fn handle_fault(cr2: u64, _error_code: u64) -> bool {
+    let Some(pml4) = task::current_process_cr3() else {
+        return false;
+    };
+    task::with_current_process_mut(|process| process.try_grow_stack(pml4, cr2)).unwrap_or(false)
 }
 
 /// Adds `PIE_LOAD_BASE` to every segment's `vaddr` and to `entry` in
@@ -194,6 +282,7 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         exit_info: None,
         inbox: None,
         fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
+        stack_low: USER_STACK_BASE,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -240,11 +329,12 @@ fn validate_segments(program: &elf::Program) -> Result<(), &'static str> {
         if end > paging::IDENTITY_MAP_END {
             return Err("segment beyond 4 GiB");
         }
-        // The kernel reserves [USER_STACK_BASE, USER_EXIT_STUB_VIRT + one
-        // page) in every process for its ring-3 stack and exit trampoline
-        // (see `setup_user_stack`); a segment landing there would get
-        // silently overwritten (or overwrite them) once mapped.
-        if start < USER_EXIT_STUB_VIRT + paging::PAGE_SIZE && end > USER_STACK_BASE {
+        // The kernel reserves [USER_STACK_LOW_LIMIT, USER_EXIT_STUB_VIRT +
+        // one page) in every process for its ring-3 stack — including the
+        // room `try_grow_stack` grows it into — and exit trampoline (see
+        // `setup_user_stack`); a segment landing there would get silently
+        // overwritten (or overwrite them) once mapped.
+        if start < USER_EXIT_STUB_VIRT + paging::PAGE_SIZE && end > USER_STACK_LOW_LIMIT {
             return Err("segment overlaps the reserved process stack region");
         }
     }

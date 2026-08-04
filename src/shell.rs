@@ -928,6 +928,23 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2b: stack growth. The embedded ELF recurses
+    // deep enough to blow well past the 32 KiB mapped for a fresh
+    // process's stack; without `process::try_grow_stack` this would be
+    // indistinguishable from part 2's fault and the process would be
+    // killed instead of returning sum(0..=2000) = 2001000.
+    let pid = crate::process::spawn(crate::user_prog::PROG_STACK, "deep-stack")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 200) {
+        Some(process::ExitInfo::Normal) => println!("[OK] deep recursion exited normally (stack grew instead of faulting)"),
+        other => selftest_fail(&format!("stack-growth process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(2_001_000) => println!("[OK] deep recursion computed sum(0..=2000) = 2001000"),
+        other => selftest_fail(&format!("stack-growth process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.

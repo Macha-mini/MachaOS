@@ -169,6 +169,15 @@ fn page_fault(frame: &mut InterruptFrame) {
     // kernel's own map — is still fatal. (Until ring 3 lands, kernel code
     // executing *in* process context is also attributed to the process.)
     if task::current_is_process() {
+        // A legitimate stack-growth touch (see `process::handle_fault`)
+        // gets mapped in and the faulting instruction just re-executes —
+        // returning from an interrupt handler without redirecting `rip`
+        // resumes exactly where the fault happened. Anything else is a
+        // real fault: not-present outside the growth region, or a
+        // protection violation.
+        if crate::process::handle_fault(cr2, frame.error_code) {
+            return;
+        }
         crate::process::kill_current(cr2, frame);
         return;
     }
