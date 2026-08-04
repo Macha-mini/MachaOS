@@ -908,6 +908,21 @@ pub fn selftest() -> ! {
         println!("[WARN] free frames changed across process tests: {} -> {}", frames_before, frames_after);
     }
 
+    // Ring 3 round trip: run a hand-assembled user-mode program (mapped
+    // PAGE_USER, entered via `enter_usermode`'s iretq) that calls the
+    // sys_write syscall once per character and then sys_exit. Reaching the
+    // line after `run_demo` at all proves SYSCALL/SYSRET and the manual
+    // "return to kernel" unwind both worked; the write count confirms
+    // every syscall was dispatched (not just the first).
+    let message = b"hello from ring3\n";
+    let before = crate::syscall::write_count();
+    crate::syscall::run_demo(message);
+    let written = crate::syscall::write_count() - before;
+    if written != message.len() as u64 {
+        selftest_fail("ring3 syscall round trip: wrong write count");
+    }
+    println!("[OK] ring3 syscall round trip ({} sys_write calls via SYSCALL/SYSRET)", written);
+
     let before: Vec<u64> = task::COUNTERS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let deadline = interrupts::ticks() + 30; // spans several scheduler quanta (5 ticks each)
     while interrupts::ticks() < deadline {

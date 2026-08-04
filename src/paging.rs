@@ -77,9 +77,20 @@ unsafe fn pt_entry_ptr_in(
     if pml4e & PAGE_PRESENT == 0 {
         return None; // the boot map covers the whole 4 GiB; anything else is a bug
     }
+    // A USER mapping must be reachable at *every* level the page walk
+    // passes through: the CPU checks U/S on the PML4, PDPT, PD and PT
+    // entries alike, so promote the upper levels when requested. This
+    // cannot widen the kernel's protection: a supervisor PDE/PTE in the
+    // same chain still blocks ring 3.
+    if entry_flags & PAGE_USER != 0 && pml4e & PAGE_USER == 0 {
+        *(pml4_base as *mut u64).add(pml4_idx) |= PAGE_USER;
+    }
     let pdpte = *table_base(pml4e).add(pdpt_idx);
     if pdpte & PAGE_PRESENT == 0 || pdpte & PS_BIT != 0 {
         return None; // no 1 GiB pages in the identity map
+    }
+    if entry_flags & PAGE_USER != 0 && pdpte & PAGE_USER == 0 {
+        *table_base(pml4e).add(pdpt_idx) |= PAGE_USER;
     }
     let pd_base = table_base(pdpte);
     let pde = *pd_base.add(pd_idx);
@@ -96,7 +107,9 @@ unsafe fn pt_entry_ptr_in(
     if pde & PS_BIT != 0 {
         // Split the 2 MiB entry into a page table. Every 4 KiB entry
         // keeps the physical address and attribute bits of the region it
-        // covers; only PS itself is dropped.
+        // covers; only PS itself is dropped. A USER mapping in this
+        // region also needs USER set on the page directory itself: the
+        // page walk requires U/S at *every* level it passes through.
         let frame = pmm::frame_alloc()?;
         if let Some(frames) = allocated_frames {
             frames.push(frame);
@@ -107,8 +120,16 @@ unsafe fn pt_entry_ptr_in(
         for i in 0..512 {
             *pt.add(i) = phys_base + (i as u64) * PAGE_SIZE | page_flags;
         }
-        *pd_base.add(pd_idx) = frame as u64 | (pde & PRESENT_MASK & !PS_BIT);
+        *pd_base.add(pd_idx) = frame as u64 | (pde & PRESENT_MASK & !PS_BIT) | (entry_flags & PAGE_USER);
         return Some(pt.add(pt_idx));
+    }
+    // Existing page table. If the caller is mapping a USER page here,
+    // promote the directory entry as well (see above); the entries
+    // themselves stay exactly as mapped, so a supervisor PTE in this
+    // table is still unreachable from ring 3.
+    let pd_entry = pd_base.add(pd_idx);
+    if entry_flags & PAGE_USER != 0 && *pd_entry & PAGE_USER == 0 {
+        *pd_entry |= PAGE_USER;
     }
     Some(table_base(pde).add(pt_idx))
 }

@@ -34,6 +34,7 @@ mod rtc;
 mod serial;
 mod shell;
 mod sync;
+mod syscall;
 mod task;
 mod user_prog;
 mod vga;
@@ -219,6 +220,9 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
 
     println!("[OK] loading IDT (256 interrupt vectors)...");
     idt::init();
+
+    println!("[OK] enabling SYSCALL/SYSRET (EFER.SCE, STAR/LSTAR/SFMASK)...");
+    syscall::init();
 
     println!("[OK] remapping PIC (IRQ0-15 -> 0x20-0x2F)...");
     pic::remap();
