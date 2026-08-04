@@ -956,14 +956,22 @@ impl WindowManager {
         }
     }
 
-    pub fn composite(&self) {
+    pub fn composite(&mut self) {
         fb::with_surface(|surface| {
             match &self.wallpaper {
                 Some(pixels) => gfx::blit(surface, 0, 0, pixels, self.screen_w, self.screen_h),
                 None => gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM),
             }
-            for (i, window) in self.windows.iter().enumerate() {
+            for (i, window) in self.windows.iter_mut().enumerate() {
                 if window.open && !window.minimized {
+                    // The file explorer re-renders on cursor moves so
+                    // its hover highlights follow the mouse.
+                    if let AppKind::FileExplorer(app) = &mut window.kind {
+                        app.render_hover(
+                            self.cursor_x - window.x,
+                            self.cursor_y - window.y - TITLE_BAR_HEIGHT as i32,
+                        );
+                    }
                     draw_window(surface, window, i == self.focused, self.cursor_x, self.cursor_y);
                 }
             }

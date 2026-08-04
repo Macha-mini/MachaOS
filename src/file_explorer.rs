@@ -1,13 +1,20 @@
-//! A GUI file explorer for the desktop: browse the mounted FAT32
-//! volume with a scrollable list, navigate folders, open text files in
-//! Notepad, launch `.elf` programs, and delete files. Renders into its
-//! own pixel buffer like the calculator, and reports "open this file"
-//! actions back to the window manager (which owns window spawning).
+//! A modern, Windows-style GUI file explorer for the desktop: sidebar
+//! with quick access and root-folder shortcuts, a toolbar, clickable
+//! breadcrumbs, a sortable details view with column headers, and an
+//! icon (grid) view. Renders into its own pixel buffer like the
+//! calculator, and reports "open this file" actions back to the window
+//! manager (which owns window spawning).
+//!
+//! The window manager calls `render_hover` with the cursor position on
+//! every composite, so hover highlights follow the mouse; everything
+//! else redraws on demand. All arithmetic is integer-only (no floats):
+//! the scheduler doesn't preserve FPU state across task switches.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 
 use crate::fat::{self, DirEntry};
 use crate::font;
@@ -15,40 +22,54 @@ use crate::gfx::{self, Surface};
 use crate::interrupts;
 use crate::keyboard;
 
-const WIDTH: u32 = 640;
-const HEIGHT: u32 = 400;
-const PATH_BAR_H: u32 = 24;
+const WIDTH: u32 = 700;
+const HEIGHT: u32 = 440;
+const PATH_H: u32 = 24; // breadcrumb bar
+const TOOLBAR_H: u32 = 26;
+const HEADER_H: u32 = 24; // details-view column headers
 const STATUS_H: u32 = 16;
-const ROW_H: u32 = 18;
-const LIST_Y: u32 = PATH_BAR_H;
+const LIST_Y: u32 = PATH_H + TOOLBAR_H;
+const SIDEBAR_W: u32 = 128;
 const SCROLLBAR_W: u32 = 10;
-const LIST_W: u32 = WIDTH - SCROLLBAR_W;
-const UP_BUTTON_W: u32 = 40;
+const LIST_W: u32 = WIDTH - SIDEBAR_W - SCROLLBAR_W;
+const ROW_H: u32 = 18;
+const GRID_TILE_W: u32 = 88;
+const GRID_TILE_H: u32 = 54;
 const DOUBLE_CLICK_TICKS: u64 = 30; // ~300 ms at the 100 Hz clock
 const DELETE_ARM_TICKS: u64 = 120; // ~1.2 s to confirm a delete
 
 const BG: u32 = 0x00_141B23;
 const LIST_BG: u32 = 0x00_10161C;
+const SIDEBAR_BG: u32 = 0x00_0D131A;
 const PATH_BG_TOP: u32 = 0x00_22303E;
 const PATH_BG_BOTTOM: u32 = 0x00_1A2632;
-const PATH_TEXT: u32 = 0x00_FFFFFF;
+const TOOLBAR_BG_TOP: u32 = 0x00_1D2834;
+const TOOLBAR_BG_BOTTOM: u32 = 0x00_17212B;
 const STATUS_BG: u32 = 0x00_1A2430;
-const STATUS_TEXT: u32 = 0x00_8FB8D8;
-const STATUS_TEXT_BAD: u32 = 0x00_E06060;
+const HEADER_BG_TOP: u32 = 0x00_202C38;
+const HEADER_BG_BOTTOM: u32 = 0x00_1A2530;
 const TEXT: u32 = 0x00_DBE6F0;
-const TEXT_DIM: u32 = 0x00_9AA8B5;
+const TEXT_DIM: u32 = 0x00_8FA0AE;
+const TEXT_FAINT: u32 = 0x00_5E6E7D;
 const DIR_TEXT: u32 = 0x00_F0C070;
 const ELF_TEXT: u32 = 0x00_86C77B;
 const SELECTED_TOP: u32 = 0x00_3C6EA8;
 const SELECTED_BOTTOM: u32 = 0x00_244A78;
+const HOVER_BG: u32 = 0x00_26333F;
+const CRUMB_BG: u32 = 0x00_2B3A49;
+const ACCENT: u32 = 0x00_6FB1E8;
 const SCROLL_TRACK: u32 = 0x00_1B2632;
 const SCROLL_THUMB: u32 = 0x00_3A4753;
-const BUTTON_BG_TOP: u32 = 0x00_35424F;
-const BUTTON_BG_BOTTOM: u32 = 0x00_232C35;
-const BUTTON_EDGE: u32 = 0x00_0E141B;
+const BTN_TOP: u32 = 0x00_2A3642;
+const BTN_BOTTOM: u32 = 0x00_1C262F;
+const BTN_HOVER_TOP: u32 = 0x00_35424F;
+const BTN_HOVER_BOTTOM: u32 = 0x00_25303A;
+const BTN_EDGE: u32 = 0x00_0E141B;
 const ICON_FOLDER: u32 = 0x00_F0C070;
 const ICON_FILE: u32 = 0x00_BBC8D4;
 const ICON_ELF: u32 = 0x00_86C77B;
+const STATUS_TEXT: u32 = 0x00_8FB8D8;
+const STATUS_TEXT_BAD: u32 = 0x00_E06060;
 
 /// What the explorer asks the window manager to do after a click or key.
 /// Owned values only, so the WM can act on it after the borrow ends.
@@ -59,18 +80,54 @@ pub enum FsAction {
     OpenText(String, Vec<u8>),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Details,
+    Grid,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SortKey {
+    Name,
+    Size,
+    Type,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ToolbarAction {
+    Up,
+    New,
+    Del,
+    Refresh,
+    ToggleView,
+}
+
+/// One row of the sidebar: either a section header or a clickable item.
+struct SidebarEntry {
+    label: String,
+    target: String, // empty for headers
+}
+
 pub struct FileExplorer {
     buffer: Vec<u32>,
     path: String,
     entries: Vec<DirEntry>,
     selection: usize,
     scroll: usize,
-    // Double-click detection: (row, tick) of the previous press.
-    last_click_row: usize,
+    view: View,
+    sort: SortKey,
+    sort_asc: bool,
+    // Cursor position in window content coordinates; set by the WM
+    // every frame so hover highlights can be drawn.
+    cursor: (i32, i32),
+    // Double-click detection: (item, tick) of the previous press.
+    last_click_item: usize,
     last_click_ticks: u64,
     // Two-step delete confirmation: (selection at press time, tick).
     pending_delete: Option<(usize, u64)>,
     status: String,
+    free_bytes: u64,
+    sidebar: Vec<SidebarEntry>,
 }
 
 fn is_elf(name: &str) -> bool {
@@ -80,6 +137,31 @@ fn is_elf(name: &str) -> bool {
 fn is_text(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.ends_with(".txt") || lower.ends_with(".md") || lower.ends_with(".log") || lower.ends_with(".cfg")
+}
+
+fn file_type(name: &str) -> &'static str {
+    if is_elf(name) {
+        "ELF Program"
+    } else if is_text(name) {
+        "Text"
+    } else {
+        "File"
+    }
+}
+
+/// Integer-only human-readable size ("12 B", "4.5 KiB", "8.0 MiB").
+fn fmt_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        let whole = bytes / (1024 * 1024);
+        let frac = (bytes % (1024 * 1024)) * 10 / (1024 * 1024);
+        format!("{}.{} MiB", whole, frac)
+    } else if bytes >= 1024 {
+        let whole = bytes / 1024;
+        let frac = (bytes % 1024) * 10 / 1024;
+        format!("{}.{} KiB", whole, frac)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 /// Joins `child` onto `path` (handling the root directory).
@@ -103,21 +185,32 @@ fn parent_path(path: &str) -> String {
     }
 }
 
-/// Directories first (case-insensitive), then by name.
-fn sort_entries(entries: &mut [DirEntry]) {
+/// Compares two entries: directories first, then by the active sort key.
+fn entry_less(a: &DirEntry, b: &DirEntry, key: SortKey, asc: bool) -> bool {
+    if a.is_dir != b.is_dir {
+        return a.is_dir;
+    }
+    let ord = match key {
+        SortKey::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+        SortKey::Size => a.size.cmp(&b.size),
+        SortKey::Type => file_type(&a.name).cmp(file_type(&b.name)),
+    };
+    if asc {
+        ord == Ordering::Less
+    } else {
+        ord == Ordering::Greater
+    }
+}
+
+/// Stable insertion sort (dirs first, then key order).
+fn sort_entries(entries: &mut [DirEntry], key: SortKey, asc: bool) {
     let mut i = 1;
     while i < entries.len() {
         let mut j = i;
         while j > 0 {
-            let a = &entries[j - 1];
-            let b = &entries[j];
-            let a_dir = a.is_dir;
-            let b_dir = b.is_dir;
-            let a_lower = a.name.to_lowercase();
-            let b_lower = b.name.to_lowercase();
-            // `b` should move before `a` when it's a directory and `a`
-            // isn't, or (same kind) its name sorts earlier.
-            let b_before_a = (b_dir && !a_dir) || (b_dir == a_dir && b_lower < a_lower);
+            // Bubble `entries[j]` left while it sorts before the item
+            // ahead of it.
+            let b_before_a = entry_less(&entries[j], &entries[j - 1], key, asc);
             if !b_before_a {
                 break;
             }
@@ -136,10 +229,16 @@ impl FileExplorer {
             entries: Vec::new(),
             selection: 0,
             scroll: 0,
-            last_click_row: usize::MAX,
+            view: View::Details,
+            sort: SortKey::Name,
+            sort_asc: true,
+            cursor: (i32::MAX, i32::MAX),
+            last_click_item: usize::MAX,
             last_click_ticks: 0,
             pending_delete: None,
             status: String::new(),
+            free_bytes: 0,
+            sidebar: Vec::new(),
         };
         app.navigate("/".to_string());
         app
@@ -157,26 +256,51 @@ impl FileExplorer {
         &self.buffer
     }
 
-    fn visible_rows(&self) -> usize {
-        ((HEIGHT - PATH_BAR_H - STATUS_H) / ROW_H) as usize
+    /// Re-renders if the cursor moved, so hover states track the mouse.
+    /// Called by the window manager on every composite.
+    pub fn render_hover(&mut self, x: i32, y: i32) {
+        if self.cursor != (x, y) {
+            self.cursor = (x, y);
+            self.render();
+        }
+    }
+
+    fn details_visible_rows(&self) -> usize {
+        ((HEIGHT - STATUS_H - LIST_Y - HEADER_H) / ROW_H) as usize
+    }
+
+    fn grid_visible_rows(&self) -> usize {
+        ((HEIGHT - STATUS_H - LIST_Y) / GRID_TILE_H) as usize
+    }
+
+    fn grid_cols(&self) -> usize {
+        (LIST_W / GRID_TILE_W).max(1) as usize
+    }
+
+    fn visible_items(&self) -> usize {
+        match self.view {
+            View::Details => self.details_visible_rows(),
+            View::Grid => self.grid_visible_rows() * self.grid_cols(),
+        }
     }
 
     fn ensure_selection_visible(&mut self) {
-        let rows = self.visible_rows();
-        let max_scroll = self.entries.len().saturating_sub(rows);
+        let visible = self.visible_items();
+        let max_scroll = self.entries.len().saturating_sub(visible);
         if self.selection < self.scroll {
             self.scroll = self.selection;
-        } else if self.selection >= self.scroll + rows {
-            self.scroll = self.selection + 1 - rows;
+        } else if self.selection >= self.scroll + visible {
+            self.scroll = self.selection + 1 - visible;
         }
         self.scroll = self.scroll.min(max_scroll);
     }
 
-    /// Reloads the entry list for the current path (keeps selection).
+    /// Reloads the entry list for the current path and rebuilds the
+    /// sidebar shortcuts (keeps selection and view).
     fn refresh(&mut self) {
         self.entries = match fat::list_dir(&self.path) {
             Ok(mut entries) => {
-                sort_entries(&mut entries);
+                sort_entries(&mut entries, self.sort, self.sort_asc);
                 entries
             }
             Err(e) => {
@@ -187,7 +311,11 @@ impl FileExplorer {
         if self.selection >= self.entries.len() {
             self.selection = 0;
         }
-        self.scroll = self.scroll.min(self.entries.len().saturating_sub(self.visible_rows()));
+        self.scroll = self.scroll.min(self.entries.len().saturating_sub(self.visible_items()));
+        self.free_bytes = fat::info()
+            .map(|info| info.free_clusters as u64 * info.sectors_per_cluster as u64 * 512)
+            .unwrap_or(0);
+        self.sidebar = build_sidebar();
         self.render();
     }
 
@@ -238,7 +366,7 @@ impl FileExplorer {
                 }
             }
         } else {
-            self.status = format!("{}: no viewer ({:.1} KiB)", entry.name, entry.size as f32 / 1024.0);
+            self.status = format!("{}: no viewer ({})", entry.name, fmt_size(entry.size as u64));
             self.render();
             None
         }
@@ -273,75 +401,194 @@ impl FileExplorer {
         self.render();
     }
 
-    fn scroll_click(&mut self, _x: u32, y: u32) {
-        let rows = self.visible_rows();
-        let max_scroll = self.entries.len().saturating_sub(rows);
+    fn create_folder(&mut self) {
+        let mut name = "New Folder".to_string();
+        let mut i = 2;
+        let taken: Vec<String> = self.entries.iter().map(|e| e.name.to_lowercase()).collect();
+        while taken.contains(&name.to_lowercase()) && i < 100 {
+            name = format!("New Folder ({})", i);
+            i += 1;
+        }
+        match fat::make_dir(&join(&self.path, &name)) {
+            Ok(()) => {
+                self.status = format!("created {}", name);
+                self.refresh();
+                if let Some(pos) = self.entries.iter().position(|e| e.name == name) {
+                    self.selection = pos;
+                    self.ensure_selection_visible();
+                    self.render();
+                }
+            }
+            Err(e) => {
+                self.status = format!("create failed: {}", e);
+                self.render();
+            }
+        }
+    }
+
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            View::Details => View::Grid,
+            View::Grid => View::Details,
+        };
+        self.scroll = self.scroll.min(self.entries.len().saturating_sub(self.visible_items()));
+        self.ensure_selection_visible();
+        self.render();
+    }
+
+    fn toggle_sort(&mut self, key: SortKey) {
+        if self.sort == key {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort = key;
+            self.sort_asc = true;
+        }
+        self.refresh();
+    }
+
+    fn scroll_click(&mut self, y: u32) {
+        let visible = self.visible_items();
+        let max_scroll = self.entries.len().saturating_sub(visible);
         if max_scroll == 0 {
             return;
         }
-        let track_h = HEIGHT - PATH_BAR_H - STATUS_H;
-        let thumb_h = (track_h * rows as u32 / self.entries.len() as u32).max(12);
+        let track_h = HEIGHT - STATUS_H - LIST_Y;
+        let thumb_h = (track_h * visible as u32 / self.entries.len() as u32).max(12);
         let thumb_y = LIST_Y + (track_h - thumb_h) * self.scroll as u32 / max_scroll as u32;
+        let page = (visible as u32 / 2).max(1);
         if y < thumb_y {
-            self.scroll = self.scroll.saturating_sub(rows / 2);
+            self.scroll = self.scroll.saturating_sub(page as usize);
         } else if y >= thumb_y + thumb_h {
-            self.scroll = (self.scroll + rows / 2).min(max_scroll);
+            self.scroll = (self.scroll + page as usize).min(max_scroll);
         }
         self.render();
     }
 
-    /// Returns an action (open a file in a new window) or `None`; the
-    /// caller (window manager) acts on it.
+    // ---- click routing -------------------------------------------------
+
     pub fn handle_click(&mut self, x: i32, y: i32) -> Option<FsAction> {
         if x < 0 || y < 0 {
             return None;
         }
         let (x, y) = (x as u32, y as u32);
-
-        if y < PATH_BAR_H {
-            if x >= WIDTH - UP_BUTTON_W - 6 && x < WIDTH - 6 {
-                self.navigate(parent_path(&self.path));
-            }
+        if y < PATH_H {
+            return self.click_breadcrumb(x);
+        }
+        if y < LIST_Y {
+            self.click_toolbar(x);
             return None;
         }
         if y >= HEIGHT - STATUS_H {
             return None;
         }
-        if x >= LIST_W {
-            self.scroll_click(x, y);
+        if x < SIDEBAR_W {
+            self.click_sidebar(y);
             return None;
         }
-        let row = ((y - LIST_Y) / ROW_H) as usize + self.scroll;
-        if row >= self.entries.len() {
+        if x >= SIDEBAR_W + LIST_W {
+            self.scroll_click(y);
+            return None;
+        }
+        match self.view {
+            View::Details => self.click_details(x, y),
+            View::Grid => self.click_grid(x, y),
+        }
+    }
+
+    fn click_breadcrumb(&mut self, x: u32) -> Option<FsAction> {
+        for crumb in crumb_layout(&self.path, LIST_W - 6) {
+            if x >= crumb.x && x < crumb.x + crumb.w {
+                self.navigate(crumb.path);
+                return None;
+            }
+        }
+        None
+    }
+
+    fn click_toolbar(&mut self, x: u32) {
+        match toolbar_button_at(x) {
+            Some(ToolbarAction::Up) => self.navigate(parent_path(&self.path)),
+            Some(ToolbarAction::New) => self.create_folder(),
+            Some(ToolbarAction::Del) => self.delete_selected(),
+            Some(ToolbarAction::Refresh) => {
+                self.status = String::new();
+                self.refresh();
+            }
+            Some(ToolbarAction::ToggleView) => self.toggle_view(),
+            None => {}
+        }
+    }
+
+    fn click_sidebar(&mut self, y: u32) {
+        if let Some(target) = sidebar_item_at(&self.sidebar, y) {
+            self.navigate(target);
+        }
+    }
+
+    fn select_item(&mut self, item: usize, now: u64) -> Option<FsAction> {
+        if item >= self.entries.len() {
             self.pending_delete = None;
             return None;
         }
-        let now = interrupts::ticks();
-        let is_double =
-            self.last_click_row == row && now.saturating_sub(self.last_click_ticks) <= DOUBLE_CLICK_TICKS;
-        self.last_click_row = row;
+        let is_double = self.last_click_item == item && now.saturating_sub(self.last_click_ticks) <= DOUBLE_CLICK_TICKS;
+        self.last_click_item = item;
         self.last_click_ticks = now;
-        self.selection = row;
+        self.selection = item;
         self.ensure_selection_visible();
         self.pending_delete = None;
         if is_double {
             self.open_selected()
         } else {
-            let entry = &self.entries[row];
+            let entry = &self.entries[item];
             if entry.is_dir {
-                self.status = format!("{} (dir, {} items)", entry.name, self.entries.len().saturating_sub(1));
+                self.status = format!("{} (folder)", entry.name);
             } else {
-                self.status = format!("{:.1} KiB", entry.size as f32 / 1024.0);
+                self.status = format!("{} · {}", entry.name, fmt_size(entry.size as u64));
             }
             self.render();
             None
         }
     }
 
+    fn click_details(&mut self, x: u32, y: u32) -> Option<FsAction> {
+        if y < LIST_Y + HEADER_H {
+            // Column header: sort.
+            let (nx, sx, tx) = details_columns();
+            if x >= nx.0 && x < nx.1 {
+                self.toggle_sort(SortKey::Name);
+            } else if x >= sx.0 && x < sx.1 {
+                self.toggle_sort(SortKey::Size);
+            } else if x >= tx.0 && x < tx.1 {
+                self.toggle_sort(SortKey::Type);
+            }
+            return None;
+        }
+        let row = ((y - LIST_Y - HEADER_H) / ROW_H) as usize + self.scroll;
+        let now = interrupts::ticks();
+        self.select_item(row, now)
+    }
+
+    fn click_grid(&mut self, x: u32, y: u32) -> Option<FsAction> {
+        let cols = self.grid_cols();
+        let col = ((x - SIDEBAR_W) / GRID_TILE_W) as usize;
+        let row = ((y - LIST_Y) / GRID_TILE_H) as usize;
+        let item = self.scroll + row * cols + col;
+        let now = interrupts::ticks();
+        self.select_item(item, now)
+    }
+
     pub fn handle_key(&mut self, event: keyboard::Event) -> Option<FsAction> {
         match event {
             keyboard::Event::Up => self.move_selection(-1),
             keyboard::Event::Down => self.move_selection(1),
+            keyboard::Event::Left => match self.view {
+                View::Grid => self.move_selection(-(self.grid_cols() as isize)),
+                View::Details => {}
+            },
+            keyboard::Event::Right => match self.view {
+                View::Grid => self.move_selection(self.grid_cols() as isize),
+                View::Details => {}
+            },
             keyboard::Event::Enter => return self.open_selected(),
             keyboard::Event::Backspace => self.navigate(parent_path(&self.path)),
             // The PS/2 driver doesn't map a Delete key; 'd' (pressed
@@ -351,53 +598,149 @@ impl FileExplorer {
                 self.status = String::new();
                 self.refresh();
             }
+            keyboard::Event::Char('n') => self.create_folder(),
+            keyboard::Event::Char('v') => self.toggle_view(),
             _ => {}
         }
         None
     }
 
+    // ---- rendering -----------------------------------------------------
+
     fn render(&mut self) {
-        let rows = self.visible_rows();
+        let (cx, cy) = self.cursor;
         gfx::fill_rect(self, 0, 0, WIDTH, HEIGHT, BG);
-        gfx::fill_rect(self, 0, LIST_Y, LIST_W, HEIGHT - PATH_BAR_H - STATUS_H, LIST_BG);
-        gfx::fill_rect_gradient_v(self, 0, 0, WIDTH, PATH_BAR_H, PATH_BG_TOP, PATH_BG_BOTTOM);
-        gfx::fill_rect(self, 0, PATH_BAR_H - 1, WIDTH, 1, 0x00_0E141B);
-        gfx::fill_rect(self, 0, HEIGHT - STATUS_H, WIDTH, STATUS_H, STATUS_BG);
-        gfx::fill_rect(self, 0, HEIGHT - STATUS_H - 1, WIDTH, 1, 0x00_0E141B);
 
-        // Path bar: current path, then an "Up" button on the right.
-        let path = self.path.clone();
-        gfx::draw_string(self, 8, 8, &path, PATH_TEXT, None);
-        let btn_x = WIDTH - UP_BUTTON_W - 6;
-        gfx::fill_rounded_rect_gradient_v(self, btn_x, 4, UP_BUTTON_W, PATH_BAR_H - 8, 4, BUTTON_BG_TOP, BUTTON_BG_BOTTOM);
-        gfx::fill_rect(self, btn_x + 1, PATH_BAR_H - 5, UP_BUTTON_W - 2, 1, BUTTON_EDGE);
-        let label = if self.path == "/" { "Root" } else { "Up" };
-        let lx = btn_x + (UP_BUTTON_W - (label.len() as u32 * font::GLYPH_WIDTH as u32)) / 2;
-        gfx::draw_string(self, lx, 8, label, TEXT, None);
-
-        // Scrollbar.
-        let track_h = HEIGHT - PATH_BAR_H - STATUS_H;
-        gfx::fill_rect(self, LIST_W, LIST_Y, SCROLLBAR_W, track_h, SCROLL_TRACK);
-        if rows < self.entries.len() {
-            let max_scroll = self.entries.len() - rows;
-            let thumb_h = (track_h * rows as u32 / self.entries.len() as u32).max(12);
-            let thumb_y = LIST_Y + (track_h - thumb_h) * self.scroll as u32 / max_scroll as u32;
-            gfx::fill_rect(self, LIST_W + 2, thumb_y, SCROLLBAR_W - 4, thumb_h, SCROLL_THUMB);
+        self.render_sidebar(cx, cy);
+        self.render_toolbar(cx, cy);
+        self.render_breadcrumbs(cx, cy);
+        match self.view {
+            View::Details => self.render_details(cx, cy),
+            View::Grid => self.render_grid(cx, cy),
         }
+        self.render_scrollbar();
+        self.render_status();
+    }
 
-        // Entry list.
+    fn render_sidebar(&mut self, cx: i32, cy: i32) {
+        gfx::fill_rect(self, 0, LIST_Y, SIDEBAR_W, HEIGHT - STATUS_H - LIST_Y, SIDEBAR_BG);
+        gfx::fill_rect(self, SIDEBAR_W - 1, LIST_Y, 1, HEIGHT - STATUS_H - LIST_Y, 0x00_0A1016);
+        let sidebar: Vec<(String, String)> = self
+            .sidebar
+            .iter()
+            .map(|e| (e.label.clone(), e.target.clone()))
+            .collect();
+        let mut y = LIST_Y + 6;
+        for (label, target) in sidebar {
+            if target.is_empty() {
+                gfx::draw_string(self, 10, y, &label, TEXT_FAINT, None);
+                y += 14;
+                continue;
+            }
+            let active = self.path == target;
+            let hovered = cy >= y as i32 && cy < (y + 16) as i32 && cx >= 2 && cx < SIDEBAR_W as i32 - 2;
+            if active {
+                gfx::fill_rounded_rect(self, 4, y, SIDEBAR_W - 8, 16, 4, 0x00_22334A);
+                gfx::fill_rect(self, 4, y + 3, 2, 10, ACCENT);
+            } else if hovered {
+                gfx::fill_rounded_rect(self, 4, y, SIDEBAR_W - 8, 16, 4, 0x00_1E2A36);
+            }
+            let color = if active { 0x00_FFFFFF } else { TEXT };
+            gfx::draw_string(self, 12, y + 4, &label, color, None);
+            y += 18;
+        }
+    }
+
+    fn render_toolbar(&mut self, cx: i32, cy: i32) {
+        gfx::fill_rect_gradient_v(self, 0, PATH_H, WIDTH, TOOLBAR_H, TOOLBAR_BG_TOP, TOOLBAR_BG_BOTTOM);
+        gfx::fill_rect(self, 0, PATH_H + TOOLBAR_H - 1, WIDTH, 1, 0x00_0E141B);
+        for action in [ToolbarAction::Up, ToolbarAction::New, ToolbarAction::Del, ToolbarAction::Refresh] {
+            if let Some((bx, bw)) = toolbar_button_rect(action) {
+                let hovered = cx >= bx as i32 && cx < (bx + bw) as i32 && cy >= PATH_H as i32 + 3 && cy < (PATH_H + TOOLBAR_H - 3) as i32;
+                let (top, bottom) = if hovered {
+                    (BTN_HOVER_TOP, BTN_HOVER_BOTTOM)
+                } else {
+                    (BTN_TOP, BTN_BOTTOM)
+                };
+                gfx::fill_rounded_rect_gradient_v(self, bx, PATH_H + 3, bw, TOOLBAR_H - 6, 4, top, bottom);
+                gfx::fill_rect(self, bx + 1, PATH_H + TOOLBAR_H - 4, bw - 2, 1, BTN_EDGE);
+                draw_toolbar_icon(self, action, bx + (bw - 16) / 2, PATH_H + 6);
+            }
+        }
+        // View toggle (text button on the right).
+        let (bx, bw) = toolbar_button_rect(ToolbarAction::ToggleView).unwrap();
+        let hovered = cx >= bx as i32 && cx < (bx + bw) as i32 && cy >= PATH_H as i32 + 3 && cy < (PATH_H + TOOLBAR_H - 3) as i32;
+        let (top, bottom) = if hovered {
+            (BTN_HOVER_TOP, BTN_HOVER_BOTTOM)
+        } else {
+            (BTN_TOP, BTN_BOTTOM)
+        };
+        gfx::fill_rounded_rect_gradient_v(self, bx, PATH_H + 3, bw, TOOLBAR_H - 6, 4, top, bottom);
+        gfx::fill_rect(self, bx + 1, PATH_H + TOOLBAR_H - 4, bw - 2, 1, BTN_EDGE);
+        let label = match self.view {
+            View::Details => "Icons",
+            View::Grid => "List",
+        };
+        let lx = bx + (bw - (label.len() as u32 * font::GLYPH_WIDTH as u32)) / 2;
+        gfx::draw_string(self, lx, PATH_H + 9, label, TEXT, None);
+    }
+
+    fn render_breadcrumbs(&mut self, cx: i32, cy: i32) {
+        gfx::fill_rect_gradient_v(self, 0, 0, WIDTH, PATH_H, PATH_BG_TOP, PATH_BG_BOTTOM);
+        gfx::fill_rect(self, 0, PATH_H - 1, WIDTH, 1, 0x00_0E141B);
+        let crumbs = crumb_layout(&self.path, LIST_W - 6);
+        let last_index = crumbs.len().saturating_sub(1);
+        for (i, crumb) in crumbs.iter().enumerate() {
+            let is_last = i == last_index;
+            let hovered = !is_last
+                && cy >= 4
+                && cy < PATH_H as i32 - 4
+                && cx >= crumb.x as i32
+                && cx < (crumb.x + crumb.w) as i32;
+            if is_last {
+                gfx::fill_rounded_rect(self, crumb.x, 4, crumb.w, PATH_H - 8, 4, CRUMB_BG);
+            }
+            let color = if is_last {
+                0x00_FFFFFF
+            } else if hovered {
+                0x00_CFE0EC
+            } else {
+                TEXT_DIM
+            };
+            let label = &crumb.label;
+            gfx::draw_string(self, crumb.x + 4, 8, label, color, None);
+            if !is_last {
+                gfx::draw_string(self, crumb.x + crumb.w - 7, 8, ">", TEXT_FAINT, None);
+            }
+        }
+    }
+
+    fn render_details(&mut self, cx: i32, cy: i32) {
+        let (nx, sx, tx) = details_columns();
+        // Column headers.
+        gfx::fill_rect_gradient_v(self, SIDEBAR_W, LIST_Y, LIST_W, HEADER_H, HEADER_BG_TOP, HEADER_BG_BOTTOM);
+        gfx::fill_rect(self, SIDEBAR_W, LIST_Y + HEADER_H - 1, LIST_W, 1, 0x00_0E141B);
+        draw_header(self, "Name", nx, cx, cy);
+        draw_header(self, "Size", sx, cx, cy);
+        draw_header(self, "Type", tx, cx, cy);
+
+        // Rows.
+        let rows = self.details_visible_rows();
         for r in 0..rows {
             let index = r + self.scroll;
             let Some(entry) = self.entries.get(index) else {
                 break;
             };
             let (name, is_dir, size) = (entry.name.clone(), entry.is_dir, entry.size);
-            let ry = LIST_Y + r as u32 * ROW_H;
+            let ry = LIST_Y + HEADER_H + r as u32 * ROW_H;
             let selected = index == self.selection;
+            let hovered = cy >= ry as i32 && cy < (ry + ROW_H) as i32 && cx >= SIDEBAR_W as i32;
             if selected {
-                gfx::fill_rect_gradient_v(self, 0, ry, LIST_W, ROW_H, SELECTED_TOP, SELECTED_BOTTOM);
+                gfx::fill_rounded_rect_gradient_v(self, SIDEBAR_W + 2, ry + 1, LIST_W - 4, ROW_H - 2, 4, SELECTED_TOP, SELECTED_BOTTOM);
+            } else if hovered {
+                gfx::fill_rounded_rect(self, SIDEBAR_W + 2, ry + 1, LIST_W - 4, ROW_H - 2, 4, HOVER_BG);
             }
-            draw_entry_icon(self, 8, ry + 4, &name, is_dir);
+            draw_entry_icon(self, SIDEBAR_W + 8, ry + 4, &name, is_dir);
             let (name_color, size_color) = if selected {
                 (0x00_FFFFFF, 0x00_C9DAE8)
             } else if is_dir {
@@ -407,47 +750,341 @@ impl FileExplorer {
             } else {
                 (TEXT, TEXT_DIM)
             };
-            gfx::draw_string(self, 24, ry + 5, &name, name_color, None);
+            gfx::draw_string(self, SIDEBAR_W + 26, ry + 5, &name, name_color, None);
             if !is_dir {
-                let size = format!("{} B", size);
+                let size = fmt_size(size as u64);
                 let sw = (size.len() * font::GLYPH_WIDTH) as u32;
-                gfx::draw_string(self, LIST_W - sw - 14, ry + 5, &size, size_color, None);
+                gfx::draw_string(self, sx.1 - sw - 10, ry + 5, &size, size_color, None);
+            }
+            let kind = if is_dir { "Folder" } else { file_type(&name) };
+            let kw = (kind.len() * font::GLYPH_WIDTH) as u32;
+            let kx = tx.0 + 8;
+            if kx + kw <= tx.1 {
+                gfx::draw_string(self, kx, ry + 5, kind, if selected { 0x00_C9DAE8 } else { TEXT_DIM }, None);
             }
         }
+    }
 
-        // Status bar.
+    fn render_grid(&mut self, cx: i32, cy: i32) {
+        let cols = self.grid_cols();
+        let rows = self.grid_visible_rows();
+        gfx::fill_rect(self, SIDEBAR_W, LIST_Y, LIST_W, HEIGHT - STATUS_H - LIST_Y, LIST_BG);
+        for r in 0..rows {
+            for c in 0..cols {
+                let index = self.scroll + r * cols + c;
+                let Some(entry) = self.entries.get(index) else {
+                    return;
+                };
+                let (name, is_dir) = (entry.name.clone(), entry.is_dir);
+                let tx = SIDEBAR_W + c as u32 * GRID_TILE_W;
+                let ty = LIST_Y + r as u32 * GRID_TILE_H;
+                let selected = index == self.selection;
+                let hovered = cx >= tx as i32 && cx < (tx + GRID_TILE_W) as i32 && cy >= ty as i32 && cy < (ty + GRID_TILE_H) as i32;
+                if selected {
+                    gfx::fill_rounded_rect(self, tx + 4, ty + 3, GRID_TILE_W - 8, GRID_TILE_H - 8, 6, 0x00_24467A);
+                } else if hovered {
+                    gfx::fill_rounded_rect(self, tx + 4, ty + 3, GRID_TILE_W - 8, GRID_TILE_H - 8, 6, 0x00_1E2A36);
+                }
+                draw_big_icon(self, tx + (GRID_TILE_W - 36) / 2, ty + 6, &name, is_dir);
+                // Label, centered and truncated to the tile width.
+                let max_chars = ((GRID_TILE_W - 10) / font::GLYPH_WIDTH as u32) as usize;
+                let label = if name.chars().count() > max_chars {
+                    let mut s: String = name.chars().take(max_chars - 2).collect();
+                    s.push_str("..");
+                    s
+                } else {
+                    name
+                };
+                let lw = (label.len() * font::GLYPH_WIDTH) as u32;
+                let lx = tx + (GRID_TILE_W - lw) / 2;
+                let color = if selected {
+                    0x00_FFFFFF
+                } else if is_dir {
+                    DIR_TEXT
+                } else if is_elf(&label) {
+                    ELF_TEXT
+                } else {
+                    TEXT
+                };
+                gfx::draw_string(self, lx, ty + 44, &label, color, None);
+            }
+        }
+    }
+
+    fn render_scrollbar(&mut self) {
+        let track_h = HEIGHT - STATUS_H - LIST_Y;
+        gfx::fill_rect(self, SIDEBAR_W + LIST_W, LIST_Y, SCROLLBAR_W, track_h, SCROLL_TRACK);
+        let visible = self.visible_items();
+        if visible < self.entries.len() {
+            let max_scroll = self.entries.len() - visible;
+            let thumb_h = (track_h * visible as u32 / self.entries.len() as u32).max(12);
+            let thumb_y = LIST_Y + (track_h - thumb_h) * self.scroll as u32 / max_scroll as u32;
+            gfx::fill_rect(self, SIDEBAR_W + LIST_W + 2, thumb_y, SCROLLBAR_W - 4, thumb_h, SCROLL_THUMB);
+        }
+    }
+
+    fn render_status(&mut self) {
+        gfx::fill_rect(self, 0, HEIGHT - STATUS_H, WIDTH, STATUS_H, STATUS_BG);
+        gfx::fill_rect(self, 0, HEIGHT - STATUS_H - 1, WIDTH, 1, 0x00_0E141B);
         let status = if self.status.is_empty() {
-            format!("{} items in {}", self.entries.len(), self.path)
+            format!("{} items", self.entries.len())
         } else {
             self.status.clone()
         };
         let is_error = status.starts_with("cannot")
             || status.starts_with("error")
             || status.starts_with("delete failed")
+            || status.starts_with("create failed")
             || status.starts_with("no viewer");
-        let status_color = if is_error { STATUS_TEXT_BAD } else { STATUS_TEXT };
-        gfx::draw_string(self, 6, HEIGHT - STATUS_H + 4, &status, status_color, None);
+        let color = if is_error { STATUS_TEXT_BAD } else { STATUS_TEXT };
+        gfx::draw_string(self, 6, HEIGHT - STATUS_H + 4, &status, color, None);
+        let free = format!("free {}", fmt_size(self.free_bytes));
+        let fw = (free.len() * font::GLYPH_WIDTH) as u32;
+        gfx::draw_string(self, WIDTH - fw - 8, HEIGHT - STATUS_H + 4, &free, TEXT_DIM, None);
     }
 }
 
-/// Small glyph for a folder / document / executable, drawn with rects
-/// since the 8x8 font has no box-drawing characters.
+struct Crumb {
+    x: u32,
+    w: u32,
+    label: String,
+    path: String,
+}
+
+/// Clickable breadcrumb segments for `path`, right-aligned so the deepest
+/// segment is always visible; a "..." crumb (clickable, goes to "/") is
+/// prepended when the path is too wide.
+fn crumb_layout(path: &str, max_w: u32) -> Vec<Crumb> {
+    let mut segs: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
+    let mut acc = String::new();
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        acc.push('/');
+        acc.push_str(seg);
+        segs.push((seg.to_string(), acc.clone()));
+    }
+    let width_of = |label: &str| (label.len() as u32) * font::GLYPH_WIDTH as u32 + 16;
+    let mut start = 0;
+    if segs.len() > 2 {
+        while start + 2 < segs.len() {
+            let w: u32 = segs[start..].iter().map(|(l, _)| width_of(l)).sum();
+            if w <= max_w {
+                break;
+            }
+            start += 1;
+        }
+    }
+    let mut out = Vec::new();
+    let mut x = 6u32;
+    if start > 0 {
+        out.push(Crumb { x, w: 24, label: "...".to_string(), path: "/".to_string() });
+        x += 30;
+    }
+    for (i, (label, target)) in segs.iter().enumerate().skip(start) {
+        let w = width_of(label);
+        out.push(Crumb { x, w, label: label.clone(), path: target.clone() });
+        if i + 1 < segs.len() {
+            x += w + 2;
+        } else {
+            x += w;
+        }
+    }
+    out
+}
+
+/// Details-view column x-ranges: (Name, Size, Type) as (start, end).
+fn details_columns() -> ((u32, u32), (u32, u32), (u32, u32)) {
+    let end = SIDEBAR_W + LIST_W;
+    ((SIDEBAR_W, 320), (320, 460), (460, end))
+}
+
+/// Toolbar button x-rect; the toggle is right-aligned, the rest are a
+/// fixed row on the left.
+fn toolbar_button_rect(action: ToolbarAction) -> Option<(u32, u32)> {
+    match action {
+        ToolbarAction::Up => Some((6, 48)),
+        ToolbarAction::New => Some((58, 48)),
+        ToolbarAction::Del => Some((110, 48)),
+        ToolbarAction::Refresh => Some((162, 64)),
+        ToolbarAction::ToggleView => Some((WIDTH - 76, 70)),
+    }
+}
+
+fn toolbar_button_at(x: u32) -> Option<ToolbarAction> {
+    [
+        ToolbarAction::Up,
+        ToolbarAction::New,
+        ToolbarAction::Del,
+        ToolbarAction::Refresh,
+        ToolbarAction::ToggleView,
+    ]
+    .into_iter()
+    .find(|action| {
+        toolbar_button_rect(*action).is_some_and(|(bx, bw)| x >= bx && x < bx + bw)
+    })
+}
+
+/// Sidebar entries: Quick Access > Home, then a FOLDERS section listing
+/// the root directories (sorted) as shortcuts.
+fn build_sidebar() -> Vec<SidebarEntry> {
+    let mut out = vec![SidebarEntry { label: "QUICK ACCESS".to_string(), target: String::new() }];
+    out.push(SidebarEntry { label: "Home".to_string(), target: "/".to_string() });
+    out.push(SidebarEntry { label: String::new(), target: String::new() });
+    out.push(SidebarEntry { label: "FOLDERS".to_string(), target: String::new() });
+    if let Ok(entries) = fat::list_dir("/") {
+        let mut dirs: Vec<String> = entries.iter().filter(|e| e.is_dir).map(|e| e.name.clone()).collect();
+        sort_names(&mut dirs);
+        for name in dirs {
+            let target = join("/", &name);
+            out.push(SidebarEntry { label: name, target });
+        }
+    }
+    out
+}
+
+/// Case-insensitive insertion sort for simple string lists.
+fn sort_names(names: &mut [String]) {
+    let mut i = 1;
+    while i < names.len() {
+        let mut j = i;
+        while j > 0 {
+            let b = names[j].to_lowercase();
+            let a = names[j - 1].to_lowercase();
+            if !(b < a) {
+                break;
+            }
+            names.swap(j - 1, j);
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+/// Sidebar item hit test: skips header rows.
+fn sidebar_item_at(sidebar: &[SidebarEntry], y: u32) -> Option<String> {
+    let mut ry = LIST_Y + 6;
+    for entry in sidebar {
+        if entry.target.is_empty() {
+            ry += 14;
+            continue;
+        }
+        if y >= ry && y < ry + 16 {
+            return Some(entry.target.clone());
+        }
+        ry += 18;
+    }
+    None
+}
+
+fn draw_header(surface: &mut dyn Surface, label: &str, range: (u32, u32), cx: i32, cy: i32) {
+    let hovered = cx >= range.0 as i32 && cx < range.1 as i32 && cy >= LIST_Y as i32 && cy < (LIST_Y + HEADER_H) as i32;
+    if hovered {
+        gfx::fill_rect(surface, range.0, LIST_Y, range.1 - range.0, HEADER_H, 0x00_25313E);
+    }
+    let color = if hovered { 0x00_C9D6E0 } else { HEADER_FG };
+    gfx::draw_string(surface, range.0 + 8, LIST_Y + 8, label, color, None);
+}
+
+const HEADER_FG: u32 = 0x00_9AA8B5;
+
+/// Small folder / document / executable glyph (14x10) used in rows.
 fn draw_entry_icon(surface: &mut dyn Surface, x: u32, y: u32, name: &str, is_dir: bool) {
     if is_dir {
-        // Folder: a short tab on top of a taller body.
         gfx::fill_rect(surface, x, y + 1, 5, 2, ICON_FOLDER);
         gfx::fill_rect(surface, x + 5, y, 5, 2, ICON_FOLDER);
         gfx::fill_rect(surface, x + 10, y + 1, 2, 1, ICON_FOLDER);
         gfx::fill_rect(surface, x, y + 3, 14, 7, ICON_FOLDER);
-        gfx::fill_rect(surface, x + 1, y + 4, 12, 5, BG);
+        gfx::fill_rect(surface, x + 1, y + 4, 12, 5, LIST_BG);
     } else {
-        // Document: page outline with a folded corner and two text lines.
         let color = if is_elf(name) { ICON_ELF } else { ICON_FILE };
         gfx::fill_rect(surface, x + 2, y, 9, 10, color);
-        gfx::fill_rect(surface, x + 3, y + 1, 7, 8, BG);
+        gfx::fill_rect(surface, x + 3, y + 1, 7, 8, LIST_BG);
         gfx::fill_rect(surface, x + 4, y + 3, 5, 1, color);
         gfx::fill_rect(surface, x + 4, y + 5, 5, 1, color);
         gfx::fill_rect(surface, x + 4, y + 7, 3, 1, color);
+    }
+}
+
+/// Larger 36x32 glyph for the icon view.
+fn draw_big_icon(surface: &mut dyn Surface, x: u32, y: u32, name: &str, is_dir: bool) {
+    if is_dir {
+        gfx::fill_rect(surface, x + 2, y + 6, 12, 5, ICON_FOLDER);
+        gfx::fill_rect(surface, x + 14, y + 2, 12, 5, ICON_FOLDER);
+        gfx::fill_rect(surface, x + 26, y + 5, 4, 3, ICON_FOLDER);
+        gfx::fill_rect(surface, x, y + 11, 36, 19, ICON_FOLDER);
+        gfx::fill_rect(surface, x + 3, y + 14, 30, 13, LIST_BG);
+    } else {
+        let color = if is_elf(name) { ICON_ELF } else { ICON_FILE };
+        gfx::fill_rect(surface, x + 6, y, 22, 28, color);
+        gfx::fill_rect(surface, x + 9, y + 3, 16, 22, LIST_BG);
+        gfx::fill_rect(surface, x + 11, y + 9, 12, 2, color);
+        gfx::fill_rect(surface, x + 11, y + 14, 12, 2, color);
+        gfx::fill_rect(surface, x + 11, y + 19, 8, 2, color);
+    }
+}
+
+/// 16x14 icon for toolbar buttons.
+fn draw_toolbar_icon(surface: &mut dyn Surface, action: ToolbarAction, x: u32, y: u32) {
+    let color = 0x00_DBE6F0;
+    match action {
+        ToolbarAction::Up => {
+            gfx::fill_rect(surface, x + 7, y + 1, 2, 9, color);
+            draw_diagonal(surface, x + 1, y + 7, x + 7, y + 1, color);
+            draw_diagonal(surface, x + 15, y + 7, x + 9, y + 1, color);
+        }
+        ToolbarAction::New => {
+            gfx::fill_rect(surface, x + 1, y + 5, 6, 2, color);
+            gfx::fill_rect(surface, x + 7, y + 3, 6, 2, color);
+            gfx::fill_rect(surface, x, y + 7, 16, 7, color);
+            gfx::fill_rect(surface, x + 2, y + 8, 12, 5, BG);
+            gfx::fill_rect(surface, x + 11, y + 8, 3, 2, color);
+            gfx::fill_rect(surface, x + 12, y + 7, 1, 4, color);
+        }
+        ToolbarAction::Del => {
+            gfx::fill_rect(surface, x + 2, y, 12, 2, color);
+            gfx::fill_rect(surface, x + 5, y + 2, 2, 2, color);
+            gfx::fill_rect(surface, x + 9, y + 2, 2, 2, color);
+            gfx::fill_rect(surface, x + 3, y + 4, 10, 10, color);
+            gfx::fill_rect(surface, x + 5, y + 6, 2, 6, BG);
+            gfx::fill_rect(surface, x + 9, y + 6, 2, 6, BG);
+        }
+        ToolbarAction::Refresh => {
+            // Circular arrow: ring with the bottom-left corner open.
+            gfx::fill_rect(surface, x + 1, y + 1, 14, 3, color);
+            gfx::fill_rect(surface, x + 1, y + 10, 14, 3, color);
+            gfx::fill_rect(surface, x + 1, y + 1, 3, 7, color);
+            gfx::fill_rect(surface, x + 12, y + 6, 3, 7, color);
+            draw_diagonal(surface, x + 1, y + 7, x + 5, y + 3, color);
+            draw_diagonal(surface, x + 13, y + 11, x + 11, y + 13, color);
+            draw_diagonal(surface, x + 12, y + 13, x + 14, y + 13, color);
+        }
+        ToolbarAction::ToggleView => {}
+    }
+}
+
+/// 1px-thick diagonal line between two endpoints (any direction).
+fn draw_diagonal(surface: &mut dyn Surface, x0: u32, y0: u32, x1: u32, y1: u32, color: u32) {
+    let (mut x, mut y) = (x0 as i32, y0 as i32);
+    let sx = if x1 >= x0 { 1 } else { -1 };
+    let sy = if y1 >= y0 { 1 } else { -1 };
+    let dx = (x1 as i32 - x0 as i32).abs();
+    let dy = (y1 as i32 - y0 as i32).abs();
+    let mut err = dx - dy;
+    loop {
+        if x >= 0 && y >= 0 {
+            surface.put_pixel(x as u32, y as u32, color);
+        }
+        if x == x1 as i32 && y == y1 as i32 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 > -dy {
+            err -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            err += dx;
+            y += sy;
+        }
     }
 }
 
