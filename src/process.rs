@@ -25,6 +25,7 @@ use alloc::vec::Vec;
 
 use crate::allocator;
 use crate::elf;
+use crate::fat;
 use crate::gdt;
 use crate::interrupts;
 use crate::io;
@@ -52,6 +53,14 @@ const MIN_SEGMENT_VADDR: u64 = 2 * 1024 * 1024;
 /// (`user/linker.ld`), and the 256 MiB user-stack region below, with no
 /// attempt at ASLR (a fixed base is fine for a single-tenant loader).
 const PIE_LOAD_BASE: u64 = 0x2000_0000;
+
+/// Load bias for a `PT_INTERP` dynamic linker (see `spawn_linux`'s Phase
+/// 4 handling): 896 MiB, clear of `PIE_LOAD_BASE` plus any realistic
+/// main-binary image size below it, and clear of `MMAP_BASE` (1 GiB)
+/// above it, where `ld.so` itself will go on to `mmap` every shared
+/// library it loads (real `ld.so` builds are a few hundred KiB, nowhere
+/// near the ~128 MiB of headroom either side gives it).
+const INTERP_LOAD_BASE: u64 = 0x3800_0000;
 
 /// Every process gets the same fixed ring-3 stack address (256 MiB — well
 /// clear of the 48 MiB test-program load address and the kernel's own
@@ -589,7 +598,51 @@ pub fn spawn_linux(elf_bytes: &[u8], name: &'static str, argv: &[&str], envp: &[
         free_process(process);
         return Err(e);
     }
-    let user_rsp = match setup_linux_stack(&mut process, pml4, elf_bytes, &program, argv, envp) {
+
+    // A dynamically-linked binary (almost always ET_DYN, like "program"
+    // itself) names its real interpreter via PT_INTERP — load *that* as
+    // the process's actual entry point instead, the same way a real
+    // Linux kernel never implements the ELF relocator itself. As long as
+    // AT_PHDR/AT_ENTRY (still `program`'s own, below) are correct, the
+    // real ld.so this loads does its own relocation, PLT resolution, and
+    // TLS setup, then jumps to `program`'s real entry itself.
+    let mut entry = program.entry;
+    let mut interp_base = 0u64;
+    if let Some(interp_path) = program.interp.clone() {
+        let interp_bytes = match fat::read_file(&interp_path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                free_process(process);
+                return Err("interpreter not found");
+            }
+        };
+        let mut interp_program = match elf::parse(&interp_bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                free_process(process);
+                return Err(e);
+            }
+        };
+        if interp_program.is_pie {
+            interp_base = INTERP_LOAD_BASE;
+            interp_program.entry = interp_program.entry.wrapping_add(INTERP_LOAD_BASE);
+            for segment in &mut interp_program.segments {
+                segment.vaddr = segment.vaddr.wrapping_add(INTERP_LOAD_BASE);
+            }
+        }
+        if let Err(e) = validate_segments(&interp_program) {
+            free_process(process);
+            return Err(e);
+        }
+        if let Err(e) = load_segments(&mut process, pml4, &interp_program.segments, &interp_bytes) {
+            free_process(process);
+            return Err(e);
+        }
+        entry = interp_program.entry;
+    }
+    process.entry = entry as usize;
+
+    let user_rsp = match setup_linux_stack(&mut process, pml4, elf_bytes, &program, interp_base, argv, envp) {
         Ok(rsp) => rsp,
         Err(e) => {
             free_process(process);
@@ -903,6 +956,7 @@ fn setup_linux_stack(
     pml4: u64,
     elf_bytes: &[u8],
     program: &elf::Program,
+    at_base: u64,
     argv: &[&str],
     envp: &[&str],
 ) -> Result<u64, &'static str> {
@@ -952,7 +1006,7 @@ fn setup_linux_stack(
         (auxv::AT_PHENT, program.phentsize as u64),
         (auxv::AT_PHNUM, program.phnum as u64),
         (auxv::AT_PAGESZ, paging::PAGE_SIZE),
-        (auxv::AT_BASE, 0),
+        (auxv::AT_BASE, at_base),
         (auxv::AT_ENTRY, program.entry),
         (auxv::AT_PHDR, 0),
         (auxv::AT_RANDOM, 0),

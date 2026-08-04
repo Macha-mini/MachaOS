@@ -1,11 +1,15 @@
 //! ELF64 executable parsing. `parse` validates the header and program
 //! headers of a 64-bit little-endian ET_EXEC or ET_DYN file (no
-//! relocations, no dynamic linking — an ET_DYN's own PT_DYNAMIC segment,
-//! if any, is just loaded and ignored like any other PT_LOAD data) and
-//! returns the entry point plus the PT_LOAD segments, which the process
-//! manager (see `process.rs`) maps into a fresh address space. All reads
-//! are bounds-checked against the input slice; any malformed field yields
-//! an error string rather than a panic.
+//! relocations, no dynamic linking done *here* — an ET_DYN's own
+//! PT_DYNAMIC segment, if any, is just loaded and ignored like any other
+//! PT_LOAD data; a dynamically-linked binary's actual relocation and
+//! symbol resolution is `PT_INTERP`'s job — see `Program::interp` and
+//! `process::spawn_linux`'s Phase 4 handling, which loads and runs the
+//! real interpreter instead) and returns the entry point plus the
+//! PT_LOAD segments, which the process manager (see `process.rs`) maps
+//! into a fresh address space. All reads are bounds-checked against the
+//! input slice; any malformed field yields an error string rather than a
+//! panic.
 //!
 //! ET_DYN segments carry link-time addresses relative to a base of 0 (the
 //! whole point of being position-independent); `process.rs` picks a load
@@ -13,6 +17,7 @@
 //! mapping, the same job a real Linux kernel's ELF loader does before
 //! handing off to `ld.so` (see `Program::is_pie`).
 
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 const ELF_HEADER_SIZE: usize = 64;
@@ -25,6 +30,7 @@ const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 0x3E;
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
@@ -62,6 +68,11 @@ pub struct Program {
     pub phoff: u64,
     pub phentsize: u16,
     pub phnum: u16,
+    /// From a `PT_INTERP` segment, if this binary has one: the path (as
+    /// a NUL-terminated string in the file, decoded here) of the dynamic
+    /// linker that should actually run it — see `process::spawn_linux`'s
+    /// Phase 4 handling.
+    pub interp: Option<String>,
 }
 
 fn read_u16(data: &[u8], off: usize) -> Result<u16, &'static str> {
@@ -119,9 +130,19 @@ pub fn parse(data: &[u8]) -> Result<Program, &'static str> {
     }
 
     let mut segments = Vec::new();
+    let mut interp = None;
     for i in 0..phnum {
         let off = (phoff + i as u64 * phentsize as u64) as usize;
         let p_type = read_u32(data, off)?;
+        if p_type == PT_INTERP {
+            let p_offset = read_u64(data, off + 8)?;
+            let p_filesz = read_u64(data, off + 32)?;
+            let end = p_offset.checked_add(p_filesz).ok_or("interp range overflow")?;
+            let bytes = data.get(p_offset as usize..end as usize).ok_or("interp data outside file")?;
+            let s = core::str::from_utf8(bytes).map_err(|_| "invalid interp string")?;
+            interp = Some(s.trim_end_matches('\0').to_string());
+            continue;
+        }
         if p_type != PT_LOAD {
             continue;
         }
@@ -161,5 +182,6 @@ pub fn parse(data: &[u8]) -> Result<Program, &'static str> {
         phoff,
         phentsize,
         phnum,
+        interp,
     })
 }
