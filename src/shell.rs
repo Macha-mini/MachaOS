@@ -5,11 +5,20 @@ use core::sync::atomic::Ordering;
 use crate::{cpuid, interrupts, io, keyboard, mouse, multiboot, port, serial, task, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
+pub const PROMPT: &str = "machaos> ";
+
+// Command names, for Tab completion in LineEditor. Kept in sync with the
+// match in `execute()` and the descriptions in `cmd_help()` by hand — if
+// you add a command there, add it here too.
+pub const COMMANDS: &[&str] = &[
+    "help", "clear", "cls", "echo", "time", "uptime", "meminfo", "heap", "cpuinfo", "version",
+    "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest", "tasks",
+];
 
 pub fn run() -> ! {
     loop {
         vga::set_color(vga::colors::LIGHT_GREEN);
-        print!("machaos> ");
+        print!("{}", PROMPT);
         vga::reset_color();
 
         let line = read_line();
@@ -46,6 +55,13 @@ fn read_line() -> String {
                         serial::write_byte(b' ');
                     }
                 }
+                // History/cursor movement are GUI-only (LineEditor, used by
+                // the desktop's Terminal window); the plain VGA fallback
+                // shell doesn't support them.
+                keyboard::Event::Up
+                | keyboard::Event::Down
+                | keyboard::Event::Left
+                | keyboard::Event::Right => {}
             }
         }
         interrupts::halt();
@@ -325,8 +341,16 @@ pub fn selftest() -> ! {
 /// window has focus, since (unlike `read_line`'s blocking loop) it must
 /// keep returning control so the compositor and other windows keep
 /// running between keystrokes.
+const HISTORY_CAPACITY: usize = 32;
+
 pub struct LineEditor {
     line: String,
+    history: Vec<String>,
+    // Some(i): browsing history[i]; None: editing fresh input (`line` is
+    // the source of truth). `draft` is what was being typed before the
+    // user pressed Up, restored when Down walks past the newest entry.
+    history_index: Option<usize>,
+    draft: String,
 }
 
 pub enum Feed {
@@ -336,7 +360,83 @@ pub enum Feed {
 
 impl LineEditor {
     pub const fn new() -> Self {
-        Self { line: String::new() }
+        Self {
+            line: String::new(),
+            history: Vec::new(),
+            history_index: None,
+            draft: String::new(),
+        }
+    }
+
+    pub fn current_line(&self) -> &str {
+        &self.line
+    }
+
+    /// Erases whatever is currently visible on screen for this line and
+    /// prints `new_line` in its place. Relies only on `print!`, like the
+    /// rest of this type, so it works wherever the caller has pointed the
+    /// active console sink.
+    fn set_line(&mut self, new_line: String) {
+        for _ in 0..self.line.chars().count() {
+            print!("\x08");
+        }
+        self.line = new_line;
+        print!("{}", self.line);
+    }
+
+    fn history_up(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let next = match self.history_index {
+            None => {
+                self.draft = self.line.clone();
+                self.history.len() - 1
+            }
+            Some(i) => i.saturating_sub(1),
+        };
+        self.history_index = Some(next);
+        let entry = self.history[next].clone();
+        self.set_line(entry);
+    }
+
+    fn history_down(&mut self) {
+        match self.history_index {
+            Some(i) if i + 1 < self.history.len() => {
+                self.history_index = Some(i + 1);
+                let entry = self.history[i + 1].clone();
+                self.set_line(entry);
+            }
+            Some(_) => {
+                self.history_index = None;
+                let draft = core::mem::take(&mut self.draft);
+                self.set_line(draft);
+            }
+            None => {}
+        }
+    }
+
+    fn complete(&mut self) {
+        // Argument completion is out of scope; only complete the command
+        // name itself, before the first space.
+        if self.line.is_empty() || self.line.contains(' ') {
+            return;
+        }
+        let matches: Vec<&str> =
+            COMMANDS.iter().copied().filter(|c| c.starts_with(self.line.as_str())).collect();
+        match matches.as_slice() {
+            [] => {}
+            [only] => {
+                let completion = &only[self.line.len()..];
+                self.line.push_str(completion);
+                print!("{}", completion);
+            }
+            multiple => {
+                println!();
+                println!("{}", multiple.join("  "));
+                print!("{}{}", PROMPT, self.line);
+            }
+        }
     }
 
     pub fn feed(&mut self, event: keyboard::Event) -> Feed {
@@ -346,25 +446,44 @@ impl LineEditor {
                     self.line.push(c);
                     print!("{}", c);
                 }
+                self.history_index = None;
                 Feed::Pending
             }
             keyboard::Event::Backspace => {
                 if self.line.pop().is_some() {
                     print!("\x08");
                 }
+                self.history_index = None;
                 Feed::Pending
             }
             keyboard::Event::Enter => {
                 println!();
-                Feed::Line(core::mem::take(&mut self.line))
+                let line = core::mem::take(&mut self.line);
+                self.history_index = None;
+                self.draft.clear();
+                if !line.is_empty() && self.history.last().map(String::as_str) != Some(&line) {
+                    if self.history.len() >= HISTORY_CAPACITY {
+                        self.history.remove(0);
+                    }
+                    self.history.push(line.clone());
+                }
+                Feed::Line(line)
             }
             keyboard::Event::Tab => {
-                for _ in 0..4 {
-                    self.line.push(' ');
-                    print!(" ");
-                }
+                self.complete();
                 Feed::Pending
             }
+            keyboard::Event::Up => {
+                self.history_up();
+                Feed::Pending
+            }
+            keyboard::Event::Down => {
+                self.history_down();
+                Feed::Pending
+            }
+            // Not supported yet: LineEditor only ever appends/removes at
+            // the end of `line`, it has no notion of a cursor within it.
+            keyboard::Event::Left | keyboard::Event::Right => Feed::Pending,
         }
     }
 }

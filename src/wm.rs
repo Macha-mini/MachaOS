@@ -1,12 +1,14 @@
-//! Window management: window rectangles, z-order, drag/focus/close hit
-//! testing, the taskbar, and the compositor that draws everything into
-//! the framebuffer's back buffer each frame.
+//! Window management: window rectangles, z-order, drag/resize/focus/close
+//! hit testing, the taskbar, and the compositor that draws everything
+//! into the framebuffer's back buffer each frame.
 
 use alloc::format;
+use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
+use crate::calculator::CalculatorApp;
 use crate::console::Console;
 use crate::cpuid;
 use crate::fb;
@@ -23,28 +25,58 @@ use crate::task;
 const TITLE_BAR_HEIGHT: u32 = 20;
 const TASKBAR_HEIGHT: u32 = 28;
 const CLOSE_BUTTON_SIZE: u32 = 14;
+const MINIMIZE_BUTTON_SIZE: u32 = 14;
+const RESIZE_GRIP_SIZE: u32 = 12;
+const MIN_COLS: usize = 20;
+const MIN_ROWS: usize = 5;
 const DESKTOP_BG: u32 = 0x00_2B4570;
 const TITLE_FOCUSED: u32 = 0x00_2C5F9E;
 const TITLE_UNFOCUSED: u32 = 0x00_45505C;
 const TASKBAR_BG: u32 = 0x00_15202B;
 const TASKBAR_BUTTON_FOCUSED: u32 = 0x00_3C6EA8;
 const TASKBAR_BUTTON: u32 = 0x00_263340;
+const TASKBAR_BUTTON_MINIMIZED: u32 = 0x00_18222C;
 const CLOSE_BUTTON_COLOR: u32 = 0x00_B33A3A;
+const MINIMIZE_BUTTON_COLOR: u32 = 0x00_4A4A2E;
+const RESIZE_GRIP_COLOR: u32 = 0x00_6E7C8C;
 const CONSOLE_FG: u32 = 0x00_E0E0E0;
 const CONSOLE_BG: u32 = 0x00_10161C;
+const EDITOR_CURSOR_COLOR: u32 = 0x00_FFCC66;
+
+pub enum AppKind {
+    Terminal { console: Console, editor: LineEditor },
+    SysInfo { console: Console },
+    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize },
+    Calculator(CalculatorApp),
+}
 
 pub struct Window {
     pub title: &'static str,
     pub x: i32,
     pub y: i32,
     pub open: bool,
-    pub console: Console,
-    pub editor: Option<LineEditor>,
+    pub minimized: bool,
+    pub resizable: bool,
+    pub kind: AppKind,
 }
 
 impl Window {
     fn content_size(&self) -> (u32, u32) {
-        (self.console.width_px(), self.console.height_px())
+        match &self.kind {
+            AppKind::Terminal { console, .. }
+            | AppKind::SysInfo { console }
+            | AppKind::Editor { console, .. } => (console.width_px(), console.height_px()),
+            AppKind::Calculator(app) => (app.width(), app.height()),
+        }
+    }
+
+    fn content_pixels(&self) -> &[u32] {
+        match &self.kind {
+            AppKind::Terminal { console, .. }
+            | AppKind::SysInfo { console }
+            | AppKind::Editor { console, .. } => console.pixels(),
+            AppKind::Calculator(app) => app.pixels(),
+        }
     }
 }
 
@@ -52,6 +84,12 @@ struct DragState {
     window_index: usize,
     offset_x: i32,
     offset_y: i32,
+}
+
+struct ResizeState {
+    window_index: usize,
+    last_cols: usize,
+    last_rows: usize,
 }
 
 pub struct WindowManager {
@@ -62,45 +100,90 @@ pub struct WindowManager {
     screen_w: u32,
     screen_h: u32,
     dragging: Option<DragState>,
+    resizing: Option<ResizeState>,
     left_was_down: bool,
     last_clock_secs: u64,
 }
 
 impl WindowManager {
     pub fn new(screen_w: u32, screen_h: u32) -> Self {
+        let margin = 40i32;
+        let max_x = screen_w as i32 - 100;
+        let max_y = screen_h as i32 - TASKBAR_HEIGHT as i32 - 100;
+        let clamp = |x: i32, y: i32| (x.clamp(0, max_x), y.clamp(0, max_y));
+
         let sysinfo_window = Window {
             title: "System Info",
-            x: 700,
-            y: 40,
+            x: clamp(880, margin).0,
+            y: margin,
             open: true,
-            console: build_sysinfo_console(),
-            editor: None,
+            minimized: false,
+            resizable: false,
+            kind: AppKind::SysInfo { console: build_sysinfo_console() },
         };
+
+        let calculator_window = Window {
+            title: "Calculator",
+            x: clamp(1220, margin).0,
+            y: margin,
+            open: true,
+            minimized: false,
+            resizable: false,
+            kind: AppKind::Calculator(CalculatorApp::new()),
+        };
+
+        let mut editor_console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
+        let editor_lines = vec![String::new()];
+        let mut editor_scroll = 0usize;
+        editor_render(&mut editor_console, &editor_lines, 0, 0, &mut editor_scroll);
+        let (ex, ey) = clamp(margin, margin + 300);
+        let editor_window = Window {
+            title: "Notepad",
+            x: ex,
+            y: ey,
+            open: true,
+            minimized: false,
+            resizable: true,
+            kind: AppKind::Editor {
+                console: editor_console,
+                lines: editor_lines,
+                cursor_row: 0,
+                cursor_col: 0,
+                scroll_offset: editor_scroll,
+            },
+        };
+
         let term_window = Window {
             title: "Terminal",
-            x: 40,
-            y: 40,
+            x: margin,
+            y: margin,
             open: true,
-            console: Console::new(80, 25, CONSOLE_FG, CONSOLE_BG),
-            editor: Some(LineEditor::new()),
+            minimized: false,
+            resizable: true,
+            kind: AppKind::Terminal {
+                console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
+                editor: LineEditor::new(),
+            },
         };
 
         let mut manager = Self {
-            windows: vec![sysinfo_window, term_window],
-            focused: 1,
+            windows: vec![sysinfo_window, calculator_window, editor_window, term_window],
+            focused: 3,
             cursor_x: (screen_w / 2) as i32,
             cursor_y: (screen_h / 2) as i32,
             screen_w,
             screen_h,
             dragging: None,
+            resizing: None,
             left_was_down: false,
             last_clock_secs: u64::MAX,
         };
 
-        let terminal = &mut manager.windows[1];
-        io::set_console_sink(Some(&mut terminal.console));
-        print!("machaos> ");
-        io::set_console_sink(None);
+        if let AppKind::Terminal { console, .. } = &mut manager.windows[3].kind {
+            io::set_console_sink(Some(console));
+            print!("{}", shell::PROMPT);
+            io::set_console_sink(None);
+        }
 
         manager
     }
@@ -120,14 +203,19 @@ impl WindowManager {
             return;
         }
         let window = &mut self.windows[self.focused];
-        let Window { console, editor, .. } = window;
-        if let Some(editor) = editor {
-            io::set_console_sink(Some(console));
-            if let Feed::Line(line) = editor.feed(event) {
-                shell::execute(&line);
-                print!("machaos> ");
+        match &mut window.kind {
+            AppKind::Terminal { console, editor } => {
+                io::set_console_sink(Some(console));
+                if let Feed::Line(line) = editor.feed(event) {
+                    shell::execute(&line);
+                    print!("{}", shell::PROMPT);
+                }
+                io::set_console_sink(None);
             }
-            io::set_console_sink(None);
+            AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset } => {
+                editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, event);
+            }
+            AppKind::SysInfo { .. } | AppKind::Calculator(_) => {}
         }
     }
 
@@ -138,6 +226,26 @@ impl WindowManager {
         let just_pressed = event.left && !self.left_was_down;
         let just_released = !event.left && self.left_was_down;
         self.left_was_down = event.left;
+
+        if let Some(resize) = &mut self.resizing {
+            if event.left {
+                let index = resize.window_index;
+                let (wx, wy) = (self.windows[index].x, self.windows[index].y);
+                let local_w = (self.cursor_x - wx).max(0) as u32;
+                let local_h = (self.cursor_y - wy - TITLE_BAR_HEIGHT as i32).max(0) as u32;
+                let cols = ((local_w / font::GLYPH_WIDTH as u32) as usize).max(MIN_COLS);
+                let rows = ((local_h / font::GLYPH_HEIGHT as u32) as usize).max(MIN_ROWS);
+                if cols != resize.last_cols || rows != resize.last_rows {
+                    resize.last_cols = cols;
+                    resize.last_rows = rows;
+                    resize_window(&mut self.windows[index], cols, rows);
+                }
+            }
+            if just_released {
+                self.resizing = None;
+            }
+            return;
+        }
 
         if let Some(drag) = &self.dragging {
             if event.left {
@@ -165,6 +273,13 @@ impl WindowManager {
         self.focused = self.windows.len() - 1;
     }
 
+    fn refocus_after_hide(&mut self, hidden_index: usize) {
+        if self.focused == hidden_index {
+            self.focused =
+                self.windows.iter().rposition(|w| w.open && !w.minimized).unwrap_or(0);
+        }
+    }
+
     fn handle_click(&mut self) {
         let taskbar_y = self.screen_h as i32 - TASKBAR_HEIGHT as i32;
         if self.cursor_y >= taskbar_y {
@@ -175,6 +290,7 @@ impl WindowManager {
                 }
                 let label_w = taskbar_label_width(self.windows[i].title);
                 if self.cursor_x >= x && self.cursor_x < x + label_w {
+                    self.windows[i].minimized = false;
                     self.raise(i);
                     return;
                 }
@@ -185,24 +301,49 @@ impl WindowManager {
 
         for i in (0..self.windows.len()).rev() {
             let window = &self.windows[i];
-            if !window.open {
+            if !window.open || window.minimized {
                 continue;
             }
             let (content_w, content_h) = window.content_size();
             let (wx, wy) = (window.x, window.y);
+            let resizable = window.resizable;
+
+            if resizable {
+                let grip_x = wx + content_w as i32 - RESIZE_GRIP_SIZE as i32;
+                let grip_y = wy + TITLE_BAR_HEIGHT as i32 + content_h as i32 - RESIZE_GRIP_SIZE as i32;
+                if self.cursor_x >= grip_x
+                    && self.cursor_x < grip_x + RESIZE_GRIP_SIZE as i32
+                    && self.cursor_y >= grip_y
+                    && self.cursor_y < grip_y + RESIZE_GRIP_SIZE as i32
+                {
+                    self.raise(i);
+                    let focused_index = self.focused;
+                    let cols = content_w as usize / font::GLYPH_WIDTH;
+                    let rows = content_h as usize / font::GLYPH_HEIGHT;
+                    self.resizing = Some(ResizeState { window_index: focused_index, last_cols: cols, last_rows: rows });
+                    return;
+                }
+            }
+
             let in_title = self.cursor_x >= wx
                 && self.cursor_x < wx + content_w as i32
                 && self.cursor_y >= wy
                 && self.cursor_y < wy + TITLE_BAR_HEIGHT as i32;
             if in_title {
                 let close_x = wx + content_w as i32 - CLOSE_BUTTON_SIZE as i32 - 3;
+                let minimize_x = close_x - MINIMIZE_BUTTON_SIZE as i32 - 6;
+
                 if self.cursor_x >= close_x && self.cursor_x < close_x + CLOSE_BUTTON_SIZE as i32 {
                     self.windows[i].open = false;
-                    if self.focused == i {
-                        self.focused = self.windows.iter().rposition(|w| w.open).unwrap_or(0);
-                    }
+                    self.refocus_after_hide(i);
                     return;
                 }
+                if self.cursor_x >= minimize_x && self.cursor_x < minimize_x + MINIMIZE_BUTTON_SIZE as i32 {
+                    self.windows[i].minimized = true;
+                    self.refocus_after_hide(i);
+                    return;
+                }
+
                 self.raise(i);
                 let focused_index = self.focused;
                 self.dragging = Some(DragState {
@@ -217,7 +358,12 @@ impl WindowManager {
                 && self.cursor_y >= wy + TITLE_BAR_HEIGHT as i32
                 && self.cursor_y < wy + TITLE_BAR_HEIGHT as i32 + content_h as i32;
             if in_content {
+                let local_x = self.cursor_x - wx;
+                let local_y = self.cursor_y - wy - TITLE_BAR_HEIGHT as i32;
                 self.raise(i);
+                if let AppKind::Calculator(app) = &mut self.windows[self.focused].kind {
+                    app.handle_click(local_x, local_y);
+                }
                 return;
             }
         }
@@ -227,7 +373,7 @@ impl WindowManager {
         fb::with_surface(|surface| {
             gfx::fill_rect(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG);
             for (i, window) in self.windows.iter().enumerate() {
-                if window.open {
+                if window.open && !window.minimized {
                     draw_window(surface, window, i == self.focused);
                 }
             }
@@ -247,7 +393,13 @@ impl WindowManager {
                 continue;
             }
             let label_w = taskbar_label_width(window.title) as u32;
-            let color = if i == self.focused { TASKBAR_BUTTON_FOCUSED } else { TASKBAR_BUTTON };
+            let color = if i == self.focused {
+                TASKBAR_BUTTON_FOCUSED
+            } else if window.minimized {
+                TASKBAR_BUTTON_MINIMIZED
+            } else {
+                TASKBAR_BUTTON
+            };
             gfx::fill_rect(surface, x, y + 4, label_w, TASKBAR_HEIGHT - 8, color);
             gfx::draw_string(surface, x + 6, y + 8, window.title, 0x00_FFFFFF, None);
             x += label_w + 6;
@@ -272,6 +424,122 @@ impl WindowManager {
     }
 }
 
+fn resize_window(window: &mut Window, cols: usize, rows: usize) {
+    match &mut window.kind {
+        AppKind::Terminal { console, editor } => {
+            console.resize(cols, rows);
+            io::set_console_sink(Some(console));
+            print!("{}{}", shell::PROMPT, editor.current_line());
+            io::set_console_sink(None);
+        }
+        AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset } => {
+            console.resize(cols, rows);
+            editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset);
+        }
+        AppKind::SysInfo { .. } | AppKind::Calculator(_) => {} // not resizable
+    }
+}
+
+fn byte_index(line: &str, char_index: usize) -> usize {
+    line.char_indices().nth(char_index).map(|(i, _)| i).unwrap_or(line.len())
+}
+
+fn editor_handle_key(
+    console: &mut Console,
+    lines: &mut Vec<String>,
+    cursor_row: &mut usize,
+    cursor_col: &mut usize,
+    scroll_offset: &mut usize,
+    event: keyboard::Event,
+) {
+    match event {
+        keyboard::Event::Char(c) => {
+            let idx = byte_index(&lines[*cursor_row], *cursor_col);
+            lines[*cursor_row].insert(idx, c);
+            *cursor_col += 1;
+        }
+        keyboard::Event::Backspace => {
+            if *cursor_col > 0 {
+                let idx = byte_index(&lines[*cursor_row], *cursor_col - 1);
+                lines[*cursor_row].remove(idx);
+                *cursor_col -= 1;
+            } else if *cursor_row > 0 {
+                let current = lines.remove(*cursor_row);
+                *cursor_row -= 1;
+                *cursor_col = lines[*cursor_row].chars().count();
+                lines[*cursor_row].push_str(&current);
+            }
+        }
+        keyboard::Event::Enter => {
+            let idx = byte_index(&lines[*cursor_row], *cursor_col);
+            let rest = lines[*cursor_row].split_off(idx);
+            lines.insert(*cursor_row + 1, rest);
+            *cursor_row += 1;
+            *cursor_col = 0;
+        }
+        keyboard::Event::Tab => {
+            let idx = byte_index(&lines[*cursor_row], *cursor_col);
+            lines[*cursor_row].insert_str(idx, "    ");
+            *cursor_col += 4;
+        }
+        keyboard::Event::Left => {
+            if *cursor_col > 0 {
+                *cursor_col -= 1;
+            } else if *cursor_row > 0 {
+                *cursor_row -= 1;
+                *cursor_col = lines[*cursor_row].chars().count();
+            }
+        }
+        keyboard::Event::Right => {
+            if *cursor_col < lines[*cursor_row].chars().count() {
+                *cursor_col += 1;
+            } else if *cursor_row + 1 < lines.len() {
+                *cursor_row += 1;
+                *cursor_col = 0;
+            }
+        }
+        keyboard::Event::Up => {
+            if *cursor_row > 0 {
+                *cursor_row -= 1;
+                *cursor_col = (*cursor_col).min(lines[*cursor_row].chars().count());
+            }
+        }
+        keyboard::Event::Down => {
+            if *cursor_row + 1 < lines.len() {
+                *cursor_row += 1;
+                *cursor_col = (*cursor_col).min(lines[*cursor_row].chars().count());
+            }
+        }
+    }
+    editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset);
+}
+
+/// Re-renders the whole visible page from `lines` (the real document —
+/// the console is just a display cache) and overlays a block cursor.
+/// Called after every keystroke and after a resize, since both replace
+/// the console's pixel buffer wholesale.
+fn editor_render(
+    console: &mut Console,
+    lines: &[String],
+    cursor_row: usize,
+    cursor_col: usize,
+    scroll_offset: &mut usize,
+) {
+    let rows = console.rows();
+    if cursor_row < *scroll_offset {
+        *scroll_offset = cursor_row;
+    } else if cursor_row >= *scroll_offset + rows {
+        *scroll_offset = cursor_row + 1 - rows;
+    }
+    console.clear();
+    for line in lines.iter().skip(*scroll_offset).take(rows) {
+        let _ = writeln!(console, "{}", line);
+    }
+    let cx = (cursor_col * font::GLYPH_WIDTH) as u32;
+    let cy = ((cursor_row - *scroll_offset) * font::GLYPH_HEIGHT) as u32;
+    gfx::fill_rect(console, cx, cy, font::GLYPH_WIDTH as u32, font::GLYPH_HEIGHT as u32, EDITOR_CURSOR_COLOR);
+}
+
 fn taskbar_label_width(title: &str) -> i32 {
     (title.len() * font::GLYPH_WIDTH + 12) as i32
 }
@@ -289,7 +557,17 @@ fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool) {
     gfx::fill_rect(surface, close_x, y + 3, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_COLOR);
     gfx::draw_string(surface, close_x + 3, y + 4, "x", 0x00_FFFFFF, None);
 
-    gfx::blit(surface, x, y + TITLE_BAR_HEIGHT, window.console.pixels(), content_w, content_h);
+    let minimize_x = close_x - MINIMIZE_BUTTON_SIZE - 6;
+    gfx::fill_rect(surface, minimize_x, y + 3, MINIMIZE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, MINIMIZE_BUTTON_COLOR);
+    gfx::draw_string(surface, minimize_x + 3, y + 4, "_", 0x00_FFFFFF, None);
+
+    gfx::blit(surface, x, y + TITLE_BAR_HEIGHT, window.content_pixels(), content_w, content_h);
+
+    if window.resizable {
+        let grip_x = x + content_w - RESIZE_GRIP_SIZE;
+        let grip_y = y + TITLE_BAR_HEIGHT + content_h - RESIZE_GRIP_SIZE;
+        gfx::fill_rect(surface, grip_x, grip_y, RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE, RESIZE_GRIP_COLOR);
+    }
 }
 
 const CURSOR_W: u32 = 10;

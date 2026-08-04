@@ -9,6 +9,10 @@ pub enum Event {
     Backspace,
     Enter,
     Tab,
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 const BUFFER_CAPACITY: usize = 256;
@@ -50,6 +54,9 @@ impl EventQueue {
 static QUEUE: SpinLock<EventQueue> = SpinLock::new(EventQueue::new());
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
+// Set to true when a 0xE0 extended-scancode prefix byte is seen; consumed
+// (swapped back to false) by the very next byte, whatever it is.
+static EXTENDED: AtomicBool = AtomicBool::new(false);
 
 // PS/2 scancode set 1 keymap (index = scancode)
 const KEYMAP: [u8; 128] = [
@@ -74,7 +81,17 @@ const KEYMAP_SHIFT: [u8; 128] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
-fn decode(scancode: u8) -> Option<Event> {
+fn decode(scancode: u8, extended: bool) -> Option<Event> {
+    if extended {
+        // Scan Code Set 1, arrow keys (numpad-alike codes prefixed with 0xE0).
+        return match scancode {
+            0x48 => Some(Event::Up),
+            0x50 => Some(Event::Down),
+            0x4B => Some(Event::Left),
+            0x4D => Some(Event::Right),
+            _ => None, // other extended keys (Home/End/Delete/...) are not handled yet
+        };
+    }
     match scancode {
         0x2A | 0x36 => {
             SHIFT_DOWN.store(true, Ordering::Relaxed);
@@ -114,7 +131,12 @@ fn decode(scancode: u8) -> Option<Event> {
 /// Called from the IRQ1 interrupt handler.
 pub fn irq() {
     let scancode = unsafe { port::inb(0x60) };
-    if let Some(event) = decode(scancode) {
+    if scancode == 0xE0 {
+        EXTENDED.store(true, Ordering::Relaxed);
+        return;
+    }
+    let extended = EXTENDED.swap(false, Ordering::Relaxed);
+    if let Some(event) = decode(scancode, extended) {
         QUEUE.lock().push(event);
     }
 }

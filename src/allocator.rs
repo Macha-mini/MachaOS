@@ -5,7 +5,7 @@ use core::ptr;
 use crate::sync::SpinLock;
 
 const MIN_ALIGN: usize = 16;
-pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
+pub const HEAP_SIZE: usize = 40 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Block {

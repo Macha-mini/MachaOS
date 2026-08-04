@@ -53,6 +53,29 @@ impl Console {
         self.col = 0;
     }
 
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Reallocates the pixel buffer for a new cell grid size. Contents are
+    /// not preserved (this is a scrolling teletype, not a document with a
+    /// separate text model) — callers that own their own source of truth
+    /// (a line buffer, an in-progress prompt string, ...) should re-print
+    /// it after calling this.
+    pub fn resize(&mut self, cols: usize, rows: usize) {
+        self.cols = cols;
+        self.rows = rows;
+        self.row = 0;
+        self.col = 0;
+        let width = cols * font::GLYPH_WIDTH;
+        let height = rows * font::GLYPH_HEIGHT;
+        self.buffer = vec![self.bg; width * height];
+    }
+
     pub fn write_byte(&mut self, byte: u8) {
         match byte {
             b'\n' => {
@@ -66,8 +89,15 @@ impl Console {
             0x08 => {
                 if self.col > 0 {
                     self.col -= 1;
-                    self.draw_cell(self.col, self.row, b' ');
+                } else if self.row > 0 {
+                    // Undo the line wrap: back up onto the end of the
+                    // previous row rather than getting stuck at col 0.
+                    self.row -= 1;
+                    self.col = self.cols - 1;
+                } else {
+                    return;
                 }
+                self.draw_cell(self.col, self.row, b' ');
             }
             b'\t' => {
                 let n = 4 - (self.col % 4);

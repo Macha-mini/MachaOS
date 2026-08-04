@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod allocator;
+mod calculator;
 mod console;
 mod cpuid;
 mod desktop;
@@ -48,8 +49,8 @@ multiboot_header:
     .long 0x00000000   # bss_end_addr
     .long 0x00000000   # entry_addr
     .long 0x00000000   # mode_type = 0 (linear graphics), offset 32 per spec
-    .long 1024         # width
-    .long 768          # height
+    .long 1920         # width
+    .long 1080         # height
     .long 32           # depth
 
 .section .bss
