@@ -1,12 +1,91 @@
 use alloc::format;
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+use crate::sync::SpinLock;
 use crate::{ata, cpuid, fat, fat::FatError, interrupts, io, keyboard, mouse, multiboot, port, rtc, serial, task, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
+
+// Current working directory on the mounted disk (absolute, normalized).
+// Defaults to the filesystem root until the user runs `cd`.
+static CWD: SpinLock<String> = SpinLock::new(String::new());
+
+/// Returns the current working directory (always starts with `/`).
+pub fn cwd() -> String {
+    CWD.lock().clone()
+}
+
+fn set_cwd(path: &str) {
+    *CWD.lock() = path.to_string();
+}
+
+/// The prompt, showing the working directory when it is not the root.
+pub fn prompt() -> String {
+    let dir = cwd();
+    if dir == "/" {
+        String::from(PROMPT)
+    } else {
+        format!("machaos:{}> ", dir)
+    }
+}
+
+/// Collapses `.` and `..` and duplicate slashes in an absolute path.
+fn normalize_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name => parts.push(name),
+        }
+    }
+    let mut out = String::from("/");
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(part);
+    }
+    out
+}
+
+/// Resolves `path` against the current working directory.
+fn abs_path(path: &str) -> String {
+    if path.starts_with('/') {
+        normalize_path(path)
+    } else {
+        normalize_path(&format!("{}/{}", cwd(), path))
+    }
+}
+
+/// Splits a command line into arguments. Text inside double quotes is kept
+/// as a single argument (quotes are stripped, no escape sequences).
+fn tokenize(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    for c in line.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => {
+                if !current.is_empty() {
+                    tokens.push(core::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
 
 // Command names, for Tab completion in LineEditor. Kept in sync with the
 // match in `execute()` and the descriptions in `cmd_help()` by hand — if
@@ -20,7 +99,7 @@ pub const COMMANDS: &[&str] = &[
 pub fn run() -> ! {
     loop {
         vga::set_color(vga::colors::LIGHT_GREEN);
-        print!("{}", PROMPT);
+        print!("{}", prompt());
         vga::reset_color();
 
         let line = read_line();
@@ -28,8 +107,48 @@ pub fn run() -> ! {
     }
 }
 
+const HISTORY_CAPACITY: usize = 32;
+static FALLBACK_HISTORY: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
+
+fn redraw_line(line: &str, clear: usize) {
+    for _ in 0..clear {
+        vga::erase_char();
+        serial::write_byte(0x08);
+    }
+    for c in line.chars() {
+        vga::print_char(c as u8);
+        serial::write_byte(c as u8);
+    }
+}
+
+fn complete_fallback(line: &mut String) {
+    if line.is_empty() || line.contains(' ') {
+        return;
+    }
+    let matches: Vec<&str> =
+        COMMANDS.iter().copied().filter(|c| c.starts_with(line.as_str())).collect();
+    match matches.as_slice() {
+        [] => {}
+        [only] => {
+            let completion = &only[line.len()..];
+            for c in completion.chars() {
+                line.push(c);
+                vga::print_char(c as u8);
+                serial::write_byte(c as u8);
+            }
+        }
+        multiple => {
+            println!();
+            println!("{}", multiple.join("  "));
+            print!("{}{}", prompt(), line);
+        }
+    }
+}
+
 fn read_line() -> String {
     let mut line = String::new();
+    let mut browse: Option<usize> = None;
+    let mut draft = String::new();
     loop {
         while let Some(event) = keyboard::next_event() {
             match event {
@@ -39,32 +158,68 @@ fn read_line() -> String {
                         vga::print_char(c as u8);
                         serial::write_byte(c as u8);
                     }
+                    browse = None;
                 }
                 keyboard::Event::Backspace => {
                     if line.pop().is_some() {
                         vga::erase_char();
                         serial::write_byte(0x08);
                     }
+                    browse = None;
                 }
                 keyboard::Event::Enter => {
                     println!();
+                    {
+                        let mut history = FALLBACK_HISTORY.lock();
+                        if !line.is_empty() && history.last().map(String::as_str) != Some(&line) {
+                            if history.len() >= HISTORY_CAPACITY {
+                                history.remove(0);
+                            }
+                            history.push(line.clone());
+                        }
+                    }
                     return line;
                 }
                 keyboard::Event::Tab => {
-                    for _ in 0..4 {
-                        line.push(' ');
-                        vga::print_char(b' ');
-                        serial::write_byte(b' ');
+                    complete_fallback(&mut line);
+                    browse = None;
+                }
+                keyboard::Event::Up => {
+                    let history = FALLBACK_HISTORY.lock();
+                    if history.is_empty() {
+                        continue;
+                    }
+                    let next = match browse {
+                        None => {
+                            draft = line.clone();
+                            history.len() - 1
+                        }
+                        Some(i) => i.saturating_sub(1),
+                    };
+                    browse = Some(next);
+                    let entry = history[next].clone();
+                    drop(history);
+                    redraw_line(&entry, line.chars().count());
+                    line = entry;
+                }
+                keyboard::Event::Down => {
+                    if let Some(i) = browse {
+                        let history = FALLBACK_HISTORY.lock();
+                        let entry = if i + 1 < history.len() {
+                            browse = Some(i + 1);
+                            history[i + 1].clone()
+                        } else {
+                            browse = None;
+                            core::mem::take(&mut draft)
+                        };
+                        drop(history);
+                        redraw_line(&entry, line.chars().count());
+                        line = entry;
                     }
                 }
-                // History/cursor movement are GUI-only (LineEditor, used by
-                // the desktop's Terminal window); the plain VGA fallback
-                // shell doesn't support them.
-                keyboard::Event::Up
-                | keyboard::Event::Down
-                | keyboard::Event::Left
-                | keyboard::Event::Right
-                | keyboard::Event::Ctrl(_) => {}
+                // The plain VGA fallback shell has no cursor movement.
+                keyboard::Event::Left | keyboard::Event::Right => {}
+                keyboard::Event::Ctrl(_) => {}
             }
         }
         interrupts::halt();
@@ -77,9 +232,12 @@ pub fn execute(line: &str) {
         return;
     }
 
-    let mut words = line.split_whitespace();
-    let command = words.next().unwrap();
-    let args: Vec<&str> = words.collect();
+    let words = tokenize(line);
+    if words.is_empty() {
+        return;
+    }
+    let command = words[0].as_str();
+    let args: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
 
     match command {
         "help" => cmd_help(),
@@ -136,6 +294,8 @@ pub fn execute(line: &str) {
         "write" => cmd_write(&args),
         "mkdir" => cmd_mkdir(&args),
         "rm" => cmd_rm(&args),
+        "cd" => cmd_cd(&args),
+        "pwd" => println!("{}", cwd()),
         _ => println!("unknown command: '{}' (type 'help')", command),
     }
 }
@@ -160,13 +320,17 @@ fn cmd_help() {
     println!("  panic       trigger a kernel panic");
     println!("  mousetest   poll the PS/2 mouse for a few seconds");
     println!("  tasks       list scheduler tasks and their counters");
-    println!("  ls [path]   list files on the mounted disk");
+    println!("  ls [path]   list files (default: current directory)");
     println!("  cat <path>  print a file's contents");
     println!("  fatinfo     show mounted volume information");
     println!("  write <path> <text>");
     println!("               write text to a file (LFN supported)");
     println!("  mkdir <path> create a directory");
     println!("  rm <path>   remove a file or empty directory");
+    println!("  cd [path]   change directory (default: root, .. goes up)");
+    println!("  pwd         print the current directory");
+    println!("Paths may be relative to the current directory; quote arguments");
+    println!("containing spaces: write notes.txt \"hello world\"");
 }
 
 fn cmd_date() {
@@ -178,8 +342,12 @@ fn cmd_date() {
 }
 
 fn cmd_ls(args: &[&str]) {
-    let path = args.first().copied().unwrap_or("/");
-    match fat::list_dir(path) {
+    let path = if args.is_empty() {
+        cwd()
+    } else {
+        abs_path(&args.join(" "))
+    };
+    match fat::list_dir(&path) {
         Ok(entries) => {
             if entries.is_empty() {
                 println!("(empty)");
@@ -193,7 +361,7 @@ fn cmd_ls(args: &[&str]) {
                 }
             }
         }
-        Err(e) => println!("ls: {}", e),
+        Err(e) => println!("ls: {}: {}", path, e),
     }
 }
 
@@ -203,8 +371,8 @@ fn cmd_cat(args: &[&str]) {
         return;
     }
     // The shell splits on whitespace, so a path containing spaces must be
-    // reassembled here.
-    let path = args.join(" ");
+    // reassembled here (or quoted: cat "hello world.txt").
+    let path = abs_path(&args.join(" "));
     match fat::read_file(&path) {
         Ok(data) => {
             let text: alloc::string::String = data
@@ -216,7 +384,7 @@ fn cmd_cat(args: &[&str]) {
                 println!();
             }
         }
-        Err(e) => println!("cat: {}", e),
+        Err(e) => println!("cat: {}: {}", path, e),
     }
 }
 
@@ -225,11 +393,13 @@ fn cmd_write(args: &[&str]) {
         println!("usage: write <path> <text>");
         return;
     }
-    // Reassemble the text: the shell splits on whitespace.
+    // Reassemble the text: the shell splits on whitespace unless it is
+    // quoted (write hello.txt "hello world").
     let text = args[1..].join(" ");
-    match fat::write_file(args[0], text.as_bytes()) {
-        Ok(()) => println!("wrote {} bytes to {}", text.len(), args[0]),
-        Err(e) => println!("write: {}", e),
+    let path = abs_path(args[0]);
+    match fat::write_file(&path, text.as_bytes()) {
+        Ok(()) => println!("wrote {} bytes to {}", text.len(), path),
+        Err(e) => println!("write: {}: {}", path, e),
     }
 }
 
@@ -238,10 +408,10 @@ fn cmd_mkdir(args: &[&str]) {
         println!("usage: mkdir <path>");
         return;
     }
-    let path = args.join(" ");
+    let path = abs_path(&args.join(" "));
     match fat::make_dir(&path) {
         Ok(()) => println!("created directory {}", path),
-        Err(e) => println!("mkdir: {}", e),
+        Err(e) => println!("mkdir: {}: {}", path, e),
     }
 }
 
@@ -250,10 +420,24 @@ fn cmd_rm(args: &[&str]) {
         println!("usage: rm <path>");
         return;
     }
-    let path = args.join(" ");
+    let path = abs_path(&args.join(" "));
     match fat::remove(&path) {
         Ok(()) => println!("removed {}", path),
-        Err(e) => println!("rm: {}", e),
+        Err(e) => println!("rm: {}: {}", path, e),
+    }
+}
+
+fn cmd_cd(args: &[&str]) {
+    // No argument: back to the root. Quoted paths may contain spaces.
+    let target = if args.is_empty() {
+        String::from("/")
+    } else {
+        abs_path(&args.join(" "))
+    };
+    match fat::is_dir(&target) {
+        Ok(true) => set_cwd(&target),
+        Ok(false) => println!("cd: {}: not a directory", target),
+        Err(e) => println!("cd: {}: {}", target, e),
     }
 }
 
@@ -530,6 +714,31 @@ pub fn selftest() -> ! {
         );
     }
 
+    // Shell path handling: cd/pwd, `..`, and relative access.
+    execute("cd /docs");
+    if cwd() != "/docs" {
+        selftest_fail("cd /docs did not update cwd");
+    }
+    execute("pwd");
+    execute("ls");
+    execute("cat readme.txt"); // relative to cwd
+    execute("cd ..");
+    if cwd() != "/" {
+        selftest_fail("cd .. did not return to the root");
+    }
+    execute("pwd");
+    println!("[OK] shell cd/pwd and relative paths");
+
+    // Quoting: a double-quoted argument keeps embedded spaces whole.
+    execute("write /qt.txt \"hello world from quotes\"");
+    match fat::read_file("/qt.txt") {
+        Ok(data) if data == b"hello world from quotes" => {
+            println!("[OK] shell quoting keeps spaces in one argument")
+        }
+        _ => selftest_fail("shell quoting mismatch"),
+    }
+    execute("rm /qt.txt");
+
     // Physical memory manager: allocate two frames, scribble on the
     // first, free both, then confirm the first allocation hands the
     // same frame back (a full alloc/free round trip).
@@ -608,8 +817,6 @@ fn selftest_fail(reason: &str) -> ! {
 /// window has focus, since (unlike `read_line`'s blocking loop) it must
 /// keep returning control so the compositor and other windows keep
 /// running between keystrokes.
-const HISTORY_CAPACITY: usize = 32;
-
 pub struct LineEditor {
     line: String,
     history: Vec<String>,
@@ -701,7 +908,7 @@ impl LineEditor {
             multiple => {
                 println!();
                 println!("{}", multiple.join("  "));
-                print!("{}{}", PROMPT, self.line);
+                print!("{}{}", prompt(), self.line);
             }
         }
     }

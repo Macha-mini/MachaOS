@@ -804,3 +804,17 @@ pub fn remove(path: &str) -> Result<(), FatError> {
     let fat = guard.as_mut().ok_or(FatError::NoDisk)?;
     fat.remove_impl(path)
 }
+
+/// Returns whether `path` exists and is a directory. `/` is a directory.
+pub fn is_dir(path: &str) -> Result<bool, FatError> {
+    let guard = MOUNTED.lock();
+    let fat = guard.as_ref().ok_or(FatError::NoDisk)?;
+    if path == "/" {
+        return Ok(true);
+    }
+    let (parent, name) = fat.resolve_parent(path)?;
+    match fat.find_dir_entry(parent, &name) {
+        Some(entry) => Ok(entry.is_dir),
+        None => Err(FatError::NotFound),
+    }
+}

@@ -187,7 +187,7 @@ impl WindowManager {
 
         if let AppKind::Terminal { console, .. } = &mut manager.windows[3].kind {
             io::set_console_sink(Some(console));
-            print!("{}", shell::PROMPT);
+            print!("{}", shell::prompt());
             io::set_console_sink(None);
         }
 
@@ -214,7 +214,7 @@ impl WindowManager {
                 io::set_console_sink(Some(console));
                 if let Feed::Line(line) = editor.feed(event) {
                     shell::execute(&line);
-                    print!("{}", shell::PROMPT);
+                    print!("{}", shell::prompt());
                 }
                 io::set_console_sink(None);
             }
@@ -442,7 +442,7 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
         AppKind::Terminal { console, editor } => {
             console.resize(cols, rows);
             io::set_console_sink(Some(console));
-            print!("{}{}", shell::PROMPT, editor.current_line());
+            print!("{}{}", shell::prompt(), editor.current_line());
             io::set_console_sink(None);
         }
         AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {

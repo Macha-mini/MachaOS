@@ -87,6 +87,8 @@ text-mode fallback). Available commands: `help`, `clear`/`cls`, `echo`,
 `reboot`, `shutdown`, `crash`, `breakpoint`, `fault`, `panic`, `mousetest`,
 `tasks` (lists scheduler tasks and their background counters), and the
 filesystem commands `ls [path]`, `cat <path>`, `write <path> <text>`,
-`mkdir <path>`, `rm <path>`, and `fatinfo`. Up/Down recall command history
-and Tab completes command names (Terminal window only — the text-mode
-fallback shell doesn't support these).
+`mkdir <path>`, `rm <path>`, `fatinfo`, `cd [path]`, and `pwd`. Paths may
+be relative to the current directory (the prompt shows it), and arguments
+containing spaces can be double-quoted: `write notes.txt "hello world"`.
+Up/Down recall command history and Tab completes command names (in both
+the Terminal window and the text-mode fallback shell).
