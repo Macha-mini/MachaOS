@@ -45,14 +45,21 @@
 //! - A real dynamically-linked glibc binary (tested against GNU Hello +
 //!   a real `ld.so`/`libc.so.6` pair — see the Phase 4 commit and
 //!   `shell.rs`'s selftest hook) doesn't run to completion yet: `ld.so`
-//!   gets through opening/reading `libc.so.6` and into symbol version
-//!   processing, then faults, without ever calling `mmap` on that fd —
-//!   so something in between (most likely `.dynamic`/version-section
-//!   parsing reading data this kernel didn't supply correctly) is still
-//!   missing or wrong. Testing against that real binary is exactly what
-//!   found and fixed the AT_PHDR/`pread64`/`AT_EMPTY_PATH`/stack-buffer
+//!   opens `libc.so.6`, `pread64`s its program headers (verified via
+//!   tracing to return the correct byte count) and `fstat`s it (verified
+//!   to report the correct real file size), then goes straight into
+//!   symbol version processing and faults — without ever calling `mmap`
+//!   on that fd to actually load its segments. Metadata about the file
+//!   is reaching `ld.so` correctly, but whatever `ld.so` does with that
+//!   metadata between "headers parsed" and "map the PT_LOAD segments" is
+//!   still going wrong in a way this kernel's own tracing can't see
+//!   further into without instrumenting `ld.so`'s disassembly directly.
+//!   Testing against that real binary is exactly what found and fixed
+//!   the AT_PHDR/`pread64`/`AT_EMPTY_PATH`/stack-buffer/`access`(21)
 //!   bugs the rest of this file's history documents; this is the next
-//!   one, left for follow-up rather than resolved here.
+//!   one, left for follow-up rather than resolved here — consistent
+//!   with this plan's own framing of Phase 4 as roadmap-level rigor
+//!   rather than Phase 1/2's full-completion bar.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -98,6 +105,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_CLOSE: u64 = 3;
 const SYS_FSTAT: u64 = 5;
 const SYS_LSEEK: u64 = 8;
+const SYS_ACCESS: u64 = 21;
 const SYS_PREAD64: u64 = 17;
 const SYS_MMAP: u64 = 9;
 const SYS_MPROTECT: u64 = 10;
@@ -256,6 +264,23 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
     let vfs_flags = translate_open_flags(flags);
     match vfs::FileHandle::open(&path, vfs_flags) {
         Ok(handle) => with_process(|p| p.alloc_fd(handle) as u64).unwrap_or(err(EBADF)),
+        Err(e) => vfs_err(e),
+    }
+}
+
+/// `access(pathname, mode)`: this kernel doesn't track file permissions
+/// (`mode`, beyond `F_OK`) meaningfully, so this only ever checks
+/// existence — `ld.so` uses `access` for a handful of legacy tunable
+/// files (e.g. `/etc/ld.so.nohwcap`) that are expected to usually not
+/// exist; ENOENT is the normal, successful-probe answer there, not a
+/// failure.
+fn sys_access(pathname: u64, _mode: u64) -> u64 {
+    let Some(path) = read_cstr(pathname, 256) else {
+        return err(EFAULT);
+    };
+    let path = normalize_path(&path);
+    match vfs::FileHandle::open(&path, 0) {
+        Ok(_) => 0,
         Err(e) => vfs_err(e),
     }
 }
@@ -640,6 +665,7 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_CLOSE => sys_close(arg1),
         SYS_FSTAT => sys_fstat(arg1, arg2),
         SYS_LSEEK => sys_lseek(arg1, arg2, arg3),
+        SYS_ACCESS => sys_access(arg1, arg2),
         SYS_PREAD64 => sys_pread64(arg1, arg2, arg3, arg4),
         SYS_MMAP => sys_mmap(arg1, arg2, arg3, arg4, arg5, arg6),
         SYS_MPROTECT => sys_mprotect(arg1, arg2, arg3),
@@ -663,6 +689,11 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_PRLIMIT64 => sys_prlimit64(arg1, arg2, arg3, arg4),
         SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(arg1, arg2, arg3),
         SYS_SYSINFO => sys_sysinfo(arg1),
-        _ => err(ENOSYS),
+        _ => {
+            let mut buf = [0u8; 64];
+            let msg = crate::io::sprint(&mut buf, format_args!("[UNKSYSCALL] num={}\n", num));
+            crate::io::exception_print(msg);
+            err(ENOSYS)
+        }
     }
 }
