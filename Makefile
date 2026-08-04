@@ -8,9 +8,13 @@ GRUB_CFG ?= boot/grub/grub.cfg
 ISO_DIR := target/machaos-iso
 ISO := target/machaos.iso
 DISK := target/disk.img
+WALLPAPER_SRC := himawari.png
+WALLPAPER := target/wallpaper.raw
+WALLPAPER_W := 1920
+WALLPAPER_H := 1080
 TEST_LOG := /tmp/machaos-selftest.log
 
-.PHONY: all build gen user iso disk run run-nographic test clean
+.PHONY: all build gen user iso disk wallpaper run run-nographic test clean
 
 all: build
 
@@ -37,7 +41,15 @@ iso: build
 	cp $(GRUB_CFG) $(ISO_DIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(ISO) $(ISO_DIR)
 
-disk:
+# Converts the source wallpaper image into the raw 0x00RRGGBB pixel dump
+# wm.rs loads from disk (see tools/gen_wallpaper.py). Only regenerated
+# when the source image or the converter script changes.
+$(WALLPAPER): $(WALLPAPER_SRC) tools/gen_wallpaper.py
+	python3 tools/gen_wallpaper.py $(WALLPAPER_SRC) $(WALLPAPER) $(WALLPAPER_W) $(WALLPAPER_H)
+
+wallpaper: $(WALLPAPER)
+
+disk: wallpaper
 	@test -n "$$(command -v mkfs.fat)" || (echo "dosfstools (mkfs.fat) is required: brew install dosfstools"; exit 1)
 	dd if=/dev/zero of=$(DISK) bs=1m count=64 2>/dev/null
 	mkfs.fat -F 32 $(DISK)
@@ -50,6 +62,7 @@ disk:
 	mmd -i $(DISK) ::/bin
 	mcopy -i $(DISK) target/user-exit.elf ::/bin/prog_exit.elf
 	mcopy -i $(DISK) target/user-fault.elf ::/bin/prog_fault.elf
+	mcopy -i $(DISK) $(WALLPAPER) ::/wallpaper.raw
 	rm -f target/fixture.txt target/fixture2.txt
 
 run: iso disk

@@ -28,6 +28,7 @@ const TITLE_BAR_HEIGHT: u32 = 20;
 const TASKBAR_HEIGHT: u32 = 28;
 const CLOSE_BUTTON_SIZE: u32 = 14;
 const MINIMIZE_BUTTON_SIZE: u32 = 14;
+const MAXIMIZE_BUTTON_SIZE: u32 = 14;
 const RESIZE_GRIP_SIZE: u32 = 12;
 const MIN_COLS: usize = 20;
 const MIN_ROWS: usize = 5;
@@ -47,6 +48,7 @@ const TASKBAR_BUTTON: u32 = 0x00_263340;
 const TASKBAR_BUTTON_MINIMIZED: u32 = 0x00_18222C;
 const CLOSE_BUTTON_COLOR: u32 = 0x00_B33A3A;
 const MINIMIZE_BUTTON_COLOR: u32 = 0x00_4A4A2E;
+const MAXIMIZE_BUTTON_COLOR: u32 = 0x00_2F5C55;
 const RESIZE_GRIP_COLOR: u32 = 0x00_6E7C8C;
 const CONSOLE_FG: u32 = 0x00_E0E0E0;
 const CONSOLE_BG: u32 = 0x00_10161C;
@@ -72,6 +74,30 @@ enum LauncherAction {
     RunElf(String),
 }
 
+/// Identifies one of the launcher's built-in, "singleton-ish" apps, so
+/// closing one and reopening it from the launcher can restore where it
+/// was last left. Windows spawned by `run <elf>` (dynamic titles) don't
+/// get a slot here — there's no natural single "last position" for an
+/// arbitrary disk program you might launch many copies of.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppId {
+    Terminal,
+    Calculator,
+    Notepad,
+    SysInfo,
+}
+
+const APP_ID_COUNT: usize = 4;
+
+#[derive(Clone, Copy)]
+struct RememberedWindow {
+    x: i32,
+    y: i32,
+    cols: usize,
+    rows: usize,
+    maximized: bool,
+}
+
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
@@ -85,7 +111,12 @@ pub struct Window {
     pub y: i32,
     pub open: bool,
     pub minimized: bool,
+    pub maximized: bool,
     pub resizable: bool,
+    app_id: Option<AppId>,
+    // (x, y, cols, rows) from just before maximizing; restored on
+    // un-maximize. Only ever `Some` while `maximized` is true.
+    restore_geometry: Option<(i32, i32, usize, usize)>,
     pub kind: AppKind,
 }
 
@@ -105,6 +136,18 @@ impl Window {
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => console.pixels(),
             AppKind::Calculator(app) => app.pixels(),
+        }
+    }
+
+    /// Cell dimensions for the console-backed kinds; `(0, 0)` for
+    /// `Calculator`, which has no grid (and is never resizable/maximizable
+    /// anyway, so this is never used for it in practice).
+    fn cols_rows(&self) -> (usize, usize) {
+        match &self.kind {
+            AppKind::Terminal { console, .. }
+            | AppKind::SysInfo { console }
+            | AppKind::Editor { console, .. } => (console.cols(), console.rows()),
+            AppKind::Calculator(_) => (0, 0),
         }
     }
 }
@@ -135,6 +178,15 @@ pub struct WindowManager {
     launcher_open: bool,
     launcher_items: Vec<(String, LauncherAction)>,
     spawn_counter: u32,
+    // Last known geometry of each built-in app, keyed by AppId, updated
+    // whenever such a window is closed. `spawn_window` consults this
+    // instead of the cascade position when relaunching that app.
+    remembered: [Option<RememberedWindow>; APP_ID_COUNT],
+    // Desktop background image, loaded from disk once at startup (see
+    // `load_wallpaper`). `None` when there's no FAT32 volume mounted, no
+    // /wallpaper.raw on it, or its size doesn't match the current mode —
+    // composite() falls back to the plain gradient fill in that case.
+    wallpaper: Option<Vec<u32>>,
 }
 
 impl WindowManager {
@@ -150,7 +202,10 @@ impl WindowManager {
             y: margin,
             open: true,
             minimized: false,
+            maximized: false,
             resizable: false,
+            app_id: Some(AppId::SysInfo),
+            restore_geometry: None,
             kind: AppKind::SysInfo { console: build_sysinfo_console() },
         };
 
@@ -160,7 +215,10 @@ impl WindowManager {
             y: margin,
             open: true,
             minimized: false,
+            maximized: false,
             resizable: false,
+            app_id: Some(AppId::Calculator),
+            restore_geometry: None,
             kind: AppKind::Calculator(CalculatorApp::new()),
         };
 
@@ -176,7 +234,10 @@ impl WindowManager {
             y: ey,
             open: true,
             minimized: false,
+            maximized: false,
             resizable: true,
+            app_id: Some(AppId::Notepad),
+            restore_geometry: None,
             kind: AppKind::Editor {
                 console: editor_console,
                 lines: editor_lines,
@@ -193,7 +254,10 @@ impl WindowManager {
             y: margin,
             open: true,
             minimized: false,
+            maximized: false,
             resizable: true,
+            app_id: Some(AppId::Terminal),
+            restore_geometry: None,
             kind: AppKind::Terminal {
                 console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
                 editor: LineEditor::new(),
@@ -214,6 +278,8 @@ impl WindowManager {
             launcher_open: false,
             launcher_items: Vec::new(),
             spawn_counter: 0,
+            remembered: [None; APP_ID_COUNT],
+            wallpaper: load_wallpaper(screen_w, screen_h),
         };
 
         if let AppKind::Terminal { console, .. } = &mut manager.windows[3].kind {
@@ -238,9 +304,30 @@ impl WindowManager {
     /// Adds a new window (or reuses a closed one's slot, so repeatedly
     /// launching and closing apps from the launcher doesn't grow the
     /// window list forever), raises and focuses it, and returns its index.
-    fn spawn_window(&mut self, title: &'static str, resizable: bool, kind: AppKind) -> usize {
-        let (x, y) = self.next_spawn_position();
-        let window = Window { title, x, y, open: true, minimized: false, resizable, kind };
+    ///
+    /// If `app_id` has a remembered geometry (it was open before, at some
+    /// point, and got closed), the window reopens at that position/size
+    /// instead of a fresh cascade position — nudged aside if something
+    /// else already occupies that spot. Otherwise it cascades as before.
+    fn spawn_window(&mut self, title: &'static str, resizable: bool, app_id: Option<AppId>, kind: AppKind) -> usize {
+        let remembered = app_id.and_then(|id| self.remembered[id as usize]);
+        let (base_x, base_y) = match remembered {
+            Some(r) => (r.x, r.y),
+            None => self.next_spawn_position(),
+        };
+        let (x, y) = self.avoid_overlap(base_x, base_y);
+        let window = Window {
+            title,
+            x,
+            y,
+            open: true,
+            minimized: false,
+            maximized: false,
+            resizable,
+            app_id,
+            restore_geometry: None,
+            kind,
+        };
         let index = if let Some(slot) = self.windows.iter().position(|w| !w.open) {
             self.windows[slot] = window;
             slot
@@ -249,6 +336,15 @@ impl WindowManager {
             self.windows.len() - 1
         };
         self.raise(index);
+
+        if let Some(r) = remembered {
+            let cols = r.cols.max(MIN_COLS);
+            let rows = r.rows.max(MIN_ROWS);
+            resize_window(&mut self.windows[index], cols, rows);
+            if r.maximized {
+                self.maximize_window(index);
+            }
+        }
         index
     }
 
@@ -263,12 +359,92 @@ impl WindowManager {
         (x, y)
     }
 
+    /// Nudges `(x, y)` diagonally while some other open, non-minimized
+    /// window's top-left corner is within a few pixels of it, so a
+    /// restored or cascaded window doesn't land exactly on top of one
+    /// that's already there. Bounded so it can never loop forever.
+    fn avoid_overlap(&self, mut x: i32, mut y: i32) -> (i32, i32) {
+        let max_x = self.screen_w as i32 - 260;
+        let max_y = self.screen_h as i32 - TASKBAR_HEIGHT as i32 - 260;
+        for _ in 0..20 {
+            let collides = self
+                .windows
+                .iter()
+                .any(|w| w.open && !w.minimized && (w.x - x).abs() < 24 && (w.y - y).abs() < 24);
+            if !collides {
+                break;
+            }
+            x = (x + 28).clamp(0, max_x.max(0));
+            y = (y + 28).clamp(0, max_y.max(0));
+        }
+        (x, y)
+    }
+
     fn start_button_hit(&self) -> bool {
         let y = self.screen_h as i32 - TASKBAR_HEIGHT as i32;
         self.cursor_x >= 8
             && self.cursor_x < 8 + START_BUTTON_WIDTH as i32
             && self.cursor_y >= y + 4
             && self.cursor_y < y + TASKBAR_HEIGHT as i32 - 4
+    }
+
+    /// The cell grid a maximized window should fill: the whole screen
+    /// width, minus the taskbar and title bar heights.
+    fn max_content_cells(&self) -> (usize, usize) {
+        let max_w = self.screen_w;
+        let max_h = self.screen_h - TASKBAR_HEIGHT - TITLE_BAR_HEIGHT;
+        ((max_w / font::GLYPH_WIDTH as u32) as usize, (max_h / font::GLYPH_HEIGHT as u32) as usize)
+    }
+
+    fn maximize_window(&mut self, index: usize) {
+        let window = &self.windows[index];
+        if !window.resizable || window.maximized {
+            return;
+        }
+        let (cols, rows) = window.cols_rows();
+        self.windows[index].restore_geometry = Some((window.x, window.y, cols, rows));
+        self.windows[index].x = 0;
+        self.windows[index].y = 0;
+        self.windows[index].maximized = true;
+        let (max_cols, max_rows) = self.max_content_cells();
+        resize_window(&mut self.windows[index], max_cols, max_rows);
+    }
+
+    fn unmaximize_window(&mut self, index: usize) {
+        let window = &mut self.windows[index];
+        if !window.maximized {
+            return;
+        }
+        window.maximized = false;
+        if let Some((x, y, cols, rows)) = window.restore_geometry.take() {
+            window.x = x;
+            window.y = y;
+            resize_window(window, cols, rows);
+        }
+    }
+
+    /// Records a window's current geometry as "where this app was last
+    /// left", so the launcher restores it there next time. No-op for
+    /// windows without an `app_id` (e.g. `run`-launched programs, which
+    /// have no single natural "last position"). If the window is
+    /// currently maximized, its pre-maximize geometry is remembered
+    /// instead (along with the fact that it was maximized), so reopening
+    /// it maximizes it again rather than reopening at the stale
+    /// full-screen bounds.
+    fn remember_geometry(&mut self, index: usize) {
+        let window = &self.windows[index];
+        let Some(id) = window.app_id else { return };
+        let remembered = if window.maximized {
+            window
+                .restore_geometry
+                .map(|(x, y, cols, rows)| RememberedWindow { x, y, cols, rows, maximized: true })
+        } else {
+            let (cols, rows) = window.cols_rows();
+            Some(RememberedWindow { x: window.x, y: window.y, cols, rows, maximized: false })
+        };
+        if let Some(r) = remembered {
+            self.remembered[id as usize] = Some(r);
+        }
     }
 
     fn launcher_popup_rect(&self) -> (i32, i32, u32, u32) {
@@ -324,6 +500,7 @@ impl WindowManager {
                 let idx = self.spawn_window(
                     "Terminal",
                     true,
+                    Some(AppId::Terminal),
                     AppKind::Terminal {
                         console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
                         editor: LineEditor::new(),
@@ -336,7 +513,12 @@ impl WindowManager {
                 }
             }
             LauncherAction::Calculator => {
-                self.spawn_window("Calculator", false, AppKind::Calculator(CalculatorApp::new()));
+                self.spawn_window(
+                    "Calculator",
+                    false,
+                    Some(AppId::Calculator),
+                    AppKind::Calculator(CalculatorApp::new()),
+                );
             }
             LauncherAction::Notepad => {
                 let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
@@ -347,17 +529,24 @@ impl WindowManager {
                 self.spawn_window(
                     "Notepad",
                     true,
+                    Some(AppId::Notepad),
                     AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status },
                 );
             }
             LauncherAction::SysInfo => {
-                self.spawn_window("System Info", false, AppKind::SysInfo { console: build_sysinfo_console() });
+                self.spawn_window(
+                    "System Info",
+                    false,
+                    Some(AppId::SysInfo),
+                    AppKind::SysInfo { console: build_sysinfo_console() },
+                );
             }
             LauncherAction::RunElf(path) => {
                 let title: &'static str = alloc::boxed::Box::leak(format!("Terminal: {}", path).into_boxed_str());
                 let idx = self.spawn_window(
                     title,
                     true,
+                    None,
                     AppKind::Terminal {
                         console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
                         editor: LineEditor::new(),
@@ -522,8 +711,9 @@ impl WindowManager {
             let (content_w, content_h) = window.content_size();
             let (wx, wy) = (window.x, window.y);
             let resizable = window.resizable;
+            let maximized = window.maximized;
 
-            if resizable {
+            if resizable && !maximized {
                 let grip_x = wx + content_w as i32 - RESIZE_GRIP_SIZE as i32;
                 let grip_y = wy + TITLE_BAR_HEIGHT as i32 + content_h as i32 - RESIZE_GRIP_SIZE as i32;
                 if self.cursor_x >= grip_x
@@ -545,13 +735,25 @@ impl WindowManager {
                 && self.cursor_y >= wy
                 && self.cursor_y < wy + TITLE_BAR_HEIGHT as i32;
             if in_title {
-                let close_x = wx + content_w as i32 - CLOSE_BUTTON_SIZE as i32 - 3;
-                let minimize_x = close_x - MINIMIZE_BUTTON_SIZE as i32 - 6;
+                let (minimize_x, maximize_x, close_x) = title_button_positions(wx, content_w, resizable);
 
                 if self.cursor_x >= close_x && self.cursor_x < close_x + CLOSE_BUTTON_SIZE as i32 {
+                    self.remember_geometry(i);
                     self.windows[i].open = false;
                     self.refocus_after_hide(i);
                     return;
+                }
+                if let Some(max_x) = maximize_x {
+                    if self.cursor_x >= max_x && self.cursor_x < max_x + MAXIMIZE_BUTTON_SIZE as i32 {
+                        self.raise(i);
+                        let focused_index = self.focused;
+                        if maximized {
+                            self.unmaximize_window(focused_index);
+                        } else {
+                            self.maximize_window(focused_index);
+                        }
+                        return;
+                    }
                 }
                 if self.cursor_x >= minimize_x && self.cursor_x < minimize_x + MINIMIZE_BUTTON_SIZE as i32 {
                     self.windows[i].minimized = true;
@@ -561,10 +763,18 @@ impl WindowManager {
 
                 self.raise(i);
                 let focused_index = self.focused;
+                if maximized {
+                    // Picking up a maximized window by its title bar
+                    // restores it first, so the drag starts from (and
+                    // follows) its normal size rather than dragging the
+                    // whole full-screen window around.
+                    self.unmaximize_window(focused_index);
+                }
+                let (wx2, wy2) = (self.windows[focused_index].x, self.windows[focused_index].y);
                 self.dragging = Some(DragState {
                     window_index: focused_index,
-                    offset_x: self.cursor_x - wx,
-                    offset_y: self.cursor_y - wy,
+                    offset_x: self.cursor_x - wx2,
+                    offset_y: self.cursor_y - wy2,
                 });
                 return;
             }
@@ -586,7 +796,10 @@ impl WindowManager {
 
     pub fn composite(&self) {
         fb::with_surface(|surface| {
-            gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM);
+            match &self.wallpaper {
+                Some(pixels) => gfx::blit(surface, 0, 0, pixels, self.screen_w, self.screen_h),
+                None => gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM),
+            }
             for (i, window) in self.windows.iter().enumerate() {
                 if window.open && !window.minimized {
                     draw_window(surface, window, i == self.focused);
@@ -818,6 +1031,17 @@ fn taskbar_label_width(title: &str) -> i32 {
     (title.len() * font::GLYPH_WIDTH + 12) as i32
 }
 
+/// (minimize_x, maximize_x, close_x) in screen coordinates. `maximize_x`
+/// is `None` for non-resizable windows, which don't get a maximize
+/// button at all — shared between hit-testing and drawing so they can
+/// never disagree about where the buttons are.
+fn title_button_positions(wx: i32, content_w: u32, resizable: bool) -> (i32, Option<i32>, i32) {
+    let close_x = wx + content_w as i32 - CLOSE_BUTTON_SIZE as i32 - 3;
+    let maximize_x = if resizable { Some(close_x - MAXIMIZE_BUTTON_SIZE as i32 - 6) } else { None };
+    let minimize_x = maximize_x.unwrap_or(close_x) - MINIMIZE_BUTTON_SIZE as i32 - 6;
+    (minimize_x, maximize_x, close_x)
+}
+
 fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool) {
     let (content_w, content_h) = window.content_size();
     let x = window.x as u32;
@@ -839,17 +1063,30 @@ fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool) {
     }
     gfx::draw_string(surface, x + 4, y + 6, window.title, 0x00_FFFFFF, None);
 
-    let close_x = x + content_w - CLOSE_BUTTON_SIZE - 3;
-    gfx::fill_rect(surface, close_x, y + 3, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_COLOR);
-    gfx::draw_string(surface, close_x + 3, y + 4, "x", 0x00_FFFFFF, None);
+    let (minimize_x, maximize_x, close_x) = title_button_positions(window.x, content_w, window.resizable);
 
-    let minimize_x = close_x - MINIMIZE_BUTTON_SIZE - 6;
+    gfx::fill_rect(surface, close_x as u32, y + 3, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_COLOR);
+    gfx::draw_string(surface, close_x as u32 + 3, y + 4, "x", 0x00_FFFFFF, None);
+
+    if let Some(max_x) = maximize_x {
+        let max_x = max_x as u32;
+        gfx::fill_rect(surface, max_x, y + 3, MAXIMIZE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, MAXIMIZE_BUTTON_COLOR);
+        // A small square outline reads as "maximize" without needing a
+        // dedicated glyph in the 8x8 font.
+        let (ix, iy, is) = (max_x + 4, y + 6, 6u32);
+        gfx::fill_rect(surface, ix, iy, is, 1, 0x00_FFFFFF);
+        gfx::fill_rect(surface, ix, iy + is - 1, is, 1, 0x00_FFFFFF);
+        gfx::fill_rect(surface, ix, iy, 1, is, 0x00_FFFFFF);
+        gfx::fill_rect(surface, ix + is - 1, iy, 1, is, 0x00_FFFFFF);
+    }
+
+    let minimize_x = minimize_x as u32;
     gfx::fill_rect(surface, minimize_x, y + 3, MINIMIZE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, MINIMIZE_BUTTON_COLOR);
     gfx::draw_string(surface, minimize_x + 3, y + 4, "_", 0x00_FFFFFF, None);
 
     gfx::blit(surface, x, y + TITLE_BAR_HEIGHT, window.content_pixels(), content_w, content_h);
 
-    if window.resizable {
+    if window.resizable && !window.maximized {
         let grip_x = x + content_w - RESIZE_GRIP_SIZE;
         let grip_y = y + TITLE_BAR_HEIGHT + content_h - RESIZE_GRIP_SIZE;
         gfx::fill_rect(surface, grip_x, grip_y, RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE, RESIZE_GRIP_COLOR);
@@ -888,6 +1125,23 @@ fn draw_cursor(surface: &mut dyn Surface, x: i32, y: i32) {
             }
         }
     }
+}
+
+/// Loads `/wallpaper.raw` (see `tools/gen_wallpaper.py`): `width*height`
+/// little-endian u32 pixels, row-major, no header. Returns `None` on any
+/// mismatch (no volume mounted, file missing, wrong size for the current
+/// mode) so the caller can fall back to the plain gradient background
+/// instead of showing a corrupted image.
+fn load_wallpaper(screen_w: u32, screen_h: u32) -> Option<Vec<u32>> {
+    if !fat::mounted() {
+        return None;
+    }
+    let bytes = fat::read_file("/wallpaper.raw").ok()?;
+    let expected_len = screen_w as usize * screen_h as usize * 4;
+    if bytes.len() != expected_len {
+        return None;
+    }
+    Some(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
 }
 
 fn build_sysinfo_console() -> Console {
