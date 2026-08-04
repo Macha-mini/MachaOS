@@ -30,6 +30,11 @@ const BG: u32 = 0x00_1B2A42;
 const TITLE: u32 = 0x00_2C5F9E;
 const TITLE_DIM: u32 = 0x00_45505C;
 const BORDER: u32 = 0x00_7FB2E5;
+const TASKBAR_H: i32 = 28;
+const TASKBAR_BG: u32 = 0x00_15202B;
+const TASKBAR_BUTTON: u32 = 0x00_263340;
+const TASKBAR_FOCUSED: u32 = 0x00_3C6EA8;
+const START_BG: u32 = 0x00_2F4A73;
 
 static mut FRAME: [u32; TILE_PIXELS] = [0; TILE_PIXELS];
 static mut WINDOW_PIXELS: [u32; MAX_WINDOW_PIXELS] = [0; MAX_WINDOW_PIXELS];
@@ -45,6 +50,12 @@ impl Surface for Screen {
 
 #[derive(Clone, Copy)]
 struct Window { pid: u64, x: i32, y: i32, width: u32, height: u32, focused: bool, title: [u8; 32], title_len: usize }
+
+fn fill_global(screen: &mut Screen, tile_y: i32, tile_height: i32, x: u32, y: i32, w: u32, h: u32, color: u32) {
+    let start = y.max(tile_y);
+    let end = (y + h as i32).min(tile_y + tile_height);
+    if end > start { gfx::fill_rect(screen, x, (start - tile_y) as u32, w, (end - start) as u32, color); }
+}
 
 fn decode_windows(buf: &[u8; MAX_WINDOWS * RECORD_SIZE], count: usize, out: &mut [Window; MAX_WINDOWS]) {
     for i in 0..count {
@@ -62,13 +73,14 @@ fn decode_windows(buf: &[u8; MAX_WINDOWS * RECORD_SIZE], count: usize, out: &mut
     }
 }
 
-fn compose_tile(windows: &[Window; MAX_WINDOWS], count: usize, tile_y: usize) {
+fn compose_tile(windows: &[Window; MAX_WINDOWS], count: usize, tile_y: usize, cursor: (i32, i32)) {
     // Initialize every pixel directly before drawing surfaces. This keeps a
     // dropped/empty window snapshot from exposing stale BSS pages in the
     // final framebuffer.
     unsafe { core::slice::from_raw_parts_mut(core::ptr::addr_of_mut!(FRAME) as *mut u32, TILE_PIXELS).fill(BG); }
     let mut screen = Screen { pixels: unsafe { &mut *core::ptr::addr_of_mut!(FRAME) } };
-    let tile_height = (SCREEN_H - tile_y).min(TILE_H);
+    let tile_y = tile_y as i32;
+    let tile_height = (SCREEN_H - tile_y as usize).min(TILE_H) as i32;
     for window in windows.iter().take(count) {
         let pixels = unsafe { &mut *core::ptr::addr_of_mut!(WINDOW_PIXELS) };
         let n = unsafe { common::syscall(SYS_WIN_READ, window.pid, pixels.as_mut_ptr() as u64, MAX_WINDOW_PIXELS as u64, 0) };
@@ -76,22 +88,40 @@ fn compose_tile(windows: &[Window; MAX_WINDOWS], count: usize, tile_y: usize) {
         let x = window.x.max(0) as u32;
         let y = window.y.max(0);
         let color = if window.focused { TITLE } else { TITLE_DIM };
-        let tile_y = tile_y as i32;
-        let rect = |screen: &mut Screen, x: u32, y: i32, w: u32, h: u32, color: u32| {
-            let start = y.max(tile_y);
-            let end = (y + h as i32).min(tile_y + tile_height as i32);
-            if end > start { gfx::fill_rect(screen, x, (start - tile_y) as u32, w, (end - start) as u32, color); }
-        };
-        rect(&mut screen, x.saturating_sub(1), y - 1, window.width + 2, window.height + TITLE_H + 2, BORDER);
-        rect(&mut screen, x, y, window.width, TITLE_H, color);
+        fill_global(&mut screen, tile_y, tile_height as i32, x.saturating_sub(1), y - 1, window.width + 2, window.height + TITLE_H + 2, BORDER);
+        fill_global(&mut screen, tile_y, tile_height as i32, x, y, window.width, TITLE_H, color);
         let title = core::str::from_utf8(&window.title[..window.title_len]).unwrap_or("");
         if y + 6 >= tile_y && y + 6 < tile_y + tile_height as i32 { gfx::draw_string(&mut screen, x + 4, (y + 6 - tile_y) as u32, title, 0x00_FFFFFF, None); }
-        rect(&mut screen, x + window.width.saturating_sub(18), y + 3, 14, 14, 0x00_B33A3A);
+        fill_global(&mut screen, tile_y, tile_height as i32, x + window.width.saturating_sub(18), y + 3, 14, 14, 0x00_B33A3A);
         if y + 6 >= tile_y && y + 6 < tile_y + tile_height as i32 { gfx::draw_string(&mut screen, x + window.width.saturating_sub(15), (y + 6 - tile_y) as u32, "x", 0x00_FFFFFF, None); }
         let content_y = y + TITLE_H as i32;
         let start = content_y.max(tile_y);
         let end = (content_y + window.height as i32).min(tile_y + tile_height as i32);
         for gy in start..end { for xx in 0..window.width { screen.put_pixel(x + xx, (gy - tile_y) as u32, pixels[((gy - content_y) as u32 * window.width + xx) as usize]); } }
+    }
+    let taskbar_y = SCREEN_H as i32 - TASKBAR_H;
+    fill_global(&mut screen, tile_y, tile_height as i32, 0, taskbar_y, SCREEN_W as u32, TASKBAR_H as u32, TASKBAR_BG);
+    fill_global(&mut screen, tile_y, tile_height as i32, 8, taskbar_y + 4, 90, 20, START_BG);
+    if taskbar_y + 8 >= tile_y && taskbar_y + 8 < tile_y + tile_height {
+        gfx::draw_string(&mut screen, 14, (taskbar_y + 8 - tile_y) as u32, "Apps", 0x00_FFFFFF, None);
+    }
+    let mut button_x = 108u32;
+    for window in windows.iter().take(count) {
+        let width = (window.title_len * 8 + 12).min(220) as u32;
+        fill_global(&mut screen, tile_y, tile_height as i32, button_x, taskbar_y + 4, width, 20, if window.focused { TASKBAR_FOCUSED } else { TASKBAR_BUTTON });
+        if taskbar_y + 8 >= tile_y && taskbar_y + 8 < tile_y + tile_height {
+            let title = core::str::from_utf8(&window.title[..window.title_len]).unwrap_or("");
+            gfx::draw_string(&mut screen, button_x + 6, (taskbar_y + 8 - tile_y) as u32, title, 0x00_FFFFFF, None);
+        }
+        button_x += width + 6;
+    }
+    if cursor.1 >= tile_y && cursor.1 < tile_y + tile_height {
+        let cy = cursor.1 - tile_y;
+        for row in 0..16i32 { for col in 0..10i32 {
+            if col <= row / 2 || (row > 8 && col <= 2) {
+                screen.put_pixel((cursor.0 + col).max(0) as u32, (cy + row).min(tile_height - 1) as u32, 0x00_FFFFFF);
+            }
+        }}
     }
     unsafe { common::syscall(SYS_FB_PRESENT_RECT, core::ptr::addr_of!(FRAME) as u64, 0, tile_y as u64, (SCREEN_W as u64) << 32 | tile_height as u64); }
 }
@@ -142,6 +172,6 @@ pub extern "C" fn _start() {
             if event[0] == 5 { handle_mouse(&event, &mut cursor, &windows, count); }
             else if event[0] == 0 || event[0] == 1 || event[0] == 2 || event[0] == 4 || (7..=11).contains(&event[0]) { forward_key(&event, &windows, count); }
         }
-        for tile_y in (0..SCREEN_H).step_by(TILE_H) { compose_tile(&windows, count, tile_y); }
+        for tile_y in (0..SCREEN_H).step_by(TILE_H) { compose_tile(&windows, count, tile_y, cursor); }
     }
 }
