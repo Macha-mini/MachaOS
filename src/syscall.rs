@@ -295,7 +295,16 @@ fn sys_recv(ptr: u64, maxlen: u64) -> u64 {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, _arg4: u64) -> u64 {
+extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
+    // A Linux-ABI process (see `process::Abi`) dispatches through an
+    // entirely separate syscall table/numbering/error convention
+    // (`linux_abi.rs`) instead of the native one below. `run_demo`'s
+    // caller isn't a process at all, so `current_process_abi` is `None`
+    // for it and it always falls through to the native table, same as
+    // today.
+    if crate::task::current_process_abi() == Some(crate::process::Abi::Linux) {
+        return crate::linux_abi::syscall_dispatch(num, arg1, arg2, arg3, arg4);
+    }
     match num {
         SYS_WRITE => sys_write(arg1, arg2, arg3),
         SYS_READ => sys_read(arg1, arg2, arg3),

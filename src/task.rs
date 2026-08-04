@@ -323,6 +323,14 @@ pub fn current_process_user_rsp() -> u64 {
         .user_rsp
 }
 
+/// Which syscall table the current task's process should dispatch
+/// through (`None` for a kernel task, which never issues a syscall in
+/// the first place). Used by `syscall::syscall_dispatch` to route
+/// between the native and Linux (`linux_abi.rs`) tables.
+pub fn current_process_abi() -> Option<crate::process::Abi> {
+    tasks()[CURRENT.load(Ordering::Relaxed)].process.as_ref().map(|p| p.abi)
+}
+
 /// The current task's CR3 (its own PML4), if it is a process — `None` for
 /// a kernel task. Used by `process::handle_fault` to map a new page into
 /// the *faulting* process's address space regardless of which task's

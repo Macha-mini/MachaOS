@@ -24,6 +24,7 @@ mod interrupts;
 mod io;
 mod isr_table;
 mod keyboard;
+mod linux_abi;
 mod mouse;
 mod multiboot;
 mod paint;

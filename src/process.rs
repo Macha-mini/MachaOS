@@ -99,6 +99,22 @@ pub enum ProcessState {
     Exited,
 }
 
+/// Which syscall table `syscall::syscall_dispatch` routes a process's
+/// syscalls to. `Native` is MachaOS's own 5-syscall ABI (`syscall.rs`);
+/// `Linux` is the (currently skeletal — see `linux_abi.rs`) Linux x86_64
+/// syscall layer this field exists to select. Independent of which
+/// initial-stack layout the process got (`setup_user_stack` vs
+/// `setup_linux_stack`): they're orthogonal today only because nothing
+/// but `spawn_linux_test` sets `Linux`, and it happens to also want the
+/// Linux-style stack — a real "run this as a Linux binary" entry point
+/// (Phase 2) would set both together, but there's no requirement that
+/// they always match.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Abi {
+    Native,
+    Linux,
+}
+
 pub struct Process {
     pub entry: usize,
     /// Initial ring-3 stack pointer (see `setup_user_stack`).
@@ -122,6 +138,8 @@ pub struct Process {
     /// `USER_STACK_BASE` and moves down as `try_grow_stack` maps more of
     /// the reserved growth region below it.
     stack_low: u64,
+    /// Which syscall table this process's syscalls dispatch to. See `Abi`.
+    pub(crate) abi: Abi,
 }
 
 impl Process {
@@ -283,6 +301,7 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         inbox: None,
         fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
         stack_low: USER_STACK_BASE,
+        abi: Abi::Native,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -304,14 +323,17 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
     Ok(task::spawn_process(process_entry_trampoline, name, pml4, process))
 }
 
-/// Test-only entry point for the Linux-style initial stack layout
-/// (`setup_linux_stack`): otherwise identical to `spawn`, but builds an
-/// argv/envp/auxv stack instead of the native ABI's single "return to
-/// the exit trampoline" slot. Not wired to any Linux syscall dispatch
-/// (that's Phase 2's job) — this exists so the stack layout itself can
-/// be built and verified against a real program reading it back
-/// (`user/src/bin/prog_linux_stack.rs`), independent of the syscall
-/// table that will eventually launch real Linux binaries this way.
+/// Test-only entry point for the Linux ABI groundwork: otherwise
+/// identical to `spawn`, but builds an argv/envp/auxv stack
+/// (`setup_linux_stack`) instead of the native ABI's single "return to
+/// the exit trampoline" slot, and routes the process's syscalls through
+/// the (currently skeletal — see `linux_abi.rs`) Linux syscall table
+/// instead of the native one (`Abi::Linux`). Not wired to any real ELF
+/// launch path (that's Phase 2's job, once `linux_abi.rs` has enough
+/// syscalls implemented to run something) — this exists so the stack
+/// layout and dispatch-routing mechanism can each be built and verified
+/// now against real test programs
+/// (`user/src/bin/prog_linux_stack.rs`, `prog_linux_syscall.rs`).
 pub fn spawn_linux_test(
     elf_bytes: &[u8],
     name: &'static str,
@@ -332,6 +354,7 @@ pub fn spawn_linux_test(
         inbox: None,
         fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
         stack_low: USER_STACK_BASE,
+        abi: Abi::Linux,
     };
 
     let pml4 = match build_address_space(&mut process) {

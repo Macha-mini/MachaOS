@@ -970,6 +970,25 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2d: Linux syscall dispatch routing.
+    // `process::Abi::Linux` (also set by `spawn_linux_test`) makes
+    // `syscall::syscall_dispatch` route to `linux_abi::syscall_dispatch`
+    // instead of the native table; the embedded ELF calls Linux syscall
+    // 39 (getpid, wired up for real in the skeleton) and an unrecognized
+    // number, checking the second comes back as `-ENOSYS` per the real
+    // Linux errno convention rather than the native ABI's error sentinel.
+    let pid = crate::process::spawn_linux_test(crate::user_prog::PROG_LINUX_SYSCALL, "linux-syscall", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux syscall dispatch process exited normally"),
+        other => selftest_fail(&format!("linux-syscall process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0b11) => println!("[OK] Linux syscall dispatch: getpid succeeded, unknown syscall returned -ENOSYS"),
+        other => selftest_fail(&format!("linux-syscall process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.
