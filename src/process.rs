@@ -304,6 +304,59 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
     Ok(task::spawn_process(process_entry_trampoline, name, pml4, process))
 }
 
+/// Test-only entry point for the Linux-style initial stack layout
+/// (`setup_linux_stack`): otherwise identical to `spawn`, but builds an
+/// argv/envp/auxv stack instead of the native ABI's single "return to
+/// the exit trampoline" slot. Not wired to any Linux syscall dispatch
+/// (that's Phase 2's job) — this exists so the stack layout itself can
+/// be built and verified against a real program reading it back
+/// (`user/src/bin/prog_linux_stack.rs`), independent of the syscall
+/// table that will eventually launch real Linux binaries this way.
+pub fn spawn_linux_test(
+    elf_bytes: &[u8],
+    name: &'static str,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<usize, &'static str> {
+    let mut program = elf::parse(elf_bytes)?;
+    apply_pie_bias(&mut program);
+    validate_segments(&program)?;
+
+    let mut process = Process {
+        entry: program.entry as usize,
+        user_rsp: 0,
+        frames: Vec::new(),
+        mappings: Vec::new(),
+        state: ProcessState::Running,
+        exit_info: None,
+        inbox: None,
+        fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
+        stack_low: USER_STACK_BASE,
+    };
+
+    let pml4 = match build_address_space(&mut process) {
+        Ok(pml4) => pml4,
+        Err(e) => {
+            free_process(process);
+            return Err(e);
+        }
+    };
+    if let Err(e) = load_segments(&mut process, pml4, &program.segments, elf_bytes) {
+        free_process(process);
+        return Err(e);
+    }
+    let user_rsp = match setup_linux_stack(&mut process, pml4, elf_bytes, &program, argv, envp) {
+        Ok(rsp) => rsp,
+        Err(e) => {
+            free_process(process);
+            return Err(e);
+        }
+    };
+    process.user_rsp = user_rsp;
+
+    Ok(task::spawn_process(process_entry_trampoline, name, pml4, process))
+}
+
 /// The process's segments must live outside the kernel's own territory:
 /// everything below 2 MiB (kernel image, PMM bitmap, page tables) and the
 /// heap range (with a 1 MiB margin). The user linker script places test
@@ -568,6 +621,170 @@ fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str
     }
     process.user_rsp = initial_rsp;
     Ok(())
+}
+
+/// ELF auxiliary vector entry types `setup_linux_stack` fills in (see the
+/// System V ABI x86-64 supplement, and the Linux kernel's
+/// `fs/binfmt_elf.c` for what a real ELF loader provides its `_start`).
+mod auxv {
+    pub const AT_NULL: u64 = 0;
+    pub const AT_PHDR: u64 = 3;
+    pub const AT_PHENT: u64 = 4;
+    pub const AT_PHNUM: u64 = 5;
+    pub const AT_PAGESZ: u64 = 6;
+    pub const AT_BASE: u64 = 7;
+    pub const AT_ENTRY: u64 = 9;
+    pub const AT_RANDOM: u64 = 25;
+    pub const AT_EXECFN: u64 = 31;
+}
+
+/// Builds a Linux-style initial stack — argc, argv[], envp[], the auxv
+/// table, and the string/random/phdr data they point into — in place of
+/// `setup_user_stack`'s single "return to the exit trampoline" slot. A
+/// real libc's `_start` reads exactly this layout off its initial `rsp`
+/// and calls `exit`/`exit_group` explicitly, never `ret`s off the end of
+/// `_start`, so unlike `setup_user_stack` this maps no exit trampoline.
+///
+/// Lays out, low to high address (i.e. reading forward from the returned
+/// rsp): argc, argv pointers, a NULL, envp pointers, a NULL, `(type,
+/// value)` auxv pairs terminated by `AT_NULL` — then, above all of that,
+/// the string/phdr/random-byte data those pointers and
+/// `AT_PHDR`/`AT_RANDOM`/`AT_EXECFN` reference. Reuses the native ABI's
+/// stack address range (`USER_STACK_BASE`/`USER_STACK_TOP`) and leaves
+/// `process.stack_low` pointing at wherever this layout's floor lands,
+/// so `Process::try_grow_stack` still works if the program needs more
+/// stack than this initial layout used.
+fn setup_linux_stack(
+    process: &mut Process,
+    pml4: u64,
+    elf_bytes: &[u8],
+    program: &elf::Program,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<u64, &'static str> {
+    // ---- pass 1: serialize the string/phdr/random data blob, recording
+    // each item's offset within it (its final vaddr isn't known until
+    // the pointer/auxv table's size — computed next — fixes where this
+    // blob starts). ----
+    let mut data: Vec<u8> = Vec::new();
+    let mut push_cstr = |data: &mut Vec<u8>, s: &[u8]| -> u64 {
+        let offset = data.len() as u64;
+        data.extend_from_slice(s);
+        data.push(0);
+        offset
+    };
+
+    let mut argv_offsets = Vec::with_capacity(argv.len());
+    for s in argv {
+        argv_offsets.push(push_cstr(&mut data, s.as_bytes()));
+    }
+    let mut envp_offsets = Vec::with_capacity(envp.len());
+    for s in envp {
+        envp_offsets.push(push_cstr(&mut data, s.as_bytes()));
+    }
+    let execfn_off = argv_offsets.first().copied();
+
+    let phdr_start = program.phoff as usize;
+    let phdr_len = program.phentsize as usize * program.phnum as usize;
+    let phdr_bytes = elf_bytes
+        .get(phdr_start..phdr_start + phdr_len)
+        .ok_or("program header table outside file")?;
+    let phdr_off = data.len() as u64;
+    data.extend_from_slice(phdr_bytes);
+
+    // 16 bytes for AT_RANDOM. Not cryptographically random — there's no
+    // HW RNG driver yet — just distinct-enough bytes to fill the ABI
+    // slot a real libc expects to be able to read (e.g. for its stack
+    // protector canary).
+    let random_off = data.len() as u64;
+    let seed = interrupts::ticks() ^ program.entry;
+    for i in 0..16u64 {
+        data.push((seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i) >> 33) as u8);
+    }
+
+    // ---- pass 2: the pointer/auxv table. AT_PHDR/AT_RANDOM/AT_EXECFN's
+    // values are filled in once `data_vaddr` (below) is known. ----
+    let mut auxv_pairs: Vec<(u64, u64)> = alloc::vec![
+        (auxv::AT_PHENT, program.phentsize as u64),
+        (auxv::AT_PHNUM, program.phnum as u64),
+        (auxv::AT_PAGESZ, paging::PAGE_SIZE),
+        (auxv::AT_BASE, 0),
+        (auxv::AT_ENTRY, program.entry),
+        (auxv::AT_PHDR, 0),
+        (auxv::AT_RANDOM, 0),
+    ];
+    let phdr_idx = 5;
+    let random_idx = 6;
+    let execfn_idx = execfn_off.map(|_| {
+        auxv_pairs.push((auxv::AT_EXECFN, 0));
+        auxv_pairs.len() - 1
+    });
+    auxv_pairs.push((auxv::AT_NULL, 0));
+
+    let table_words = 1 + (argv.len() + 1) + (envp.len() + 1) + auxv_pairs.len() * 2;
+    let table_len = table_words as u64 * 8;
+
+    let total_len = table_len + data.len() as u64;
+    if total_len > USER_STACK_TOP {
+        return Err("linux stack layout too large");
+    }
+    let final_rsp = (USER_STACK_TOP - total_len) & !0xF; // 16-byte align, per the SysV ABI
+    let data_vaddr = final_rsp + table_len;
+
+    auxv_pairs[phdr_idx].1 = data_vaddr + phdr_off;
+    auxv_pairs[random_idx].1 = data_vaddr + random_off;
+    if let (Some(idx), Some(off)) = (execfn_idx, execfn_off) {
+        auxv_pairs[idx].1 = data_vaddr + off;
+    }
+
+    let mut table = Vec::with_capacity(table_len as usize);
+    table.extend_from_slice(&(argv.len() as u64).to_le_bytes());
+    for &off in &argv_offsets {
+        table.extend_from_slice(&(data_vaddr + off).to_le_bytes());
+    }
+    table.extend_from_slice(&0u64.to_le_bytes());
+    for &off in &envp_offsets {
+        table.extend_from_slice(&(data_vaddr + off).to_le_bytes());
+    }
+    table.extend_from_slice(&0u64.to_le_bytes());
+    for &(t, v) in &auxv_pairs {
+        table.extend_from_slice(&t.to_le_bytes());
+        table.extend_from_slice(&v.to_le_bytes());
+    }
+    debug_assert_eq!(table.len() as u64, table_len);
+
+    // ---- map the region and write both blobs into it ----
+    let region_start = final_rsp & !(paging::PAGE_SIZE - 1);
+    let region_len = align_up(USER_STACK_TOP - region_start, paging::PAGE_SIZE);
+    let pages = (region_len / paging::PAGE_SIZE) as usize;
+    let phys = pmm::alloc_contiguous(pages).ok_or("out of memory")?;
+    for i in 0..pages {
+        process.frames.push(phys + i * pmm::FRAME_SIZE);
+    }
+    unsafe {
+        core::ptr::write_bytes(phys as *mut u8, 0, region_len as usize);
+        let table_phys = phys + (final_rsp - region_start) as usize;
+        core::ptr::copy_nonoverlapping(table.as_ptr(), table_phys as *mut u8, table.len());
+        let data_phys = phys + (data_vaddr - region_start) as usize;
+        core::ptr::copy_nonoverlapping(data.as_ptr(), data_phys as *mut u8, data.len());
+    }
+    if !paging::map_range_in(
+        pml4,
+        region_start,
+        phys as u64,
+        region_len,
+        paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+        &mut process.frames,
+    ) {
+        return Err("failed to map linux-style stack");
+    }
+    process.mappings.push(Mapping {
+        vaddr: region_start,
+        phys: phys as u64,
+        len: region_len,
+    });
+    process.stack_low = region_start;
+    Ok(final_rsp)
 }
 
 /// Entry point every process task starts at: run the ELF's `_start` in

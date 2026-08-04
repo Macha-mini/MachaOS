@@ -51,6 +51,17 @@ pub struct Program {
     /// Whether this is an ET_DYN (PIE) image, whose segment addresses are
     /// relative to a base of 0 and need a load bias applied.
     pub is_pie: bool,
+    /// Location of the program header table in the file. None of this
+    /// binary's PT_LOAD segments necessarily covers file offset `phoff`
+    /// (MachaOS's own `user/linker.ld` places `.result` first, well past
+    /// it), so a caller that needs the table mapped somewhere for AT_PHDR
+    /// (see `process::setup_linux_stack`) reads these bytes straight out
+    /// of the original file and places its own copy, rather than
+    /// computing an address within a loaded segment the way a real
+    /// toolchain's output (which always covers offset 0) would allow.
+    pub phoff: u64,
+    pub phentsize: u16,
+    pub phnum: u16,
 }
 
 fn read_u16(data: &[u8], off: usize) -> Result<u16, &'static str> {
@@ -143,5 +154,12 @@ pub fn parse(data: &[u8]) -> Result<Program, &'static str> {
     if segments.is_empty() {
         return Err("no loadable segments");
     }
-    Ok(Program { entry, segments, is_pie })
+    Ok(Program {
+        entry,
+        segments,
+        is_pie,
+        phoff,
+        phentsize,
+        phnum,
+    })
 }

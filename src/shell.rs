@@ -945,6 +945,31 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2c: Linux-style initial stack layout.
+    // `process::spawn_linux_test` builds a real argv/argc/envp/auxv stack
+    // (`process::setup_linux_stack`) instead of the native ABI's single
+    // return-address slot; the embedded ELF reads it straight off its
+    // entry `rsp` (the way a real libc's `_start` does) and reports which
+    // of 13 checks (argc, argv[], envp[], the auxv terminator, and each
+    // auxv value including a round trip through the copied program
+    // header table) passed as a bitmask.
+    let pid = crate::process::spawn_linux_test(
+        crate::user_prog::PROG_LINUX_STACK,
+        "linux-stack",
+        &["prog_linux_stack", "hello"],
+        &["FOO=bar"],
+    )
+    .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux-style stack layout process exited normally"),
+        other => selftest_fail(&format!("linux-stack process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0x1FFF) => println!("[OK] Linux-style stack layout: argv/envp/auxv all read back correctly"),
+        other => selftest_fail(&format!("linux-stack process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.
