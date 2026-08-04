@@ -2,12 +2,20 @@
 //! manager, recomposites when something changed, and otherwise halts
 //! until the next interrupt (timer, keyboard, or mouse).
 
-use crate::{fb, interrupts, keyboard, mouse, wm};
+use crate::{fb, interrupts, io, keyboard, mouse, process, user_prog, wm};
 
 pub fn run() -> ! {
     let (screen_w, screen_h) = fb::dimensions();
     let mut manager = wm::WindowManager::new(screen_w, screen_h);
     manager.composite();
+
+    // Calculator runs as a real ring-3 process now (user/src/bin/prog_calculator.rs),
+    // not kernel-resident `AppKind` state — its window shows up a frame or
+    // two after boot, once it calls sys_win_create and the loop below
+    // drains that request. See wm.rs's module docs on `WinCommand`.
+    if let Err(e) = process::spawn(user_prog::PROG_CALCULATOR, "calculator") {
+        io::print(format_args!("failed to launch Calculator: {}\n", e));
+    }
 
     loop {
         let mut dirty = false;

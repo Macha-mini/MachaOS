@@ -6,7 +6,6 @@ extern crate alloc;
 
 mod allocator;
 mod ata;
-mod calculator;
 mod console;
 mod cpuid;
 mod desktop;

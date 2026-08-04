@@ -30,6 +30,7 @@ user:
 	cp user/target/x86_64-unknown-none/release/prog_syscall target/user-syscall.elf
 	cp user/target/x86_64-unknown-none/release/prog_ipc target/user-ipc.elf
 	cp user/target/x86_64-unknown-none/release/prog_window target/user-window.elf
+	cp user/target/x86_64-unknown-none/release/prog_calculator target/user-calculator.elf
 
 build: gen user
 	cargo build --release

@@ -286,8 +286,8 @@ fn sys_read(fd: u64, ptr: u64, len: u64) -> u64 {
 }
 
 /// Delivers `[ptr, ptr+len)` (from the *sender's* address space) to
-/// `dest_pid`'s single-message inbox. See `task::deliver_message`: a
-/// second `send` before the target reads the first overwrites it.
+/// `dest_pid`'s bounded inbox queue. See `task::deliver_message`: when the
+/// queue is full, its oldest message is dropped.
 fn sys_send(dest_pid: u64, ptr: u64, len: u64) -> u64 {
     let Some(phys) = resolve_user_buffer(ptr, len) else {
         return SYSCALL_ERROR;

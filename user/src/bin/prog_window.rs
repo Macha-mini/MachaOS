@@ -50,7 +50,9 @@ pub extern "C" fn _start() {
     let pixels = unsafe { &mut *core::ptr::addr_of_mut!(PIXELS) };
     let mut color_index: usize = 0;
     let mut redraws: u64 = 0;
-    let mut buf = [0u8; 2];
+    // Window input uses the six-byte wire format documented in wm.rs:
+    // [tag, data, x_lo, x_hi, y_lo, y_hi].
+    let mut buf = [0u8; 6];
 
     loop {
         let n = unsafe { common::syscall(SYS_RECV, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) };

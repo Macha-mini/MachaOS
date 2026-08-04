@@ -9,7 +9,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-use crate::calculator::CalculatorApp;
 use crate::console::Console;
 use crate::cpuid;
 use crate::fat;
@@ -84,12 +83,11 @@ enum LauncherAction {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppId {
     Terminal,
-    Calculator,
     Notepad,
     SysInfo,
 }
 
-const APP_ID_COUNT: usize = 4;
+const APP_ID_COUNT: usize = 3;
 
 #[derive(Clone, Copy)]
 struct RememberedWindow {
@@ -143,25 +141,39 @@ pub fn queue_update(pid: usize, pixels: Vec<u32>) {
     push_command(WinCommand::Update { pid, pixels });
 }
 
+/// The 6-byte wire format `sys_recv` hands a process window's events back
+/// in: `[tag, data, x_lo, x_hi, y_lo, y_hi]`, x/y little-endian `u16`s
+/// (unused, zero, outside of `Click`). Tags: 0 Char (data = ASCII byte),
+/// 1 Backspace, 2 Enter, 3 Click (x/y = position local to the window's
+/// content area — the same coordinates a kernel-resident `AppKind` (e.g.
+/// `Editor`) would get passed directly).
+const EVENT_SIZE: usize = 6;
+
 /// Translates the subset of `keyboard::Event` a process window
-/// understands into the 2-byte wire format `sys_recv` hands back to it:
-/// `[tag, data]` where tag is 0 (Char, data = ASCII byte), 1
-/// (Backspace), or 2 (Enter). Arrow keys, Tab, and Ctrl+letter aren't
-/// forwarded yet — `None` for those, and for any non-ASCII char.
-fn encode_key_event(event: &keyboard::Event) -> Option<[u8; 2]> {
+/// understands. Arrow keys, Tab, and Ctrl+letter aren't forwarded yet —
+/// `None` for those, and for any non-ASCII char.
+fn encode_key_event(event: &keyboard::Event) -> Option<[u8; EVENT_SIZE]> {
     match *event {
-        keyboard::Event::Char(c) if c.is_ascii() => Some([0, c as u8]),
-        keyboard::Event::Backspace => Some([1, 0]),
-        keyboard::Event::Enter => Some([2, 0]),
+        keyboard::Event::Char(c) if c.is_ascii() => Some([0, c as u8, 0, 0, 0, 0]),
+        keyboard::Event::Backspace => Some([1, 0, 0, 0, 0, 0]),
+        keyboard::Event::Enter => Some([2, 0, 0, 0, 0, 0]),
         _ => None,
     }
+}
+
+/// Encodes a click at content-local `(x, y)` (both expected in
+/// `0..=u16::MAX`, comfortably beyond any window this compositor can lay
+/// out; out-of-range coordinates just clamp rather than wrapping oddly).
+fn encode_click_event(x: i32, y: i32) -> [u8; EVENT_SIZE] {
+    let [xl, xh] = (x.clamp(0, u16::MAX as i32) as u16).to_le_bytes();
+    let [yl, yh] = (y.clamp(0, u16::MAX as i32) as u16).to_le_bytes();
+    [3, 0, xl, xh, yl, yh]
 }
 
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
     Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String },
-    Calculator(CalculatorApp),
     /// A window owned by a ring-3 process (see `syscall::sys_win_create`),
     /// as opposed to the kinds above, whose app logic lives in the kernel.
     /// `pixels` is a plain framebuffer the process replaces wholesale via
@@ -192,7 +204,6 @@ impl Window {
             AppKind::Terminal { console, .. }
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => (console.width_px(), console.height_px()),
-            AppKind::Calculator(app) => (app.width(), app.height()),
             AppKind::Process { width, height, .. } => (*width, *height),
         }
     }
@@ -202,20 +213,19 @@ impl Window {
             AppKind::Terminal { console, .. }
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => console.pixels(),
-            AppKind::Calculator(app) => app.pixels(),
             AppKind::Process { pixels, .. } => pixels,
         }
     }
 
     /// Cell dimensions for the console-backed kinds; `(0, 0)` for
-    /// `Calculator`/`Process`, neither of which has a grid (and neither is
-    /// ever resizable/maximizable, so this is never used for them).
+    /// `Process`, which has no grid (and is never resizable/maximizable,
+    /// so this is never used for it).
     fn cols_rows(&self) -> (usize, usize) {
         match &self.kind {
             AppKind::Terminal { console, .. }
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => (console.cols(), console.rows()),
-            AppKind::Calculator(_) | AppKind::Process { .. } => (0, 0),
+            AppKind::Process { .. } => (0, 0),
         }
     }
 }
@@ -277,19 +287,6 @@ impl WindowManager {
             kind: AppKind::SysInfo { console: build_sysinfo_console() },
         };
 
-        let calculator_window = Window {
-            title: "Calculator",
-            x: clamp(1220, margin).0,
-            y: margin,
-            open: true,
-            minimized: false,
-            maximized: false,
-            resizable: false,
-            app_id: Some(AppId::Calculator),
-            restore_geometry: None,
-            kind: AppKind::Calculator(CalculatorApp::new()),
-        };
-
         let mut editor_console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
         let editor_lines = vec![String::new()];
         let mut editor_scroll = 0usize;
@@ -333,8 +330,8 @@ impl WindowManager {
         };
 
         let mut manager = Self {
-            windows: vec![sysinfo_window, calculator_window, editor_window, term_window],
-            focused: 3,
+            windows: vec![sysinfo_window, editor_window, term_window],
+            focused: 2,
             cursor_x: (screen_w / 2) as i32,
             cursor_y: (screen_h / 2) as i32,
             screen_w,
@@ -350,7 +347,7 @@ impl WindowManager {
             wallpaper: load_wallpaper(screen_w, screen_h),
         };
 
-        if let AppKind::Terminal { console, .. } = &mut manager.windows[3].kind {
+        if let AppKind::Terminal { console, .. } = &mut manager.windows[2].kind {
             io::set_console_sink(Some(console));
             print!("{}", shell::prompt());
             io::set_console_sink(None);
@@ -581,12 +578,13 @@ impl WindowManager {
                 }
             }
             LauncherAction::Calculator => {
-                self.spawn_window(
-                    "Calculator",
-                    false,
-                    Some(AppId::Calculator),
-                    AppKind::Calculator(CalculatorApp::new()),
-                );
+                // Runs as a real ring-3 process (user/src/bin/prog_calculator.rs),
+                // not kernel-resident `AppKind` state — its window shows up a
+                // moment later, once it calls sys_win_create and
+                // `drain_commands` picks that up (see desktop::run's loop).
+                if let Err(e) = process::spawn(crate::user_prog::PROG_CALCULATOR, "calculator") {
+                    println!("failed to launch Calculator: {}", e);
+                }
             }
             LauncherAction::Notepad => {
                 let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
@@ -673,7 +671,7 @@ impl WindowManager {
                     process::send_from_kernel(*pid, &encoded);
                 }
             }
-            AppKind::SysInfo { .. } | AppKind::Calculator(_) => {}
+            AppKind::SysInfo { .. } => {}
         }
     }
 
@@ -859,8 +857,11 @@ impl WindowManager {
                 let local_x = self.cursor_x - wx;
                 let local_y = self.cursor_y - wy - TITLE_BAR_HEIGHT as i32;
                 self.raise(i);
-                if let AppKind::Calculator(app) = &mut self.windows[self.focused].kind {
-                    app.handle_click(local_x, local_y);
+                match &mut self.windows[self.focused].kind {
+                    AppKind::Process { pid, .. } => {
+                        process::send_from_kernel(*pid, &encode_click_event(local_x, local_y));
+                    }
+                    _ => {}
                 }
                 return;
             }
@@ -1039,7 +1040,7 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             console.resize(cols, rows);
             editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
         }
-        AppKind::SysInfo { .. } | AppKind::Calculator(_) | AppKind::Process { .. } => {} // not resizable
+        AppKind::SysInfo { .. } | AppKind::Process { .. } => {} // not resizable
     }
 }
 
