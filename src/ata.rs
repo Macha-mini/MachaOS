@@ -10,8 +10,10 @@ use crate::port;
 use crate::sync::SpinLock;
 
 pub const PRIMARY_BASE: u16 = 0x1F0;
-pub const PRIMARY_CTRL: u16 = 0x3F6;
 pub const SECONDARY_BASE: u16 = 0x170;
+#[allow(dead_code)]
+pub const PRIMARY_CTRL: u16 = 0x3F6;
+#[allow(dead_code)]
 pub const SECONDARY_CTRL: u16 = 0x376;
 
 const REG_DATA: u16 = 0;

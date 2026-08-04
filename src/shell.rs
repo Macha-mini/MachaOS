@@ -2,7 +2,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-use crate::{cpuid, interrupts, io, keyboard, mouse, multiboot, port, rtc, serial, task, vga};
+use crate::{ata, cpuid, fat, interrupts, io, keyboard, mouse, multiboot, port, rtc, serial, task, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
@@ -13,7 +13,7 @@ pub const PROMPT: &str = "machaos> ";
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks",
+    "tasks", "ls", "cat", "fatinfo",
 ];
 
 pub fn run() -> ! {
@@ -128,6 +128,9 @@ pub fn execute(line: &str) {
         "panic" => panic!("user-requested kernel panic"),
         "mousetest" => cmd_mousetest(),
         "tasks" => cmd_tasks(),
+        "ls" => cmd_ls(&args),
+        "cat" => cmd_cat(&args),
+        "fatinfo" => cmd_fatinfo(),
         _ => println!("unknown command: '{}' (type 'help')", command),
     }
 }
@@ -152,6 +155,9 @@ fn cmd_help() {
     println!("  panic       trigger a kernel panic");
     println!("  mousetest   poll the PS/2 mouse for a few seconds");
     println!("  tasks       list scheduler tasks and their counters");
+    println!("  ls [path]   list files on the mounted disk");
+    println!("  cat <path>  print a file's contents");
+    println!("  fatinfo     show mounted volume information");
 }
 
 fn cmd_date() {
@@ -160,6 +166,76 @@ fn cmd_date() {
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         now.year, now.month, now.day, now.hour, now.minute, now.second
     );
+}
+
+fn cmd_ls(args: &[&str]) {
+    let path = args.first().copied().unwrap_or("/");
+    match fat::list_dir(path) {
+        Ok(entries) => {
+            if entries.is_empty() {
+                println!("(empty)");
+                return;
+            }
+            for entry in entries {
+                if entry.is_dir {
+                    println!("{:<32} <dir>", entry.name);
+                } else {
+                    println!("{:<32} {:>8} bytes", entry.name, entry.size);
+                }
+            }
+        }
+        Err(e) => println!("ls: {}", e),
+    }
+}
+
+fn cmd_cat(args: &[&str]) {
+    if args.is_empty() {
+        println!("usage: cat <path>");
+        return;
+    }
+    // The shell splits on whitespace, so a path containing spaces must be
+    // reassembled here.
+    let path = args.join(" ");
+    match fat::read_file(&path) {
+        Ok(data) => {
+            let text: alloc::string::String = data
+                .iter()
+                .map(|&b| if b.is_ascii() { b as char } else { '?' })
+                .collect();
+            print!("{}", text);
+            if !text.ends_with('\n') {
+                println!();
+            }
+        }
+        Err(e) => println!("cat: {}", e),
+    }
+}
+
+fn cmd_fatinfo() {
+    match fat::info() {
+        Some(info) => {
+            let cluster_bytes = info.sectors_per_cluster as u32 * 512;
+            println!(
+                "FAT32 volume: {} sectors ({} MiB), {} bytes/cluster",
+                info.total_sectors,
+                info.total_sectors / 2048,
+                cluster_bytes
+            );
+            println!(
+                "  fat: {} sectors, root cluster {}, free: {} clusters ({} KiB)",
+                info.fat_sectors,
+                info.root_cluster,
+                info.free_clusters,
+                info.free_clusters * cluster_bytes / 1024
+            );
+        }
+        None => println!("no FAT32 volume mounted"),
+    }
+    for i in 0..ata::count() {
+        if let Some(description) = ata::describe(i) {
+            println!("  {}", description);
+        }
+    }
 }
 
 fn cmd_meminfo() {
@@ -334,6 +410,34 @@ pub fn selftest() -> ! {
     execute("heap");
     execute("cpuinfo");
     execute("tasks");
+    execute("fatinfo");
+    execute("ls");
+    execute("ls /docs");
+    execute("cat /hello world.txt");
+    execute("cat /greetings.txt");
+    execute("cat /docs/readme.txt");
+
+    // FAT32 read verification: the fixture files were placed on the disk
+    // image by `make disk` (mtools), so this exercises LFN parsing, the
+    // FAT cluster chain, and subdirectory traversal.
+    match fat::list_dir("/") {
+        Ok(entries) => {
+            let fixture = entries.iter().find(|e| e.name == "hello world.txt");
+            match fixture {
+                Some(entry) if !entry.is_dir && entry.size == 20 => {
+                    println!("[OK] FAT32 root listing finds fixture (20 bytes)")
+                }
+                _ => selftest_fail("FAT32 fixture file missing or wrong size in /"),
+            }
+        }
+        Err(_) => selftest_fail("FAT32 root listing failed"),
+    }
+    match fat::read_file("/docs/readme.txt") {
+        Ok(data) if data == b"hello from the host\n" => {
+            println!("[OK] FAT32 read /docs/readme.txt matches fixture")
+        }
+        _ => selftest_fail("FAT32 subdirectory read mismatch"),
+    }
 
     // Physical memory manager: allocate two frames, scribble on the
     // first, free both, then confirm the first allocation hands the

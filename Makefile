@@ -7,9 +7,10 @@ GRUB_MKRESCUE := $(shell command -v i686-elf-grub-mkrescue 2>/dev/null || comman
 GRUB_CFG ?= boot/grub/grub.cfg
 ISO_DIR := target/machaos-iso
 ISO := target/machaos.iso
+DISK := target/disk.img
 TEST_LOG := /tmp/machaos-selftest.log
 
-.PHONY: all build gen iso run run-nographic test clean
+.PHONY: all build gen iso disk run run-nographic test clean
 
 all: build
 
@@ -27,17 +28,29 @@ iso: build
 	cp $(GRUB_CFG) $(ISO_DIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(ISO) $(ISO_DIR)
 
-run: iso
-	$(QEMU) -cdrom $(ISO) -serial stdio
+disk:
+	@test -n "$$(command -v mkfs.fat)" || (echo "dosfstools (mkfs.fat) is required: brew install dosfstools"; exit 1)
+	dd if=/dev/zero of=$(DISK) bs=1m count=64 2>/dev/null
+	mkfs.fat -F 32 $(DISK)
+	printf 'hello from the host\n' > target/fixture.txt
+	printf 'welcome to MachaOS\n' > target/fixture2.txt
+	mmd -i $(DISK) ::/docs
+	mcopy -i $(DISK) target/fixture.txt "::/hello world.txt"
+	mcopy -i $(DISK) target/fixture2.txt ::/greetings.txt
+	mcopy -i $(DISK) target/fixture.txt ::/docs/readme.txt
+	rm -f target/fixture.txt target/fixture2.txt
 
-run-nographic: iso
+run: iso disk
+	$(QEMU) -cdrom $(ISO) -hda $(DISK) -serial stdio
+
+run-nographic: iso disk
 	$(QEMU) -cdrom $(ISO) -boot d -display none -serial stdio
 
 test: GRUB_CFG=boot/grub/grub-selftest.cfg
-test: iso
+test: iso disk
 	@rm -f $(TEST_LOG)
 	@echo "== running MachaOS selftest in QEMU =="
-	@$(QEMU) -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) \
+	@$(QEMU) -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 &
 	@for i in $$(seq 1 60); do \
 		sleep 1; \

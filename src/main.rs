@@ -11,6 +11,7 @@ mod console;
 mod cpuid;
 mod desktop;
 mod fb;
+mod fat;
 mod font;
 mod gdt;
 mod gfx;
@@ -235,6 +236,11 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     }
     if ata::count() == 0 {
         println!("[WARN] no ATA devices found");
+    }
+
+    match fat::mount() {
+        Ok(()) => println!("[OK] FAT32 volume mounted"),
+        Err(e) => println!("[WARN] no FAT32 volume: {}", e),
     }
 
     if fb::init(&info) {
