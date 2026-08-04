@@ -17,11 +17,14 @@ use crate::fb;
 use crate::file_explorer::{DragInfo, FileExplorer, FsAction};
 use crate::font;
 use crate::gfx::{self, Surface};
+use crate::image_viewer::ImageViewerApp;
 use crate::interrupts;
 use crate::io;
 use crate::keyboard;
 use crate::mouse::MouseEvent;
 use crate::multiboot;
+use crate::paint::{PaintAction, PaintApp};
+use crate::settings::{Settings, SettingsApp};
 use crate::shell::{self, Feed, LineEditor};
 use crate::task;
 
@@ -129,6 +132,9 @@ enum LauncherAction {
     Files,
     Notepad,
     SysInfo,
+    Settings,
+    Paint,
+    ImageViewer,
     RunElf(String),
 }
 
@@ -144,9 +150,12 @@ enum AppId {
     Notepad,
     SysInfo,
     Files,
+    Settings,
+    Paint,
+    ImageViewer,
 }
 
-const APP_ID_COUNT: usize = 5;
+const APP_ID_COUNT: usize = 8;
 
 #[derive(Clone, Copy)]
 struct RememberedWindow {
@@ -163,6 +172,9 @@ pub enum AppKind {
     Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String },
     Calculator(CalculatorApp),
     FileExplorer(FileExplorer),
+    Settings(SettingsApp),
+    Paint(PaintApp),
+    ImageViewer(ImageViewerApp),
 }
 
 pub struct Window {
@@ -188,6 +200,9 @@ impl Window {
             | AppKind::Editor { console, .. } => (console.width_px(), console.height_px()),
             AppKind::Calculator(app) => (app.width(), app.height()),
             AppKind::FileExplorer(app) => (app.width(), app.height()),
+            AppKind::Settings(app) => (app.width(), app.height()),
+            AppKind::Paint(app) => (app.width(), app.height()),
+            AppKind::ImageViewer(app) => (app.width(), app.height()),
         }
     }
 
@@ -198,6 +213,9 @@ impl Window {
             | AppKind::Editor { console, .. } => console.pixels(),
             AppKind::Calculator(app) => app.pixels(),
             AppKind::FileExplorer(app) => app.pixels(),
+            AppKind::Settings(app) => app.pixels(),
+            AppKind::Paint(app) => app.pixels(),
+            AppKind::ImageViewer(app) => app.pixels(),
         }
     }
 
@@ -209,7 +227,11 @@ impl Window {
             AppKind::Terminal { console, .. }
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => (console.cols(), console.rows()),
-            AppKind::Calculator(_) | AppKind::FileExplorer(_) => (0, 0),
+            AppKind::Calculator(_)
+            | AppKind::FileExplorer(_)
+            | AppKind::Settings(_)
+            | AppKind::Paint(_)
+            | AppKind::ImageViewer(_) => (0, 0),
         }
     }
 }
@@ -264,6 +286,8 @@ pub struct WindowManager {
     // /system/wallpaper.raw on it, or its size doesn't match the current mode —
     // composite() falls back to the plain gradient fill in that case.
     wallpaper: Option<Vec<u32>>,
+    // Persistent system settings loaded from /system/settings.conf.
+    settings: Settings,
 }
 
 impl WindowManager {
@@ -359,6 +383,7 @@ impl WindowManager {
             spawn_counter: 0,
             remembered: [None; APP_ID_COUNT],
             wallpaper: load_wallpaper(screen_w, screen_h),
+            settings: Settings::load(),
         };
 
         if let AppKind::Terminal { console, .. } = &mut manager.windows[3].kind {
@@ -563,7 +588,10 @@ impl WindowManager {
             ("Calculator".to_string(), LauncherAction::Calculator),
             ("File Explorer".to_string(), LauncherAction::Files),
             ("Notepad".to_string(), LauncherAction::Notepad),
+            ("Paint".to_string(), LauncherAction::Paint),
+            ("Image Viewer".to_string(), LauncherAction::ImageViewer),
             ("System Info".to_string(), LauncherAction::SysInfo),
+            ("Settings".to_string(), LauncherAction::Settings),
         ];
         if fat::mounted() {
             if let Ok(entries) = fat::list_dir("/bin") {
@@ -633,6 +661,35 @@ impl WindowManager {
                     AppKind::SysInfo { console: build_sysinfo_console() },
                 );
             }
+            LauncherAction::Settings => {
+                let settings_copy = Settings {
+                    accent_color: self.settings.accent_color.clone(),
+                    wallpaper: self.settings.wallpaper,
+                    show_bg_tasks: self.settings.show_bg_tasks,
+                };
+                self.spawn_window(
+                    "Settings",
+                    false,
+                    Some(AppId::Settings),
+                    AppKind::Settings(SettingsApp::new(settings_copy)),
+                );
+            }
+            LauncherAction::Paint => {
+                self.spawn_window(
+                    "Paint",
+                    false,
+                    Some(AppId::Paint),
+                    AppKind::Paint(PaintApp::new()),
+                );
+            }
+            LauncherAction::ImageViewer => {
+                self.spawn_window(
+                    "Image Viewer",
+                    false,
+                    Some(AppId::ImageViewer),
+                    AppKind::ImageViewer(ImageViewerApp::new()),
+                );
+            }
             LauncherAction::RunElf(path) => {
                 self.launch_elf_in_terminal(path);
             }
@@ -687,11 +744,27 @@ impl WindowManager {
         );
     }
 
+    /// Spawns an Image Viewer window preloaded with a `.raw` file's bytes
+    /// (used by the file explorer — see `file_explorer::is_raw`). The raw
+    /// format (`tools/gen_wallpaper.py`) has no width/height header, so an
+    /// arbitrary file opened this way is guessed as square; a non-square
+    /// dump just shows `ImageViewerApp::load_image`'s existing "invalid
+    /// size" message instead of a wrong picture.
+    fn open_image_viewer_with(&mut self, path: String, content: Vec<u8>) {
+        let side = isqrt((content.len() / 4) as u32);
+        let mut app = ImageViewerApp::new();
+        app.load_image(&path, &content, side, side);
+        let base = path.rsplit('/').next().unwrap_or(&path);
+        let title: &'static str = alloc::boxed::Box::leak(format!("Image Viewer: {}", base).into_boxed_str());
+        self.spawn_window(title, true, None, AppKind::ImageViewer(app));
+    }
+
     /// Handles a `FsAction` reported by an app (the file explorer).
     fn dispatch_action(&mut self, action: FsAction) {
         match action {
             FsAction::RunTerminal(path) => self.launch_elf_in_terminal(path),
             FsAction::OpenText(path, content) => self.open_notepad_with(path, &content),
+            FsAction::OpenImage(path, content) => self.open_image_viewer_with(path, content),
         }
     }
 
@@ -764,6 +837,20 @@ impl WindowManager {
                     None
                 }
                 AppKind::FileExplorer(app) => app.handle_key(event),
+                AppKind::Settings(_) => None,
+                AppKind::Paint(app) => {
+                    let action = app.handle_key(event);
+                    if let Some(PaintAction::Load) = action {
+                        // TODO: Open file picker
+                        None
+                    } else {
+                        None
+                    }
+                }
+                AppKind::ImageViewer(app) => {
+                    app.handle_key(event);
+                    None
+                }
                 AppKind::SysInfo { .. } | AppKind::Calculator(_) => None,
             }
         };
@@ -1052,6 +1139,22 @@ impl WindowManager {
                             let item = app.drag_candidate(item);
                             (action, item)
                         }
+                        AppKind::Settings(app) => {
+                            let changed = app.handle_click(local_x, local_y);
+                            if changed {
+                                // Reload settings from disk after a change.
+                                self.settings = Settings::load();
+                            }
+                            (None, None)
+                        }
+                        AppKind::Paint(app) => {
+                            app.handle_click(local_x, local_y);
+                            (None, None)
+                        }
+                        AppKind::ImageViewer(app) => {
+                            app.handle_click(local_x, local_y);
+                            (None, None)
+                        }
                         _ => (None, None),
                     }
                 };
@@ -1075,9 +1178,15 @@ impl WindowManager {
 
     pub fn composite(&mut self) {
         fb::with_surface(|surface| {
-            match &self.wallpaper {
-                Some(pixels) => gfx::blit(surface, 0, 0, pixels, self.screen_w, self.screen_h),
-                None => gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM),
+            // Use wallpaper only if settings enable it and it's available.
+            if self.settings.wallpaper {
+                if let Some(pixels) = &self.wallpaper {
+                    gfx::blit(surface, 0, 0, pixels, self.screen_w, self.screen_h);
+                } else {
+                    gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM);
+                }
+            } else {
+                gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM);
             }
             for (i, window) in self.windows.iter_mut().enumerate() {
                 if window.open && !window.minimized {
@@ -1087,6 +1196,21 @@ impl WindowManager {
                         app.render_hover(
                             self.cursor_x - window.x,
                             self.cursor_y - window.y - TITLE_BAR_HEIGHT as i32,
+                        );
+                    }
+                    // Settings app also re-renders on cursor moves for hover.
+                    if let AppKind::Settings(app) = &mut window.kind {
+                        app.render_hover(
+                            self.cursor_x - window.x,
+                            self.cursor_y - window.y - TITLE_BAR_HEIGHT as i32,
+                        );
+                    }
+                    // Paint app re-renders on mouse moves for drawing.
+                    if let AppKind::Paint(app) = &mut window.kind {
+                        app.handle_mouse_move(
+                            self.cursor_x - window.x,
+                            self.cursor_y - window.y - TITLE_BAR_HEIGHT as i32,
+                            self.left_was_down,
                         );
                     }
                     draw_window(surface, window, i == self.focused, self.cursor_x, self.cursor_y);
@@ -1171,15 +1295,17 @@ impl WindowManager {
         // Background counter tasks keep running (preemptively, via the
         // scheduler in task.rs) whether or not anyone is looking at the
         // Terminal window — this is the visible proof of that.
-        let counters = task::COUNTERS
-            .iter()
-            .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
-            .collect::<Vec<_>>();
-        let bg = format!("bg: {} {} {}", counters[0], counters[1], counters[2]);
-        let bg_w = (bg.len() * font::GLYPH_WIDTH) as u32;
-        let bg_x = clock_x - bg_w - 16;
-        gfx::draw_string(surface, bg_x, y + 11, &bg, 0x00_86C77B, None);
-        gfx::fill_rect(surface, bg_x - 9, y + 4, 1, TASKBAR_HEIGHT - 8, TASKBAR_DIVIDER);
+        if self.settings.show_bg_tasks {
+            let counters = task::COUNTERS
+                .iter()
+                .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
+                .collect::<Vec<_>>();
+            let bg = format!("bg: {} {} {}", counters[0], counters[1], counters[2]);
+            let bg_w = (bg.len() * font::GLYPH_WIDTH) as u32;
+            let bg_x = clock_x - bg_w - 16;
+            gfx::draw_string(surface, bg_x, y + 11, &bg, 0x00_86C77B, None);
+            gfx::fill_rect(surface, bg_x - 9, y + 4, 1, TASKBAR_HEIGHT - 8, TASKBAR_DIVIDER);
+        }
     }
 }
 
@@ -1195,7 +1321,12 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             console.resize(cols, rows);
             editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
         }
-        AppKind::SysInfo { .. } | AppKind::Calculator(_) | AppKind::FileExplorer(_) => {} // not resizable
+        AppKind::SysInfo { .. }
+        | AppKind::Calculator(_)
+        | AppKind::FileExplorer(_)
+        | AppKind::Settings(_)
+        | AppKind::Paint(_)
+        | AppKind::ImageViewer(_) => {} // not resizable
     }
 }
 
@@ -1603,6 +1734,21 @@ fn load_wallpaper(screen_w: u32, screen_h: u32) -> Option<Vec<u32>> {
         return None;
     }
     Some(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+}
+
+/// Integer square root (Newton's method), used to guess square dimensions
+/// for a headerless `.raw` image opened from the file explorer.
+fn isqrt(n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
 }
 
 fn build_sysinfo_console() -> Console {

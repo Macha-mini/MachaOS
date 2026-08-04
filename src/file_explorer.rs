@@ -79,6 +79,8 @@ pub enum FsAction {
     RunTerminal(String),
     /// Open `content` (a text file's bytes) in a fresh Notepad window.
     OpenText(String, Vec<u8>),
+    /// Open `content` (a raw image's bytes) in a fresh ImageViewer window.
+    OpenImage(String, Vec<u8>),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -148,11 +150,19 @@ fn is_text(name: &str) -> bool {
     lower.ends_with(".txt") || lower.ends_with(".md") || lower.ends_with(".log") || lower.ends_with(".cfg")
 }
 
+/// Raw 32-bit pixel dumps (see `tools/gen_wallpaper.py`'s format), openable
+/// in the Image Viewer.
+fn is_raw(name: &str) -> bool {
+    name.to_lowercase().ends_with(".raw")
+}
+
 fn file_type(name: &str) -> &'static str {
     if is_elf(name) {
         "ELF Program"
     } else if is_text(name) {
         "Text"
+    } else if is_raw(name) {
+        "Image"
     } else {
         "File"
     }
@@ -459,6 +469,19 @@ impl FileExplorer {
             self.status = format!("launching {}", entry.name);
             self.render();
             Some(FsAction::RunTerminal(path))
+        } else if is_raw(&entry.name) {
+            match fat::read_file(&path) {
+                Ok(content) => {
+                    self.status = format!("opened {} ({} bytes)", entry.name, content.len());
+                    self.render();
+                    Some(FsAction::OpenImage(path, content))
+                }
+                Err(e) => {
+                    self.status = format!("cannot read {}: {}", entry.name, e);
+                    self.render();
+                    None
+                }
+            }
         } else if entry.size > 0 && is_text(&entry.name) {
             match fat::read_file(&path) {
                 Ok(content) => {
