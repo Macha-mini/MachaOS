@@ -47,6 +47,24 @@ const EDITOR_CURSOR_COLOR: u32 = 0x00_FFCC66;
 const EDITOR_STATUS_BG: u32 = 0x00_1A2430;
 const EDITOR_STATUS_FG: u32 = 0x00_8FB8D8;
 
+const START_BUTTON_WIDTH: u32 = 90;
+const START_BUTTON_BG: u32 = 0x00_2F4A73;
+const LAUNCHER_BG: u32 = 0x00_1C2733;
+const LAUNCHER_ITEM_HOVER: u32 = 0x00_35506E;
+const LAUNCHER_WIDTH: u32 = 280;
+const LAUNCHER_ITEM_HEIGHT: u32 = 30;
+// Where taskbar window buttons begin, past the Start button.
+const WINDOW_BUTTONS_START_X: i32 = 8 + START_BUTTON_WIDTH as i32 + 10;
+
+#[derive(Clone)]
+enum LauncherAction {
+    Terminal,
+    Calculator,
+    Notepad,
+    SysInfo,
+    RunElf(String),
+}
+
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
@@ -107,6 +125,9 @@ pub struct WindowManager {
     resizing: Option<ResizeState>,
     left_was_down: bool,
     last_clock_secs: u64,
+    launcher_open: bool,
+    launcher_items: Vec<(String, LauncherAction)>,
+    spawn_counter: u32,
 }
 
 impl WindowManager {
@@ -183,6 +204,9 @@ impl WindowManager {
             resizing: None,
             left_was_down: false,
             last_clock_secs: u64::MAX,
+            launcher_open: false,
+            launcher_items: Vec::new(),
+            spawn_counter: 0,
         };
 
         if let AppKind::Terminal { console, .. } = &mut manager.windows[3].kind {
@@ -201,6 +225,162 @@ impl WindowManager {
             true
         } else {
             false
+        }
+    }
+
+    /// Adds a new window (or reuses a closed one's slot, so repeatedly
+    /// launching and closing apps from the launcher doesn't grow the
+    /// window list forever), raises and focuses it, and returns its index.
+    fn spawn_window(&mut self, title: &'static str, resizable: bool, kind: AppKind) -> usize {
+        let (x, y) = self.next_spawn_position();
+        let window = Window { title, x, y, open: true, minimized: false, resizable, kind };
+        let index = if let Some(slot) = self.windows.iter().position(|w| !w.open) {
+            self.windows[slot] = window;
+            slot
+        } else {
+            self.windows.push(window);
+            self.windows.len() - 1
+        };
+        self.raise(index);
+        index
+    }
+
+    /// Cascades new windows diagonally so they don't stack exactly on top
+    /// of one another, wrapping back to the top-left once they'd run off
+    /// the screen.
+    fn next_spawn_position(&mut self) -> (i32, i32) {
+        self.spawn_counter = self.spawn_counter.wrapping_add(1);
+        let offset = (self.spawn_counter as i32 * 28) % 320;
+        let x = (140 + offset).min(self.screen_w as i32 - 260);
+        let y = (100 + offset).min(self.screen_h as i32 - TASKBAR_HEIGHT as i32 - 260);
+        (x, y)
+    }
+
+    fn start_button_hit(&self) -> bool {
+        let y = self.screen_h as i32 - TASKBAR_HEIGHT as i32;
+        self.cursor_x >= 8
+            && self.cursor_x < 8 + START_BUTTON_WIDTH as i32
+            && self.cursor_y >= y + 4
+            && self.cursor_y < y + TASKBAR_HEIGHT as i32 - 4
+    }
+
+    fn launcher_popup_rect(&self) -> (i32, i32, u32, u32) {
+        let popup_h = LAUNCHER_ITEM_HEIGHT * self.launcher_items.len().max(1) as u32 + 8;
+        let popup_y = self.screen_h as i32 - TASKBAR_HEIGHT as i32 - popup_h as i32;
+        (8, popup_y, LAUNCHER_WIDTH, popup_h)
+    }
+
+    fn launcher_hit_test(&self) -> Option<usize> {
+        let (px, py, pw, ph) = self.launcher_popup_rect();
+        if self.cursor_x < px
+            || self.cursor_x >= px + pw as i32
+            || self.cursor_y < py
+            || self.cursor_y >= py + ph as i32
+        {
+            return None;
+        }
+        let rel_y = (self.cursor_y - py - 4).max(0) as u32;
+        let idx = (rel_y / LAUNCHER_ITEM_HEIGHT) as usize;
+        if idx < self.launcher_items.len() {
+            Some(idx)
+        } else {
+            None
+        }
+    }
+
+    /// Built-in apps first, then any `.elf` file found in `/bin` on the
+    /// mounted FAT32 volume (if any) — rebuilt each time the launcher
+    /// opens so newly written files show up without a reboot.
+    fn build_launcher_items(&self) -> Vec<(String, LauncherAction)> {
+        let mut items = vec![
+            ("Terminal".to_string(), LauncherAction::Terminal),
+            ("Calculator".to_string(), LauncherAction::Calculator),
+            ("Notepad".to_string(), LauncherAction::Notepad),
+            ("System Info".to_string(), LauncherAction::SysInfo),
+        ];
+        if fat::mounted() {
+            if let Ok(entries) = fat::list_dir("/bin") {
+                for entry in entries {
+                    if !entry.is_dir && entry.name.to_lowercase().ends_with(".elf") {
+                        let path = format!("/bin/{}", entry.name);
+                        items.push((entry.name.clone(), LauncherAction::RunElf(path)));
+                    }
+                }
+            }
+        }
+        items
+    }
+
+    fn run_launcher_action(&mut self, action: LauncherAction) {
+        match action {
+            LauncherAction::Terminal => {
+                let idx = self.spawn_window(
+                    "Terminal",
+                    true,
+                    AppKind::Terminal {
+                        console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
+                        editor: LineEditor::new(),
+                    },
+                );
+                if let AppKind::Terminal { console, .. } = &mut self.windows[idx].kind {
+                    io::set_console_sink(Some(console));
+                    print!("{}", shell::prompt());
+                    io::set_console_sink(None);
+                }
+            }
+            LauncherAction::Calculator => {
+                self.spawn_window("Calculator", false, AppKind::Calculator(CalculatorApp::new()));
+            }
+            LauncherAction::Notepad => {
+                let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
+                let lines = vec![String::new()];
+                let mut scroll = 0usize;
+                let mut status = String::new();
+                editor_render(&mut console, &lines, 0, 0, &mut scroll, &mut status);
+                self.spawn_window(
+                    "Notepad",
+                    true,
+                    AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status },
+                );
+            }
+            LauncherAction::SysInfo => {
+                self.spawn_window("System Info", false, AppKind::SysInfo { console: build_sysinfo_console() });
+            }
+            LauncherAction::RunElf(path) => {
+                let title: &'static str = alloc::boxed::Box::leak(format!("Terminal: {}", path).into_boxed_str());
+                let idx = self.spawn_window(
+                    title,
+                    true,
+                    AppKind::Terminal {
+                        console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
+                        editor: LineEditor::new(),
+                    },
+                );
+                if let AppKind::Terminal { console, .. } = &mut self.windows[idx].kind {
+                    io::set_console_sink(Some(console));
+                    let command = format!("run {}", path);
+                    println!("{}{}", shell::prompt(), command);
+                    shell::execute(&command);
+                    print!("{}", shell::prompt());
+                    io::set_console_sink(None);
+                }
+            }
+        }
+    }
+
+    fn draw_launcher(&self, surface: &mut dyn Surface) {
+        let (px, py, pw, ph) = self.launcher_popup_rect();
+        gfx::fill_rect(surface, px as u32, py as u32, pw, ph, LAUNCHER_BG);
+        for (i, (label, _)) in self.launcher_items.iter().enumerate() {
+            let iy = py as u32 + 4 + i as u32 * LAUNCHER_ITEM_HEIGHT;
+            let hovered = self.cursor_y >= iy as i32
+                && self.cursor_y < (iy + LAUNCHER_ITEM_HEIGHT) as i32
+                && self.cursor_x >= px
+                && self.cursor_x < px + pw as i32;
+            if hovered {
+                gfx::fill_rect(surface, px as u32 + 2, iy, pw - 4, LAUNCHER_ITEM_HEIGHT - 2, LAUNCHER_ITEM_HOVER);
+            }
+            gfx::draw_string(surface, px as u32 + 10, iy + 8, label, 0x00_FFFFFF, None);
         }
     }
 
@@ -287,9 +467,28 @@ impl WindowManager {
     }
 
     fn handle_click(&mut self) {
+        if self.launcher_open {
+            if let Some(idx) = self.launcher_hit_test() {
+                let action = self.launcher_items[idx].1.clone();
+                self.launcher_open = false;
+                self.run_launcher_action(action);
+            } else {
+                // Clicking the Start button again, or anywhere else,
+                // dismisses the popup (a second Start click shouldn't
+                // reopen it in the same gesture).
+                self.launcher_open = false;
+            }
+            return;
+        }
+
         let taskbar_y = self.screen_h as i32 - TASKBAR_HEIGHT as i32;
         if self.cursor_y >= taskbar_y {
-            let mut x = 8i32;
+            if self.start_button_hit() {
+                self.launcher_items = self.build_launcher_items();
+                self.launcher_open = true;
+                return;
+            }
+            let mut x = WINDOW_BUTTONS_START_X;
             for i in 0..self.windows.len() {
                 if !self.windows[i].open {
                     continue;
@@ -384,6 +583,9 @@ impl WindowManager {
                 }
             }
             self.draw_taskbar(surface);
+            if self.launcher_open {
+                self.draw_launcher(surface);
+            }
             draw_cursor(surface, self.cursor_x, self.cursor_y);
         });
         fb::present();
@@ -393,7 +595,11 @@ impl WindowManager {
         let y = self.screen_h - TASKBAR_HEIGHT;
         gfx::fill_rect(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, TASKBAR_BG);
 
-        let mut x = 8u32;
+        let start_color = if self.launcher_open { TASKBAR_BUTTON_FOCUSED } else { START_BUTTON_BG };
+        gfx::fill_rect(surface, 8, y + 4, START_BUTTON_WIDTH, TASKBAR_HEIGHT - 8, start_color);
+        gfx::draw_string(surface, 8 + 6, y + 8, "Apps", 0x00_FFFFFF, None);
+
+        let mut x = WINDOW_BUTTONS_START_X as u32;
         for (i, window) in self.windows.iter().enumerate() {
             if !window.open {
                 continue;
