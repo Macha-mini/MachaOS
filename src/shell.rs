@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::sync::SpinLock;
-use crate::{ata, cpuid, fat, fat::FatError, interrupts, io, keyboard, mouse, multiboot, port, rtc, serial, task, vga};
+use crate::{ata, cpuid, fat, fat::FatError, interrupts, io, keyboard, mouse, multiboot, port, process, rtc, serial, task, vga};
 
 const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
@@ -93,7 +93,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm",
+    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "run",
 ];
 
 pub fn run() -> ! {
@@ -294,6 +294,7 @@ pub fn execute(line: &str) {
         "write" => cmd_write(&args),
         "mkdir" => cmd_mkdir(&args),
         "rm" => cmd_rm(&args),
+        "run" => cmd_run(&args),
         "cd" => cmd_cd(&args),
         "pwd" => println!("{}", cwd()),
         _ => println!("unknown command: '{}' (type 'help')", command),
@@ -327,6 +328,7 @@ fn cmd_help() {
     println!("               write text to a file (LFN supported)");
     println!("  mkdir <path> create a directory");
     println!("  rm <path>   remove a file or empty directory");
+    println!("  run <path>  load and run an ELF program as a process");
     println!("  cd [path]   change directory (default: root, .. goes up)");
     println!("  pwd         print the current directory");
     println!("Paths may be relative to the current directory; quote arguments");
@@ -441,7 +443,44 @@ fn cmd_cd(args: &[&str]) {
     }
 }
 
-fn cmd_fatinfo() {    match fat::info() {
+/// Loads an ELF file from the disk, spawns it as a process, waits for it
+/// to exit, and reports its result (up to one second).
+fn cmd_run(args: &[&str]) {
+    if args.is_empty() {
+        println!("usage: run <path>");
+        return;
+    }
+    // A path containing spaces must be reassembled (or quoted).
+    let path = abs_path(&args.join(" "));
+    match fat::read_file(&path) {
+        Ok(elf) => match process::spawn(&elf, "app") {
+            Ok(pid) => {
+                println!(
+                    "spawned process {} from {} ({} byte ELF)",
+                    pid,
+                    path,
+                    elf.len()
+                );
+                match process::wait(pid, 100) {
+                    Some(info) => {
+                        println!("process {} {}", pid, process::describe_exit(&info));
+                        if let Some(result) = process::read_result(pid) {
+                            println!("process {} result: {:#x}", pid, result);
+                        }
+                        process::reap(pid);
+                        println!("process {} reaped", pid);
+                    }
+                    None => println!("process {} did not exit within 1s", pid),
+                }
+            }
+            Err(e) => println!("run: {}: {}", path, e),
+        },
+        Err(e) => println!("run: {}: {}", path, e),
+    }
+}
+
+fn cmd_fatinfo() {
+    match fat::info() {
         Some(info) => {
             let cluster_bytes = info.sectors_per_cluster as u32 * 512;
             println!(
@@ -566,7 +605,11 @@ fn cmd_tasks() {
     let count = task::task_count();
     println!("scheduler tasks: {}", count);
     for i in 0..count {
-        println!("  [{}] {}", i, task::task_name(i));
+        let label = match task::process_state_label(i) {
+            Some(state) => format!(" [proc, {}]", state),
+            None => String::new(),
+        };
+        println!("  [{}] {}{}", i, task::task_name(i), label);
     }
     for (i, counter) in task::COUNTERS.iter().enumerate() {
         println!("  bg-{} counter: {}", i, counter.load(Ordering::Relaxed));
@@ -673,7 +716,7 @@ pub fn selftest() -> ! {
     // remove also proves that free clusters are recycled.
     match fat::make_dir("/selftest") {
         Ok(()) => println!("[OK] FAT32 mkdir /selftest"),
-        Err(e) => selftest_fail("FAT32 mkdir failed"),
+        Err(_e) => selftest_fail("FAT32 mkdir failed"),
     }
     let payload = "selftest payload line 1\nline 2 (2 KiB+ to force multi-cluster)\n".repeat(64);
     if let Err(_e) = fat::write_file("/selftest/multicluster payload.txt", payload.as_bytes()) {
@@ -781,10 +824,89 @@ pub fn selftest() -> ! {
         selftest_fail("unmap_page refused the request");
     }
     crate::pmm::frame_free(frame);
+    // Restore the identity map: the PMM hands freed frames straight out
+    // again, and fresh allocations are expected to be identity-mapped
+    // (the unmap test above proved the teardown works; this returns the
+    // frame to the normal contract).
+    if !crate::paging::map_page(
+        frame as u64,
+        frame as u64,
+        crate::paging::PAGE_PRESENT | crate::paging::PAGE_WRITABLE,
+    ) {
+        selftest_fail("restoring the identity map after the unmap test");
+    }
     if value != 0x1234_5678 {
         selftest_fail("paging map/write/read/unmap round trip mismatch");
     }
     println!("[OK] paging 4 KiB map/split/unmap round trip (frame {:#x})", frame);
+
+    // Process management, part 1: a clean run. The embedded ELF computes
+    // sum(1..=1000), stores it in its .result page, and returns from
+    // `_start`; the trampoline then exits the process normally. Waiting
+    // proves the scheduler switched to and back from the process (which
+    // runs under its own page tables / CR3), and reading the result
+    // proves the ELF was loaded, mapped, and executed.
+    let frames_before = crate::pmm::free_frames();
+    let pid = crate::process::spawn(crate::user_prog::PROG_EXIT, "sum")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    println!("[OK] process {} spawned from embedded ELF", pid);
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] process exited normally"),
+        Some(other) => selftest_fail(&format!("unexpected exit: {:?}", other)),
+        None => selftest_fail("process did not exit in time"),
+    }
+    match crate::process::read_result(pid) {
+        Some(500500) => println!("[OK] process computed sum(1..=1000) = 500500"),
+        other => selftest_fail(&format!("process result mismatch: {:?}", other)),
+    }
+    execute("tasks");
+    crate::process::reap(pid);
+
+    // Process management, part 2: fault isolation. A process writing to
+    // an unmapped address (4 GiB) must be killed by the #PF handler —
+    // leaving the kernel and every other task alive.
+    let pid = crate::process::spawn(crate::user_prog::PROG_FAULT, "faulty")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::PageFault { cr2 }) if cr2 == 0x1_0000_0000 => {
+            println!("[OK] page fault in process killed it (cr2 = {:#x}), kernel survived", cr2)
+        }
+        other => selftest_fail(&format!("faulting process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0xFACE_FEED) => println!("[OK] faulting process stored its result before dying"),
+        other => selftest_fail(&format!("faulting process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 3: the full disk path. The same program
+    // read back from the FAT32 image (copied there by `make disk`) must
+    // run identically to the embedded copy.
+    match fat::read_file("/bin/prog_exit.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn(&elf, "disk-sum")
+                .unwrap_or_else(|e| selftest_fail(&format!("disk process spawn failed: {e}")));
+            match crate::process::wait(pid, 100) {
+                Some(process::ExitInfo::Normal) => match crate::process::read_result(pid) {
+                    Some(500500) => println!(
+                        "[OK] process loaded from disk ({} byte ELF) ran correctly",
+                        elf.len()
+                    ),
+                    _ => selftest_fail("disk-loaded process gave wrong result"),
+                },
+                _ => selftest_fail("disk-loaded process did not exit normally"),
+            }
+            crate::process::reap(pid);
+        }
+        Err(e) => selftest_fail(&format!("reading /bin/prog_exit.elf failed: {e}")),
+    }
+
+    let frames_after = crate::pmm::free_frames();
+    if frames_after == frames_before {
+        println!("[OK] all process frames returned to the PMM");
+    } else {
+        println!("[WARN] free frames changed across process tests: {} -> {}", frames_before, frames_after);
+    }
 
     let before: Vec<u64> = task::COUNTERS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let deadline = interrupts::ticks() + 30; // spans several scheduler quanta (5 ticks each)

@@ -17,6 +17,7 @@ pub struct FreeListAllocator {
     head: *mut Block,
     allocated: usize,
     total: usize,
+    base: usize,
 }
 
 unsafe impl Send for FreeListAllocator {}
@@ -27,6 +28,7 @@ impl FreeListAllocator {
             head: ptr::null_mut(),
             allocated: 0,
             total: 0,
+            base: 0,
         }
     }
 
@@ -39,6 +41,7 @@ impl FreeListAllocator {
         self.head = block;
         self.allocated = 0;
         self.total = total;
+        self.base = start;
     }
 
     unsafe fn alloc(&mut self, size: usize) -> *mut u8 {
@@ -166,4 +169,12 @@ pub fn free_bytes() -> usize {
 
 pub fn total_bytes() -> usize {
     ALLOCATOR.lock().total_bytes()
+}
+
+/// Half-open [base, end) range the heap occupies in the identity map.
+/// The process loader rejects user programs whose segments would overlap
+/// it (see `validate_segments` in process.rs).
+pub fn heap_range() -> (usize, usize) {
+    let allocator = ALLOCATOR.lock();
+    (allocator.base, allocator.base + allocator.total)
 }

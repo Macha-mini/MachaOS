@@ -34,7 +34,7 @@ pub struct InterruptFrame {
     pub ss: u64,
 }
 
-pub type Handler = fn(&InterruptFrame);
+pub type Handler = fn(&mut InterruptFrame);
 
 static mut HANDLERS: [Option<Handler>; 256] = [None; 256];
 
@@ -45,8 +45,8 @@ pub fn set_handler(vector: u8, handler: Option<Handler>) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn isr_dispatch(frame: *const InterruptFrame) {
-    let frame = unsafe { &*frame };
+pub extern "C" fn isr_dispatch(frame: *mut InterruptFrame) {
+    let frame = unsafe { &mut *frame };
     let vector = frame.vector as usize;
     if let Some(handler) = unsafe { HANDLERS[vector] } {
         handler(frame);
@@ -72,7 +72,7 @@ pub fn register_default_handlers() {
     set_handler(44, Some(mouse));
 }
 
-fn exception(name: &str, frame: &InterruptFrame) -> ! {
+fn exception(name: &str, frame: &mut InterruptFrame) -> ! {
     let mut buf = [0u8; 96];
     io::exception_print(io::sprint(&mut buf, format_args!("\n===== EXCEPTION: {} =====\n", name)));
     dump_registers(frame);
@@ -115,15 +115,15 @@ fn dump_registers(frame: &InterruptFrame) {
     io::exception_print(text);
 }
 
-fn divide_error(frame: &InterruptFrame) {
+fn divide_error(frame: &mut InterruptFrame) {
     exception("#DE Divide-by-zero", frame)
 }
 
-fn debug_exception(frame: &InterruptFrame) {
+fn debug_exception(frame: &mut InterruptFrame) {
     exception("#DB Debug", frame)
 }
 
-fn breakpoint(frame: &InterruptFrame) {
+fn breakpoint(frame: &mut InterruptFrame) {
     let mut buf = [0u8; 96];
     io::exception_print(io::sprint(
         &mut buf,
@@ -131,24 +131,34 @@ fn breakpoint(frame: &InterruptFrame) {
     ));
 }
 
-fn overflow(frame: &InterruptFrame) {
+fn overflow(frame: &mut InterruptFrame) {
     exception("#OF Overflow", frame)
 }
 
-fn invalid_opcode(frame: &InterruptFrame) {
+fn invalid_opcode(frame: &mut InterruptFrame) {
     exception("#UD Invalid opcode", frame)
 }
 
-fn double_fault(frame: &InterruptFrame) {
+fn double_fault(frame: &mut InterruptFrame) {
     exception("#DF Double fault (IST used)", frame)
 }
 
-fn general_protection_fault(frame: &InterruptFrame) {
+fn general_protection_fault(frame: &mut InterruptFrame) {
     exception("#GP General protection fault", frame)
 }
 
-fn page_fault(frame: &InterruptFrame) {
+fn page_fault(frame: &mut InterruptFrame) {
     let cr2 = read_cr2();
+    // A fault inside a process (that is, with the process's address space
+    // active) kills just that process: the page it touched is simply not
+    // mapped, which is the one kind of fault a process can cause on its
+    // own. Anything else — a fault while a kernel task runs, or in the
+    // kernel's own map — is still fatal. (Until ring 3 lands, kernel code
+    // executing *in* process context is also attributed to the process.)
+    if task::current_is_process() {
+        crate::process::kill_current(cr2, frame);
+        return;
+    }
     let err = frame.error_code;
     let mut buf = [0u8; 192];
     io::exception_print(io::sprint(
@@ -166,7 +176,7 @@ fn page_fault(frame: &InterruptFrame) {
     halt_forever()
 }
 
-fn unhandled(frame: &InterruptFrame) {
+fn unhandled(frame: &mut InterruptFrame) {
     exception("unknown interrupt", frame)
 }
 
@@ -184,7 +194,7 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-fn timer(_frame: &InterruptFrame) {
+fn timer(_frame: &mut InterruptFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
     // EOI must go out before a possible task switch: if scheduler_tick()
     // switches away from this task before the PIC hears about it, IRQ0's
@@ -195,12 +205,12 @@ fn timer(_frame: &InterruptFrame) {
     task::scheduler_tick();
 }
 
-fn keyboard(_frame: &InterruptFrame) {
+fn keyboard(_frame: &mut InterruptFrame) {
     crate::keyboard::irq();
     pic::eoi(1);
 }
 
-fn mouse(_frame: &InterruptFrame) {
+fn mouse(_frame: &mut InterruptFrame) {
     crate::mouse::irq();
     pic::eoi(12);
 }

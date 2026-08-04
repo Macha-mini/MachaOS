@@ -6,12 +6,13 @@ A small x86_64 Multiboot kernel written in Rust. It currently includes:
 - A statically identity-mapped 4 GiB address space (2 MiB pages)
 - A linear VBE framebuffer desktop (1920x1080x32, requested via the Multiboot video header) with a window manager: draggable/resizable/minimizable/closable windows, a taskbar, and a mouse cursor, alongside VGA text output and COM1 serial logging
 - GDT, TSS, IST, IDT, exception handlers, PIC, PIT, PS/2 keyboard, and PS/2 mouse IRQs
-- A lock-protected 8 MiB free-list heap allocator
+- A lock-protected 40 MiB free-list heap allocator
 - Preemptive kernel-thread multitasking: a round-robin scheduler switches tasks from the PIT timer interrupt (50 ms quanta), sharing the single address space
+- ELF64 loading and process management: `run <path>` loads an ELF from disk into its own private page table (deep copy of the kernel's identity map), switches CR3 when it is scheduled, and reports its result through a pinned `.result` page. A page fault inside a process kills only that process (via the #PF handler) instead of the whole system
 - CPUID information and a small interactive shell, running inside a Terminal window on the desktop
 - A polled ATA PIO driver and a FAT32 filesystem: `ls`, `cat`, `write`, `mkdir`, and `rm` commands (long filenames supported), with the Notepad saving/loading files to the disk
 - A graphical (and text-mode) panic screen
-- QEMU self-test coverage for heap allocation, interrupts, CPU information, background task scheduling, and FAT32 read/write round trips
+- QEMU self-test coverage for heap allocation, interrupts, CPU information, background task scheduling, FAT32 read/write round trips, and process management (clean exit, page-fault isolation, disk-loaded ELF)
 
 ## Requirements
 
@@ -85,10 +86,25 @@ Type `help` at the `machaos>` prompt (inside the Terminal window, or at the
 text-mode fallback). Available commands: `help`, `clear`/`cls`, `echo`,
 `time`, `date`, `uptime`, `meminfo`, `heap`, `cpuinfo`, `version`/`ver`,
 `reboot`, `shutdown`, `crash`, `breakpoint`, `fault`, `panic`, `mousetest`,
-`tasks` (lists scheduler tasks and their background counters), and the
-filesystem commands `ls [path]`, `cat <path>`, `write <path> <text>`,
-`mkdir <path>`, `rm <path>`, `fatinfo`, `cd [path]`, and `pwd`. Paths may
-be relative to the current directory (the prompt shows it), and arguments
-containing spaces can be double-quoted: `write notes.txt "hello world"`.
-Up/Down recall command history and Tab completes command names (in both
-the Terminal window and the text-mode fallback shell).
+`tasks` (lists scheduler tasks, their background counters, and any
+processes with their running/exited state), `run <path>` (loads an ELF from
+disk as a process and waits for it to exit), and the filesystem commands
+`ls [path]`, `cat <path>`, `write <path> <text>`, `mkdir <path>`,
+`rm <path>`, `fatinfo`, `cd [path]`, and `pwd`. Paths may be relative to
+the current directory (the prompt shows it), and arguments containing
+spaces can be double-quoted: `write notes.txt "hello world"`. Up/Down
+recall command history and Tab completes command names (in both the
+Terminal window and the text-mode fallback shell).
+
+## User programs
+
+The `user/` crate compiles test programs (`prog_exit`, `prog_fault`) as
+standalone x86_64 ELF binaries with no libc. Its linker script
+(`user/linker.ld`) places the `.result` page at virtual address
+`0x2FF0000` — pinned there so the kernel can read a u64 result after the
+process exits — and the code at 48 MiB, clear of the kernel image and
+heap. Segments must stay between 2 MiB and 4 GiB and outside the heap
+range; `process::spawn` rejects anything else. `make build` compiles the
+user programs first and embeds them into the kernel
+(`src/user_prog.rs`); `make disk` also copies them to `/bin` so the shell's
+`run` command can load them from disk.
