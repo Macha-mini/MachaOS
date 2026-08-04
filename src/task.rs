@@ -197,6 +197,16 @@ fn spawn(entry: fn() -> !, name: &'static str) {
     push_task(entry as *const () as usize, name, paging::kernel_pml4(), None);
 }
 
+/// Registers a kernel-native background task (own stack, kernel address
+/// space, no `Process`) — `wayland.rs`'s compositor loop uses this
+/// instead of running as a Linux-ABI process, so it can freely `hlt`-wait
+/// for a connection or more data the way `process::wait` does; a
+/// syscall-driven process can't (see `syscall.rs`'s module docs on
+/// `SFMASK` clearing IF for a syscall's whole duration).
+pub fn spawn_kernel_task(entry: fn() -> !, name: &'static str) {
+    spawn(entry, name);
+}
+
 /// Registers a new task running `entry` (a kernel function address) on a
 /// fresh 16 KiB stack, returning its index ("pid"). Runs with interrupts
 /// disabled around the table mutation. `cr3` selects the address space

@@ -31,6 +31,8 @@ use crate::interrupts;
 use crate::io;
 use crate::paging;
 use crate::pmm;
+use crate::shm;
+use crate::socket;
 use crate::syscall;
 use crate::task;
 use crate::vfs;
@@ -98,6 +100,43 @@ pub struct Mapping {
     pub vaddr: u64,
     pub phys: u64,
     pub len: u64,
+    /// `Some(shm_id)` for a `MAP_SHARED` mapping of a `shm.rs` object —
+    /// those physical frames are refcounted there, owned by whichever
+    /// fds (in any process) still reference the object, not by this
+    /// process. `munmap` and process exit must leave them alone (no
+    /// `pmm::frame_free`) for a `Some` mapping; `None` is the normal
+    /// process-owned case every other mapping already was before shared
+    /// memory existed.
+    pub shm_id: Option<usize>,
+}
+
+/// One open fd's referent: a real file, a `memfd_create` shared-memory
+/// object, or an `AF_UNIX` socket endpoint. `File` used to be the fd
+/// table's only variant (`Vec<Option<vfs::FileHandle>>`); this widens it
+/// for Phase 5 (`shm.rs`/`socket.rs`) without disturbing how a plain
+/// file fd already worked.
+pub enum FdEntry {
+    File(vfs::FileHandle),
+    /// `(shm.rs` object id, byte cursor)` — a memfd is readable/
+    /// writable like a regular file even though real clients only ever
+    /// `mmap` it; kept for completeness since it costs little.
+    Shm(usize, usize),
+    /// `socket.rs` endpoint id.
+    Socket(usize),
+}
+
+impl Drop for FdEntry {
+    fn drop(&mut self) {
+        // `File`'s own `vfs::FileHandle` has its own `Drop` (flushes if
+        // dirty) that still runs automatically after this — Rust drops
+        // an enum's field(s) after a custom `Drop::drop` body, the same
+        // way it would for a struct.
+        match self {
+            FdEntry::Shm(id, _) => shm::close(*id),
+            FdEntry::Socket(id) => socket::close(*id),
+            FdEntry::File(_) => {}
+        }
+    }
 }
 
 /// Why a process stopped running.
@@ -149,10 +188,10 @@ pub struct Process {
     pub(crate) exit_info: Option<ExitInfo>,
     /// Single-slot mailbox for `sys_send`/`sys_recv` (see `task::deliver_message`).
     pub(crate) inbox: Option<Vec<u8>>,
-    /// Open-file table for the (future) Linux ABI layer's
-    /// `openat`/`read`/`write`/`lseek`/`close`/`fstat` syscalls. Indices
+    /// Open-fd table for the Linux ABI layer's `openat`/`read`/`write`/
+    /// `lseek`/`close`/`fstat`/`socket`/`mmap` syscalls. Indices
     /// 0..FIRST_FILE_FD stay `None` always — see `FIRST_FILE_FD`.
-    fds: Vec<Option<vfs::FileHandle>>,
+    fds: Vec<Option<FdEntry>>,
     /// Lowest address currently mapped for the ring-3 stack; starts at
     /// `USER_STACK_BASE` and moves down as `try_grow_stack` maps more of
     /// the reserved growth region below it.
@@ -213,20 +252,20 @@ impl Process {
         }
     }
 
-    /// Installs `handle` at the lowest free fd (never below
+    /// Installs `entry` at the lowest free fd (never below
     /// `FIRST_FILE_FD`), returning it.
-    pub fn alloc_fd(&mut self, handle: vfs::FileHandle) -> usize {
+    pub fn alloc_fd(&mut self, entry: FdEntry) -> usize {
         for (i, slot) in self.fds.iter_mut().enumerate().skip(FIRST_FILE_FD) {
             if slot.is_none() {
-                *slot = Some(handle);
+                *slot = Some(entry);
                 return i;
             }
         }
-        self.fds.push(Some(handle));
+        self.fds.push(Some(entry));
         self.fds.len() - 1
     }
 
-    pub fn fd_mut(&mut self, fd: usize) -> Option<&mut vfs::FileHandle> {
+    pub fn fd_mut(&mut self, fd: usize) -> Option<&mut FdEntry> {
         self.fds.get_mut(fd)?.as_mut()
     }
 
@@ -265,6 +304,7 @@ impl Process {
             vaddr: USER_STACK_LOW_LIMIT,
             phys: phys as u64,
             len: USER_STACK_MAX_PAGES * paging::PAGE_SIZE,
+            shm_id: None,
         });
         Ok(())
     }
@@ -364,6 +404,7 @@ impl Process {
                 vaddr: map_at,
                 phys: phys as u64,
                 len: grow_len,
+                shm_id: None,
             });
         }
         self.heap_end = requested;
@@ -435,6 +476,53 @@ impl Process {
             vaddr: addr,
             phys: phys as u64,
             len,
+            shm_id: None,
+        });
+        if at.is_none() {
+            self.mmap_next = addr + len;
+        }
+        Some(addr)
+    }
+
+    /// Linux `mmap(..., MAP_SHARED, shm_fd, 0)` against a `shm.rs`
+    /// object: maps that object's *existing* physical frames (whole
+    /// object, offset 0 only — every real `wl_shm` caller maps the
+    /// entire pool it just `ftruncate`d) instead of allocating fresh
+    /// ones, so writes through this mapping are visible to whichever
+    /// other process maps the same `shm_id` — the actual point of
+    /// `MAP_SHARED`, unlike `mmap_file`'s eager private copy. The
+    /// mapped `Mapping` doesn't own these frames (`shm_id: Some(id)`
+    /// marks that for `munmap`/process exit): `shm.rs`'s own refcount,
+    /// not this process, decides when they're freed.
+    pub fn mmap_shared(&mut self, pml4: u64, at: Option<u64>, shm_id: usize, writable: bool) -> Option<u64> {
+        let phys = shm::phys_of(shm_id)?;
+        let pages = shm::pages_of(shm_id)?;
+        let len = (pages * paging::PAGE_SIZE as usize) as u64;
+        if len == 0 {
+            return None;
+        }
+        let addr = match at {
+            Some(a) => a & !(paging::PAGE_SIZE - 1),
+            None => {
+                let a = self.mmap_next;
+                if a.checked_add(len)? > MMAP_CEILING {
+                    return None;
+                }
+                a
+            }
+        };
+        let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
+        if writable {
+            flags |= paging::PAGE_WRITABLE;
+        }
+        if !paging::map_range_in(pml4, addr, phys as u64, len, flags, &mut self.frames) {
+            return None;
+        }
+        self.mappings.push(Mapping {
+            vaddr: addr,
+            phys: phys as u64,
+            len,
+            shm_id: Some(shm_id),
         });
         if at.is_none() {
             self.mmap_next = addr + len;
@@ -456,11 +544,16 @@ impl Process {
             let m = self.mappings[i];
             if m.vaddr >= start && m.vaddr + m.len <= end {
                 paging::unmap_range_in(pml4, m.vaddr, m.len);
-                let pages = (m.len / paging::PAGE_SIZE) as usize;
-                for p in 0..pages {
-                    pmm::frame_free(m.phys as usize + p * pmm::FRAME_SIZE);
+                // Shared-memory frames outlive this mapping — see
+                // `Mapping::shm_id`'s doc comment — so only a
+                // process-owned (`shm_id: None`) mapping frees them.
+                if m.shm_id.is_none() {
+                    let pages = (m.len / paging::PAGE_SIZE) as usize;
+                    for p in 0..pages {
+                        pmm::frame_free(m.phys as usize + p * pmm::FRAME_SIZE);
+                    }
+                    self.frames.retain(|&f| (f as u64) < m.phys || (f as u64) >= m.phys + m.len);
                 }
-                self.frames.retain(|&f| (f as u64) < m.phys || (f as u64) >= m.phys + m.len);
                 self.mappings.remove(i);
             } else {
                 i += 1;
@@ -875,6 +968,7 @@ fn load_segments(
         vaddr: overall_start,
         phys: phys as u64,
         len,
+        shm_id: None,
     });
     Ok(())
 }
@@ -933,6 +1027,7 @@ fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str
         vaddr: USER_EXIT_STUB_VIRT,
         phys: stub_phys as u64,
         len: paging::PAGE_SIZE,
+        shm_id: None,
     });
 
     // One return-address slot at the top of the stack. Written through

@@ -96,6 +96,18 @@ pub fn with_surface<F: FnOnce(&mut dyn Surface)>(f: F) {
     }
 }
 
+/// Reads back a pixel from the back buffer — used by `wayland.rs`'s
+/// selftest hook to verify a client's shared-memory buffer actually made
+/// it onto the real framebuffer, not just that the handshake completed.
+pub fn get_pixel(x: u32, y: u32) -> Option<u32> {
+    let guard = STATE.lock();
+    let state = guard.as_ref()?;
+    if x >= state.width || y >= state.height {
+        return None;
+    }
+    Some(state.back_buffer[(y * state.width + x) as usize])
+}
+
 /// Copies the back buffer to the real MMIO framebuffer.
 pub fn present() {
     let guard = STATE.lock();

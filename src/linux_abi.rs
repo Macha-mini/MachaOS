@@ -63,7 +63,11 @@
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
+use crate::process::FdEntry;
+use crate::shm;
+use crate::socket;
 use crate::vfs;
 
 // ---- errno -----------------------------------------------------------
@@ -131,6 +135,12 @@ const SYS_SET_ROBUST_LIST: u64 = 273;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
 const SYS_RSEQ: u64 = 334;
+const SYS_SOCKET: u64 = 41;
+const SYS_CONNECT: u64 = 42;
+const SYS_SENDMSG: u64 = 46;
+const SYS_RECVMSG: u64 = 47;
+const SYS_FTRUNCATE: u64 = 77;
+const SYS_MEMFD_CREATE: u64 = 319;
 
 // ---- helpers ------------------------------------------------------------
 
@@ -215,10 +225,12 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
         return err(EBADF); // fd 0 (stdin) isn't writable
     }
     with_process(|p| match p.fd_mut(fd as usize) {
-        Some(h) => match h.write(bytes) {
+        Some(FdEntry::File(h)) => match h.write(bytes) {
             Ok(n) => n as u64,
             Err(e) => vfs_err(e),
         },
+        Some(FdEntry::Shm(id, cursor)) => shm_write(*id, cursor, bytes) as u64,
+        Some(FdEntry::Socket(id)) => socket::send(*id, bytes, &[]).map(|n| n as u64).unwrap_or(err(EPIPE)),
         None => err(EBADF),
     })
     .unwrap_or(err(EBADF))
@@ -247,9 +259,27 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
         return err(EBADF); // fd 1/2 (stdout/stderr) aren't readable
     }
     with_process(|p| match p.fd_mut(fd as usize) {
-        Some(h) => {
+        Some(FdEntry::File(h)) => {
             let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
             h.read(out) as u64
+        }
+        Some(FdEntry::Shm(id, cursor)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            shm_read(*id, cursor, out) as u64
+        }
+        Some(FdEntry::Socket(id)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            let (n, fds) = socket::recv(*id, out);
+            // A plain `read()` can't carry `SCM_RIGHTS` — any fds that
+            // happened to be queued on this message are lost, same as
+            // real Linux. Nothing in this kernel's own protocol
+            // (`wayland.rs`) ever mixes a data-only `read()` with an
+            // fd-bearing message, so this path is a defensive fallback,
+            // not a real one.
+            for fid in fds {
+                shm::close(fid);
+            }
+            n as u64
         }
         None => err(EBADF),
     })
@@ -263,9 +293,48 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
     let path = normalize_path(&path);
     let vfs_flags = translate_open_flags(flags);
     match vfs::FileHandle::open(&path, vfs_flags) {
-        Ok(handle) => with_process(|p| p.alloc_fd(handle) as u64).unwrap_or(err(EBADF)),
+        Ok(handle) => with_process(|p| p.alloc_fd(FdEntry::File(handle)) as u64).unwrap_or(err(EBADF)),
         Err(e) => vfs_err(e),
     }
+}
+
+/// Copies up to `out.len()` bytes from `id`'s backing starting at
+/// `*cursor`, advancing it — `read()`/`pread`-style access to a memfd,
+/// direct against its physical frames (identity-mapped, like everything
+/// else this kernel touches straight from ring 0).
+fn shm_read(id: usize, cursor: &mut usize, out: &mut [u8]) -> usize {
+    let (Some(phys), Some(size)) = (shm::phys_of(id), shm::size_of(id)) else {
+        return 0;
+    };
+    let avail = size.saturating_sub(*cursor);
+    let n = avail.min(out.len());
+    if n > 0 {
+        unsafe { core::ptr::copy_nonoverlapping((phys + *cursor) as *const u8, out.as_mut_ptr(), n) };
+        *cursor += n;
+    }
+    n
+}
+
+fn shm_write(id: usize, cursor: &mut usize, data: &[u8]) -> usize {
+    let (Some(phys), Some(size)) = (shm::phys_of(id), shm::size_of(id)) else {
+        return 0;
+    };
+    let avail = size.saturating_sub(*cursor);
+    let n = avail.min(data.len());
+    if n > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), (phys + *cursor) as *mut u8, n) };
+        *cursor += n;
+    }
+    n
+}
+
+fn seek_cursor(cursor: usize, size: usize, from: vfs::SeekFrom) -> usize {
+    let base = match from {
+        vfs::SeekFrom::Start(p) => p as i64,
+        vfs::SeekFrom::Current(p) => cursor as i64 + p,
+        vfs::SeekFrom::End(p) => size as i64 + p,
+    };
+    base.max(0) as usize
 }
 
 /// `access(pathname, mode)`: this kernel doesn't track file permissions
@@ -303,7 +372,13 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         _ => return err(EINVAL),
     };
     with_process(|p| match p.fd_mut(fd as usize) {
-        Some(h) => h.seek(from),
+        Some(FdEntry::File(h)) => h.seek(from),
+        Some(FdEntry::Shm(id, cursor)) => {
+            let size = shm::size_of(*id).unwrap_or(0);
+            *cursor = seek_cursor(*cursor, size, from);
+            *cursor as u64
+        }
+        Some(FdEntry::Socket(_)) => err(ESPIPE),
         None => err(EBADF),
     })
     .unwrap_or(err(EBADF))
@@ -324,8 +399,8 @@ fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> u64 {
         return err(EFAULT);
     };
     with_process(|p| {
-        let Some(h) = p.fd_mut(fd as usize) else {
-            return err(EBADF);
+        let Some(FdEntry::File(h)) = p.fd_mut(fd as usize) else {
+            return err(EBADF); // pread64 against a memfd/socket isn't needed by anything this kernel runs yet
         };
         let saved = h.seek(vfs::SeekFrom::Current(0));
         h.seek(vfs::SeekFrom::Start(offset));
@@ -362,16 +437,24 @@ fn write_stat(buf_ptr: u64, mode: u32, size: u64) -> u64 {
     0
 }
 
+const S_IFSOCK: u32 = 0o140000;
+
 fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     if fd < 3 {
         return write_stat(statbuf, S_IFCHR | 0o666, 0);
     }
-    let stat = with_process(|p| p.fd_mut(fd as usize).map(|h| h.stat()));
-    match stat {
-        Some(Some(st)) => {
+    let result = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::File(h)) => {
+            let st = h.stat();
             let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
-            write_stat(statbuf, mode, st.size)
+            Some((mode, st.size))
         }
+        Some(FdEntry::Shm(id, _)) => Some((S_IFREG | 0o600, shm::size_of(*id).unwrap_or(0) as u64)),
+        Some(FdEntry::Socket(_)) => Some((S_IFSOCK | 0o777, 0)),
+        None => None,
+    });
+    match result {
+        Some(Some((mode, size))) => write_stat(statbuf, mode, size),
         _ => err(EBADF),
     }
 }
@@ -432,14 +515,27 @@ fn sys_brk(addr: u64) -> u64 {
     with_process(|p| p.brk(pml4, addr)).unwrap_or(0)
 }
 
+const MAP_SHARED: u64 = 0x01;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const PROT_WRITE: u64 = 2;
 
+enum MmapFdKind {
+    File,
+    Shm(usize),
+}
+
 /// `fd`/`offset` only matter for a file-backed request (`MAP_ANONYMOUS`
-/// clear and `fd` a real, non-negative descriptor) — `ld.so` uses this to
-/// map each segment of a shared library it's loading straight from the
-/// library's own file bytes (see `process::Process::mmap_file`).
+/// clear and `fd` a real, non-negative descriptor). Two real fd kinds
+/// reach here: a plain file — `ld.so` uses this to map each segment of a
+/// shared library it's loading straight from the library's own file
+/// bytes (see `process::Process::mmap_file`), a private eager copy — or
+/// a `memfd_create` shared-memory object with `MAP_SHARED`, which needs
+/// `process::Process::mmap_shared` instead: the whole reason `wl_shm`
+/// works is that the compositor's mapping of the same object sees the
+/// client's writes, which an eager copy could never give it.
+/// `MAP_PRIVATE` of a memfd isn't supported (see module docs) — nothing
+/// this kernel runs needs it.
 fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
     if len == 0 {
         return err(EINVAL);
@@ -454,17 +550,35 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
         return with_process(|p| p.mmap_anon(pml4, at, len, writable)).flatten().unwrap_or(err(ENOMEM));
     }
 
-    let content = with_process(|p| {
-        let h = p.fd_mut(fd as usize)?;
-        h.seek(vfs::SeekFrom::Start(offset));
-        let mut buf = alloc::vec![0u8; len as usize];
-        let n = h.read(&mut buf);
-        buf.truncate(n);
-        Some(buf)
-    });
-    match content {
-        Some(Some(bytes)) => with_process(|p| p.mmap_file(pml4, at, len, writable, &bytes)).flatten().unwrap_or(err(ENOMEM)),
-        _ => err(EBADF),
+    let kind = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::File(_)) => Some(MmapFdKind::File),
+        Some(FdEntry::Shm(id, _)) => Some(MmapFdKind::Shm(*id)),
+        _ => None,
+    })
+    .flatten();
+
+    match kind {
+        Some(MmapFdKind::Shm(shm_id)) if flags & MAP_SHARED != 0 => {
+            with_process(|p| p.mmap_shared(pml4, at, shm_id, writable)).flatten().unwrap_or(err(ENOMEM))
+        }
+        Some(MmapFdKind::Shm(_)) => err(EINVAL),
+        Some(MmapFdKind::File) => {
+            let content = with_process(|p| {
+                let Some(FdEntry::File(h)) = p.fd_mut(fd as usize) else {
+                    return None;
+                };
+                h.seek(vfs::SeekFrom::Start(offset));
+                let mut buf = alloc::vec![0u8; len as usize];
+                let n = h.read(&mut buf);
+                buf.truncate(n);
+                Some(buf)
+            });
+            match content {
+                Some(Some(bytes)) => with_process(|p| p.mmap_file(pml4, at, len, writable, &bytes)).flatten().unwrap_or(err(ENOMEM)),
+                _ => err(EBADF),
+            }
+        }
+        None => err(EBADF),
     }
 }
 
@@ -489,6 +603,255 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     } else {
         err(EINVAL)
     }
+}
+
+// ---- shared memory (memfd_create / ftruncate) ----------------------------
+
+fn sys_memfd_create(_name: u64, _flags: u64) -> u64 {
+    let id = shm::create();
+    with_process(|p| p.alloc_fd(FdEntry::Shm(id, 0)) as u64).unwrap_or(err(EBADF))
+}
+
+/// Only meaningful against a `memfd_create` fd — this kernel's regular
+/// files aren't sparse/pre-sizeable the way `ftruncate` implies, and
+/// nothing that runs against them needs it (only `wl_shm`-style shared
+/// memory ever calls this).
+fn sys_ftruncate(fd: u64, len: u64) -> u64 {
+    let shm_id = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::Shm(id, _)) => Some(*id),
+        _ => None,
+    })
+    .flatten();
+    match shm_id {
+        Some(id) if shm::truncate(id, len as usize) => 0,
+        Some(_) => err(ENOMEM),
+        None => err(EBADF),
+    }
+}
+
+// ---- AF_UNIX sockets ------------------------------------------------------
+//
+// See `socket.rs`'s module docs for why every syscall here is
+// non-blocking (interrupts are off for a syscall's whole duration) and
+// what "connect" actually does (synchronously pairs this endpoint with
+// a freshly created one on the listener's backlog — nothing here ever
+// calls `socket::bind`/`listen`/`accept`, since those are only ever
+// used by `wayland.rs`'s kernel-native compositor task directly, not
+// through a syscall).
+
+const AF_UNIX: u64 = 1;
+const SOCK_STREAM: u64 = 1;
+const SOL_SOCKET: u32 = 1;
+const SCM_RIGHTS: u32 = 1;
+const EPIPE: i32 = 32;
+const EAFNOSUPPORT: i32 = 97;
+const ECONNREFUSED: i32 = 111;
+
+unsafe fn read_u64(addr: u64) -> u64 {
+    unsafe { core::ptr::read_unaligned(addr as *const u64) }
+}
+
+unsafe fn read_u32(addr: u64) -> u32 {
+    unsafe { core::ptr::read_unaligned(addr as *const u32) }
+}
+
+unsafe fn write_u64(addr: u64, v: u64) {
+    unsafe { core::ptr::write_unaligned(addr as *mut u64, v) }
+}
+
+unsafe fn write_u32(addr: u64, v: u32) {
+    unsafe { core::ptr::write_unaligned(addr as *mut u32, v) }
+}
+
+fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> u64 {
+    if domain != AF_UNIX || (ty & 0xf) != SOCK_STREAM {
+        return err(EAFNOSUPPORT);
+    }
+    let id = socket::create();
+    with_process(|p| p.alloc_fd(FdEntry::Socket(id)) as u64).unwrap_or(err(EBADF))
+}
+
+/// Reads a `struct sockaddr_un` (`sa_family: u16` then a NUL-terminated
+/// `sun_path`) from user memory — the only address family these sockets
+/// support.
+fn read_sockaddr_un(addr: u64, addrlen: u64) -> Option<String> {
+    let len = addrlen.min(2 + 108) as usize;
+    if len < 2 {
+        return None;
+    }
+    let phys = resolve(addr, len as u64)?;
+    let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, len) };
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+    if family as u64 != AF_UNIX {
+        return None;
+    }
+    let path_bytes = &bytes[2..];
+    let nul = path_bytes.iter().position(|&b| b == 0).unwrap_or(path_bytes.len());
+    core::str::from_utf8(&path_bytes[..nul]).ok().map(|s| s.to_string())
+}
+
+fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    let Some(path) = read_sockaddr_un(addr, addrlen) else {
+        return err(EINVAL);
+    };
+    let socket_id = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::Socket(id)) => Some(*id),
+        _ => None,
+    })
+    .flatten();
+    let Some(socket_id) = socket_id else {
+        return err(EBADF);
+    };
+    if socket::connect(socket_id, &path) {
+        0
+    } else {
+        err(ECONNREFUSED)
+    }
+}
+
+/// `sendmsg(fd, msg, flags)`: a real `struct msghdr`/`iovec`/`cmsghdr`
+/// layout, but only ever reads a single `iovec` and at most one
+/// `SCM_RIGHTS` `cmsghdr` — everything `wayland.rs`'s wire protocol
+/// needs to pass. Each ancillary fd is resolved from *this* (the
+/// sender's) fd table to a `shm.rs` object id before handing it to
+/// `socket::send`, which is what actually crosses it over to the peer.
+fn sys_sendmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
+    let Some(msg_phys) = resolve(msg, 56) else {
+        return err(EFAULT);
+    };
+    let socket_id = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::Socket(id)) => Some(*id),
+        _ => None,
+    })
+    .flatten();
+    let Some(socket_id) = socket_id else {
+        return err(EBADF);
+    };
+
+    let iov_ptr = unsafe { read_u64(msg_phys + 16) };
+    let iov_len_count = unsafe { read_u64(msg_phys + 24) };
+    let control_ptr = unsafe { read_u64(msg_phys + 32) };
+    let control_len = unsafe { read_u64(msg_phys + 40) };
+
+    let mut bytes: Vec<u8> = Vec::new();
+    if iov_len_count > 0 {
+        if let Some(iov_phys) = resolve(iov_ptr, 16) {
+            let base = unsafe { read_u64(iov_phys) };
+            let blen = unsafe { read_u64(iov_phys + 8) };
+            if blen > 0 {
+                if let Some(data_phys) = resolve(base, blen) {
+                    bytes = unsafe { core::slice::from_raw_parts(data_phys as *const u8, blen as usize) }.to_vec();
+                }
+            }
+        }
+    }
+
+    let mut shm_ids: Vec<usize> = Vec::new();
+    if control_len >= 16 {
+        if let Some(ctrl_phys) = resolve(control_ptr, control_len) {
+            let cmsg_len = unsafe { read_u64(ctrl_phys) } as usize;
+            let cmsg_level = unsafe { read_u32(ctrl_phys + 8) };
+            let cmsg_type = unsafe { read_u32(ctrl_phys + 12) };
+            if cmsg_level == SOL_SOCKET && cmsg_type == SCM_RIGHTS && cmsg_len > 16 {
+                let n_fds = (cmsg_len - 16) / 4;
+                for i in 0..n_fds {
+                    let client_fd = unsafe { read_u32(ctrl_phys + 16 + (i as u64) * 4) } as u64;
+                    let shm_id = with_process(|p| match p.fd_mut(client_fd as usize) {
+                        Some(FdEntry::Shm(id, _)) => Some(*id),
+                        _ => None,
+                    })
+                    .flatten();
+                    if let Some(id) = shm_id {
+                        shm_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    match socket::send(socket_id, &bytes, &shm_ids) {
+        Some(n) => n as u64,
+        None => err(EPIPE),
+    }
+}
+
+/// `recvmsg(fd, msg, flags)`: the receiving half of `sys_sendmsg` — never
+/// blocks (see `socket.rs`'s module docs), returns `-EAGAIN` immediately
+/// when nothing is queued rather than waiting for it.
+fn sys_recvmsg(fd: u64, msg: u64, _flags: u64) -> u64 {
+    let Some(msg_phys) = resolve(msg, 56) else {
+        return err(EFAULT);
+    };
+    let socket_id = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::Socket(id)) => Some(*id),
+        _ => None,
+    })
+    .flatten();
+    let Some(socket_id) = socket_id else {
+        return err(EBADF);
+    };
+    if !socket::has_data(socket_id) {
+        return err(EAGAIN);
+    }
+
+    let iov_ptr = unsafe { read_u64(msg_phys + 16) };
+    let iov_len_count = unsafe { read_u64(msg_phys + 24) };
+    let control_ptr = unsafe { read_u64(msg_phys + 32) };
+    let control_cap = unsafe { read_u64(msg_phys + 40) };
+
+    let (buf_phys, buf_len) = if iov_len_count > 0 {
+        match resolve(iov_ptr, 16) {
+            Some(iov_phys) => {
+                let base = unsafe { read_u64(iov_phys) };
+                let blen = unsafe { read_u64(iov_phys + 8) };
+                (resolve(base, blen), blen)
+            }
+            None => (None, 0),
+        }
+    } else {
+        (None, 0)
+    };
+
+    let (n, recv_fds) = match buf_phys {
+        Some(bp) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(bp as *mut u8, buf_len as usize) };
+            socket::recv(socket_id, out)
+        }
+        None => socket::recv(socket_id, &mut []),
+    };
+
+    let mut controllen_used = 0u64;
+    match resolve(control_ptr, control_cap).filter(|_| !recv_fds.is_empty() && control_cap >= 16) {
+        Some(ctrl_phys) => {
+            let max_fds = ((control_cap - 16) / 4).min(recv_fds.len() as u64) as usize;
+            let cmsg_len = 16 + (max_fds as u64) * 4;
+            unsafe {
+                write_u64(ctrl_phys, cmsg_len);
+                write_u32(ctrl_phys + 8, SOL_SOCKET);
+                write_u32(ctrl_phys + 12, SCM_RIGHTS);
+            }
+            for (i, &shm_id) in recv_fds.iter().take(max_fds).enumerate() {
+                let new_fd = with_process(|p| p.alloc_fd(FdEntry::Shm(shm_id, 0))).unwrap_or(0);
+                unsafe { write_u32(ctrl_phys + 16 + (i as u64) * 4, new_fd as u32) };
+            }
+            controllen_used = cmsg_len;
+            // Any fds beyond what the caller's buffer could fit are
+            // simply dropped (their `shm.rs` reference released) — real
+            // recvmsg sets MSG_CTRUNC instead; not worth the extra
+            // plumbing when this module's one real caller always sizes
+            // its buffer correctly.
+            for &shm_id in recv_fds.iter().skip(max_fds) {
+                shm::close(shm_id);
+            }
+        }
+        None => {
+            for &shm_id in &recv_fds {
+                shm::close(shm_id);
+            }
+        }
+    }
+    unsafe { write_u64(msg_phys + 40, controllen_used) };
+    n as u64
 }
 
 // ---- TLS (arch_prctl) -------------------------------------------------
@@ -689,6 +1052,12 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_PRLIMIT64 => sys_prlimit64(arg1, arg2, arg3, arg4),
         SYS_SCHED_GETAFFINITY => sys_sched_getaffinity(arg1, arg2, arg3),
         SYS_SYSINFO => sys_sysinfo(arg1),
+        SYS_MEMFD_CREATE => sys_memfd_create(arg1, arg2),
+        SYS_FTRUNCATE => sys_ftruncate(arg1, arg2),
+        SYS_SOCKET => sys_socket(arg1, arg2, arg3),
+        SYS_CONNECT => sys_connect(arg1, arg2, arg3),
+        SYS_SENDMSG => sys_sendmsg(arg1, arg2, arg3),
+        SYS_RECVMSG => sys_recvmsg(arg1, arg2, arg3),
         _ => {
             let mut buf = [0u8; 64];
             let msg = crate::io::sprint(&mut buf, format_args!("[UNKSYSCALL] num={}\n", num));

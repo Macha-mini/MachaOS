@@ -38,6 +38,8 @@ mod rtc;
 mod serial;
 mod settings;
 mod shell;
+mod shm;
+mod socket;
 mod sync;
 mod syscall;
 mod task;
@@ -45,6 +47,7 @@ mod user_prog;
 mod users;
 mod vfs;
 mod vga;
+mod wayland;
 mod wm;
 
 use core::arch::global_asm;
@@ -286,6 +289,8 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     println!("     features: {}", features.join(" "));
 
     interrupts::enable_interrupts();
+
+    wayland::start();
 
     let selftest_mode = info
         .cmdline()
