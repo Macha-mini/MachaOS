@@ -38,6 +38,7 @@ mod sync;
 mod syscall;
 mod task;
 mod user_prog;
+mod users;
 mod vga;
 mod wm;
 

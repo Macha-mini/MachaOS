@@ -818,3 +818,27 @@ pub fn is_dir(path: &str) -> Result<bool, FatError> {
         None => Err(FatError::NotFound),
     }
 }
+
+/// Moves a file — or an empty directory — from `src` to `dst`.
+///
+/// Implemented as copy + delete (the FAT layer has no rename); an
+/// existing file at `dst` is overwritten, an existing directory makes
+/// `make_dir` fail with `AlreadyExists`, and moving a non-empty
+/// directory fails with `NotEmpty` (no recursive copy).
+pub fn move_file(src: &str, dst: &str) -> Result<(), FatError> {
+    if src == dst {
+        return Ok(());
+    }
+    if is_dir(src)? {
+        if !list_dir(src)?.is_empty() {
+            return Err(FatError::NotEmpty);
+        }
+        make_dir(dst)?;
+        remove(src)?;
+        Ok(())
+    } else {
+        let data = read_file(src)?;
+        write_file(dst, &data)?;
+        remove(src)
+    }
+}

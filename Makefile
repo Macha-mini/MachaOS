@@ -55,15 +55,27 @@ disk: wallpaper
 	mkfs.fat -F 32 $(DISK)
 	printf 'hello from the host\n' > target/fixture.txt
 	printf 'welcome to MachaOS\n' > target/fixture2.txt
-	mmd -i $(DISK) ::/docs
-	mcopy -i $(DISK) target/fixture.txt "::/hello world.txt"
-	mcopy -i $(DISK) target/fixture2.txt ::/greetings.txt
-	mcopy -i $(DISK) target/fixture.txt ::/docs/readme.txt
 	mmd -i $(DISK) ::/bin
 	mcopy -i $(DISK) target/user-exit.elf ::/bin/prog_exit.elf
 	mcopy -i $(DISK) target/user-fault.elf ::/bin/prog_fault.elf
-	mcopy -i $(DISK) $(WALLPAPER) ::/wallpaper.raw
+	mmd -i $(DISK) ::/system
+	mmd -i $(DISK) ::/users
+	mmd -i $(DISK) ::/users/macha
+	mmd -i $(DISK) ::/users/macha/Desktop
+	mmd -i $(DISK) ::/users/macha/Documents
+	mmd -i $(DISK) ::/users/macha/Downloads
+	mmd -i $(DISK) ::/users/macha/Pictures
+	mmd -i $(DISK) ::/users/macha/Music
+	printf 'MachaOS system files\n' > target/system-readme.txt
+	printf 'Welcome to MachaOS Desktop\n' > target/desktop-welcome.txt
+	mcopy -i $(DISK) target/system-readme.txt ::/system/README.TXT
+	mcopy -i $(DISK) target/desktop-welcome.txt ::/users/macha/Desktop/welcome.txt
+	mcopy -i $(DISK) target/fixture.txt "::/users/macha/Documents/hello world.txt"
+	mcopy -i $(DISK) target/fixture2.txt ::/users/macha/Documents/greetings.txt
+	mcopy -i $(DISK) target/fixture.txt ::/users/macha/Documents/readme.txt
+	mcopy -i $(DISK) $(WALLPAPER) ::/system/wallpaper.raw
 	rm -f target/fixture.txt target/fixture2.txt
+	rm -f target/system-readme.txt target/desktop-welcome.txt
 
 run: iso disk
 	$(QEMU) -cdrom $(ISO) -boot d -drive file=$(DISK),format=raw -serial stdio

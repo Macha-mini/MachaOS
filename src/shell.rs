@@ -11,12 +11,17 @@ const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
 
 // Current working directory on the mounted disk (absolute, normalized).
-// Defaults to the filesystem root until the user runs `cd`.
+// Empty means "not set yet": the shell starts in the user's home.
 static CWD: SpinLock<String> = SpinLock::new(String::new());
 
 /// Returns the current working directory (always starts with `/`).
 pub fn cwd() -> String {
-    CWD.lock().clone()
+    let dir = CWD.lock().clone();
+    if dir.is_empty() {
+        crate::users::home()
+    } else {
+        dir
+    }
 }
 
 fn set_cwd(path: &str) {
@@ -55,12 +60,22 @@ fn normalize_path(path: &str) -> String {
     out
 }
 
-/// Resolves `path` against the current working directory.
+/// Resolves `path` against the current working directory. A leading
+/// `~` (or `~/`) expands to the user's home directory.
 fn abs_path(path: &str) -> String {
-    if path.starts_with('/') {
-        normalize_path(path)
+    let expanded = if let Some(rest) = path.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            format!("{}{}", crate::users::home(), rest)
+        } else {
+            path.to_string()
+        }
     } else {
-        normalize_path(&format!("{}/{}", cwd(), path))
+        path.to_string()
+    };
+    if expanded.starts_with('/') {
+        normalize_path(&expanded)
+    } else {
+        normalize_path(&format!("{}/{}", cwd(), expanded))
     }
 }
 
@@ -297,6 +312,7 @@ pub fn execute(line: &str) {
         "run" => cmd_run(&args),
         "cd" => cmd_cd(&args),
         "pwd" => println!("{}", cwd()),
+        "whoami" => println!("{}", crate::users::USER),
         _ => println!("unknown command: '{}' (type 'help')", command),
     }
 }
@@ -329,10 +345,11 @@ fn cmd_help() {
     println!("  mkdir <path> create a directory");
     println!("  rm <path>   remove a file or empty directory");
     println!("  run <path>  load and run an ELF program as a process");
-    println!("  cd [path]   change directory (default: root, .. goes up)");
+    println!("  cd [path]   change directory (default: home, .. goes up)");
     println!("  pwd         print the current directory");
-    println!("Paths may be relative to the current directory; quote arguments");
-    println!("containing spaces: write notes.txt \"hello world\"");
+    println!("  whoami      print the current user");
+    println!("Paths may be relative to the current directory; '~' means the");
+    println!("home directory; quote arguments containing spaces: write notes.txt \"hello world\"");
 }
 
 fn cmd_date() {
@@ -430,9 +447,10 @@ fn cmd_rm(args: &[&str]) {
 }
 
 fn cmd_cd(args: &[&str]) {
-    // No argument: back to the root. Quoted paths may contain spaces.
+    // No argument: back to the user's home. Quoted paths may contain
+    // spaces, and `~` expands to the home directory.
     let target = if args.is_empty() {
-        String::from("/")
+        crate::users::home()
     } else {
         abs_path(&args.join(" "))
     };
@@ -684,29 +702,31 @@ pub fn selftest() -> ! {
     execute("tasks");
     execute("fatinfo");
     execute("ls");
-    execute("ls /docs");
-    execute("cat /hello world.txt");
-    execute("cat /greetings.txt");
-    execute("cat /docs/readme.txt");
+    execute("ls /users/macha/Documents");
+    execute("cat /users/macha/Documents/hello world.txt");
+    execute("cat /users/macha/Documents/greetings.txt");
+    execute("cat /users/macha/Documents/readme.txt");
+    execute("whoami");
 
     // FAT32 read verification: the fixture files were placed on the disk
     // image by `make disk` (mtools), so this exercises LFN parsing, the
-    // FAT cluster chain, and subdirectory traversal.
-    match fat::list_dir("/") {
+    // FAT cluster chain, and subdirectory traversal. Fixtures live in
+    // the user's Documents folder.
+    match fat::list_dir("/users/macha/Documents") {
         Ok(entries) => {
             let fixture = entries.iter().find(|e| e.name == "hello world.txt");
             match fixture {
                 Some(entry) if !entry.is_dir && entry.size == 20 => {
-                    println!("[OK] FAT32 root listing finds fixture (20 bytes)")
+                    println!("[OK] FAT32 Documents listing finds fixture (20 bytes)")
                 }
-                _ => selftest_fail("FAT32 fixture file missing or wrong size in /"),
+                _ => selftest_fail("FAT32 fixture file missing or wrong size in Documents"),
             }
         }
-        Err(_) => selftest_fail("FAT32 root listing failed"),
+        Err(_) => selftest_fail("FAT32 Documents listing failed"),
     }
-    match fat::read_file("/docs/readme.txt") {
+    match fat::read_file("/users/macha/Documents/readme.txt") {
         Ok(data) if data == b"hello from the host\n" => {
-            println!("[OK] FAT32 read /docs/readme.txt matches fixture")
+            println!("[OK] FAT32 read Documents/readme.txt matches fixture")
         }
         _ => selftest_fail("FAT32 subdirectory read mismatch"),
     }
@@ -739,6 +759,27 @@ pub fn selftest() -> ! {
         }
         _ => selftest_fail("FAT32 overwrite mismatch"),
     }
+    if let Err(_e) = fat::write_file("/selftest/movable.txt", b"move payload") {
+        selftest_fail("FAT32 move source write failed");
+    }
+    if let Err(_e) = fat::make_dir("/selftest/destination") {
+        selftest_fail("FAT32 move destination mkdir failed");
+    }
+    if let Err(_e) = fat::move_file("/selftest/movable.txt", "/selftest/destination/movable.txt") {
+        selftest_fail("FAT32 move failed");
+    }
+    match fat::read_file("/selftest/destination/movable.txt") {
+        Ok(data) if data == b"move payload" && fat::read_file("/selftest/movable.txt").is_err() => {
+            println!("[OK] FAT32 move file round trip")
+        }
+        _ => selftest_fail("FAT32 move result mismatch"),
+    }
+    if let Err(_e) = fat::remove("/selftest/destination/movable.txt") {
+        selftest_fail("FAT32 move cleanup file failed");
+    }
+    if let Err(_e) = fat::remove("/selftest/destination") {
+        selftest_fail("FAT32 move cleanup directory failed");
+    }
     if let Err(_e) = fat::remove("/selftest/multicluster payload.txt") {
         selftest_fail("FAT32 rm file failed");
     }
@@ -757,30 +798,38 @@ pub fn selftest() -> ! {
         );
     }
 
-    // Shell path handling: cd/pwd, `..`, and relative access.
-    execute("cd /docs");
-    if cwd() != "/docs" {
-        selftest_fail("cd /docs did not update cwd");
+    // Shell path handling: cd/pwd, `..`, home expansion, and relative access.
+    execute("cd /users/macha/Documents");
+    if cwd() != "/users/macha/Documents" {
+        selftest_fail("cd Documents did not update cwd");
     }
     execute("pwd");
     execute("ls");
     execute("cat readme.txt"); // relative to cwd
     execute("cd ..");
-    if cwd() != "/" {
-        selftest_fail("cd .. did not return to the root");
+    if cwd() != "/users/macha" {
+        selftest_fail("cd .. did not return to the home directory");
     }
     execute("pwd");
+    execute("cd ~/Documents");
+    if cwd() != "/users/macha/Documents" {
+        selftest_fail("~ expansion did not resolve to Documents");
+    }
+    execute("cd");
+    if cwd() != "/users/macha" {
+        selftest_fail("cd with no argument did not return home");
+    }
     println!("[OK] shell cd/pwd and relative paths");
 
     // Quoting: a double-quoted argument keeps embedded spaces whole.
-    execute("write /qt.txt \"hello world from quotes\"");
-    match fat::read_file("/qt.txt") {
+    execute("write ~/Documents/qt.txt \"hello world from quotes\"");
+    match fat::read_file("/users/macha/Documents/qt.txt") {
         Ok(data) if data == b"hello world from quotes" => {
             println!("[OK] shell quoting keeps spaces in one argument")
         }
         _ => selftest_fail("shell quoting mismatch"),
     }
-    execute("rm /qt.txt");
+    execute("rm ~/Documents/qt.txt");
 
     // Physical memory manager: allocate two frames, scribble on the
     // first, free both, then confirm the first allocation hands the

@@ -21,6 +21,7 @@ use crate::font;
 use crate::gfx::{self, Surface};
 use crate::interrupts;
 use crate::keyboard;
+use crate::users;
 
 const WIDTH: u32 = 700;
 const HEIGHT: u32 = 440;
@@ -108,6 +109,12 @@ struct SidebarEntry {
     target: String, // empty for headers
 }
 
+#[derive(Clone)]
+pub struct DragInfo {
+    pub path: String,
+    pub is_dir: bool,
+}
+
 pub struct FileExplorer {
     buffer: Vec<u32>,
     path: String,
@@ -123,11 +130,13 @@ pub struct FileExplorer {
     // Double-click detection: (item, tick) of the previous press.
     last_click_item: usize,
     last_click_ticks: u64,
+    last_click_was_double: bool,
     // Two-step delete confirmation: (selection at press time, tick).
     pending_delete: Option<(usize, u64)>,
     status: String,
     free_bytes: u64,
     sidebar: Vec<SidebarEntry>,
+    drag: Option<DragInfo>,
 }
 
 fn is_elf(name: &str) -> bool {
@@ -225,7 +234,7 @@ impl FileExplorer {
     pub fn new() -> Self {
         let mut app = Self {
             buffer: vec![BG; (WIDTH * HEIGHT) as usize],
-            path: "/".to_string(),
+            path: users::home(),
             entries: Vec::new(),
             selection: 0,
             scroll: 0,
@@ -235,12 +244,14 @@ impl FileExplorer {
             cursor: (i32::MAX, i32::MAX),
             last_click_item: usize::MAX,
             last_click_ticks: 0,
+            last_click_was_double: false,
             pending_delete: None,
             status: String::new(),
             free_bytes: 0,
             sidebar: Vec::new(),
+            drag: None,
         };
-        app.navigate("/".to_string());
+        app.navigate(users::home());
         app
     }
 
@@ -263,6 +274,102 @@ impl FileExplorer {
             self.cursor = (x, y);
             self.render();
         }
+    }
+
+    /// Returns the entry index under a content-local point. Toolbar,
+    /// sidebar, headers, empty space, and the scrollbar are not items.
+    pub fn item_at(&self, x: i32, y: i32) -> Option<usize> {
+        if x < SIDEBAR_W as i32 || x >= (SIDEBAR_W + LIST_W) as i32 || y < LIST_Y as i32 {
+            return None;
+        }
+        let item = match self.view {
+            View::Details => {
+                if y < (LIST_Y + HEADER_H) as i32 {
+                    return None;
+                }
+                self.scroll + ((y as u32 - LIST_Y - HEADER_H) / ROW_H) as usize
+            }
+            View::Grid => {
+                let col = ((x as u32 - SIDEBAR_W) / GRID_TILE_W) as usize;
+                let row = ((y as u32 - LIST_Y) / GRID_TILE_H) as usize;
+                self.scroll + row * self.grid_cols() + col
+            }
+        };
+        (item < self.entries.len()).then_some(item)
+    }
+
+    /// Absolute source path and directory flag for an entry index.
+    pub fn entry_path(&self, item: usize) -> Option<(String, bool)> {
+        let entry = self.entries.get(item)?;
+        Some((join(&self.path, &entry.name), entry.is_dir))
+    }
+
+    /// Returns the item pressed in a drag-capable click. Double-clicks
+    /// (which open or enter the item) are explicitly excluded.
+    pub fn drag_candidate(&mut self, item: Option<usize>) -> Option<usize> {
+        let was_double = self.last_click_was_double;
+        self.last_click_was_double = false;
+        if was_double { None } else { item }
+    }
+
+    /// Updates the drag visual state supplied by the window manager.
+    pub fn set_drag(&mut self, drag: Option<DragInfo>) {
+        self.drag = drag;
+        self.render();
+    }
+
+    /// Re-reads the current directory after another explorer moved a file.
+    pub fn refresh_now(&mut self) {
+        self.refresh();
+    }
+
+    /// Handles a drop at a content-local point. Returns `true` when this
+    /// explorer was a valid drop surface, even if the move was a no-op or
+    /// failed; the WM then refreshes the source explorer as needed.
+    pub fn handle_drop(&mut self, x: i32, y: i32, src: &str, is_dir: bool) -> bool {
+        let Some(target) = self.drop_target_at(x, y) else {
+            return false;
+        };
+        let source_parent = parent_path(src);
+        if target == source_parent || target == src || (is_dir && target.starts_with(&(src.to_string() + "/"))) {
+            self.status = format!("{} is already in {}", src.rsplit('/').next().unwrap_or(src), target);
+            self.render();
+            return true;
+        }
+        let name = src.rsplit('/').next().unwrap_or(src);
+        let destination = join(&target, name);
+        match fat::move_file(src, &destination) {
+            Ok(()) => {
+                self.status = format!("moved {} to {}", name, target);
+                self.refresh();
+            }
+            Err(e) => {
+                self.status = format!("move failed: {}", e);
+                self.render();
+            }
+        }
+        true
+    }
+
+    fn drop_target_at(&self, x: i32, y: i32) -> Option<String> {
+        if x < 0 || y < 0 || y >= (HEIGHT - STATUS_H) as i32 {
+            return None;
+        }
+        if x < SIDEBAR_W as i32 {
+            return sidebar_item_at(&self.sidebar, y as u32);
+        }
+        if x >= (SIDEBAR_W + LIST_W) as i32 || y < LIST_Y as i32 {
+            return None;
+        }
+        if let Some(item) = self.item_at(x, y) {
+            if let Some(entry) = self.entries.get(item) {
+                if entry.is_dir {
+                    return Some(join(&self.path, &entry.name));
+                }
+            }
+        }
+        // Dropping on a file or empty list space means the current folder.
+        Some(self.path.clone())
     }
 
     fn details_visible_rows(&self) -> usize {
@@ -467,6 +574,7 @@ impl FileExplorer {
     // ---- click routing -------------------------------------------------
 
     pub fn handle_click(&mut self, x: i32, y: i32) -> Option<FsAction> {
+        self.last_click_was_double = false;
         if x < 0 || y < 0 {
             return None;
         }
@@ -531,6 +639,7 @@ impl FileExplorer {
             return None;
         }
         let is_double = self.last_click_item == item && now.saturating_sub(self.last_click_ticks) <= DOUBLE_CLICK_TICKS;
+        self.last_click_was_double = is_double;
         self.last_click_item = item;
         self.last_click_ticks = now;
         self.selection = item;
@@ -625,6 +734,7 @@ impl FileExplorer {
     fn render_sidebar(&mut self, cx: i32, cy: i32) {
         gfx::fill_rect(self, 0, LIST_Y, SIDEBAR_W, HEIGHT - STATUS_H - LIST_Y, SIDEBAR_BG);
         gfx::fill_rect(self, SIDEBAR_W - 1, LIST_Y, 1, HEIGHT - STATUS_H - LIST_Y, 0x00_0A1016);
+        let drop_target = if self.drag.is_some() { self.drop_target_at(cx, cy) } else { None };
         let sidebar: Vec<(String, String)> = self
             .sidebar
             .iter()
@@ -644,6 +754,10 @@ impl FileExplorer {
                 gfx::fill_rect(self, 4, y + 3, 2, 10, ACCENT);
             } else if hovered {
                 gfx::fill_rounded_rect(self, 4, y, SIDEBAR_W - 8, 16, 4, 0x00_1E2A36);
+            }
+            if hovered && drop_target.as_deref() == Some(target.as_str()) {
+                gfx::fill_rect(self, 4, y + 2, 2, 12, ACCENT);
+                gfx::fill_rect(self, SIDEBAR_W - 8, y + 2, 2, 12, ACCENT);
             }
             let color = if active { 0x00_FFFFFF } else { TEXT };
             gfx::draw_string(self, 12, y + 4, &label, color, None);
@@ -717,6 +831,7 @@ impl FileExplorer {
 
     fn render_details(&mut self, cx: i32, cy: i32) {
         let (nx, sx, tx) = details_columns();
+        let drop_target = if self.drag.is_some() { self.drop_target_at(cx, cy) } else { None };
         // Column headers.
         gfx::fill_rect_gradient_v(self, SIDEBAR_W, LIST_Y, LIST_W, HEADER_H, HEADER_BG_TOP, HEADER_BG_BOTTOM);
         gfx::fill_rect(self, SIDEBAR_W, LIST_Y + HEADER_H - 1, LIST_W, 1, 0x00_0E141B);
@@ -739,6 +854,10 @@ impl FileExplorer {
                 gfx::fill_rounded_rect_gradient_v(self, SIDEBAR_W + 2, ry + 1, LIST_W - 4, ROW_H - 2, 4, SELECTED_TOP, SELECTED_BOTTOM);
             } else if hovered {
                 gfx::fill_rounded_rect(self, SIDEBAR_W + 2, ry + 1, LIST_W - 4, ROW_H - 2, 4, HOVER_BG);
+            }
+            if is_dir && drop_target.as_deref() == Some(join(&self.path, &name).as_str()) {
+                gfx::fill_rect(self, SIDEBAR_W + 3, ry + 1, LIST_W - 6, 1, ACCENT);
+                gfx::fill_rect(self, SIDEBAR_W + 3, ry + ROW_H - 2, LIST_W - 6, 1, ACCENT);
             }
             draw_entry_icon(self, SIDEBAR_W + 8, ry + 4, &name, is_dir);
             let (name_color, size_color) = if selected {
@@ -768,6 +887,7 @@ impl FileExplorer {
     fn render_grid(&mut self, cx: i32, cy: i32) {
         let cols = self.grid_cols();
         let rows = self.grid_visible_rows();
+        let drop_target = if self.drag.is_some() { self.drop_target_at(cx, cy) } else { None };
         gfx::fill_rect(self, SIDEBAR_W, LIST_Y, LIST_W, HEIGHT - STATUS_H - LIST_Y, LIST_BG);
         for r in 0..rows {
             for c in 0..cols {
@@ -784,6 +904,10 @@ impl FileExplorer {
                     gfx::fill_rounded_rect(self, tx + 4, ty + 3, GRID_TILE_W - 8, GRID_TILE_H - 8, 6, 0x00_24467A);
                 } else if hovered {
                     gfx::fill_rounded_rect(self, tx + 4, ty + 3, GRID_TILE_W - 8, GRID_TILE_H - 8, 6, 0x00_1E2A36);
+                }
+                if is_dir && drop_target.as_deref() == Some(join(&self.path, &name).as_str()) {
+                    gfx::fill_rect(self, tx + 5, ty + 3, GRID_TILE_W - 10, 1, ACCENT);
+                    gfx::fill_rect(self, tx + 5, ty + GRID_TILE_H - 6, GRID_TILE_W - 10, 1, ACCENT);
                 }
                 draw_big_icon(self, tx + (GRID_TILE_W - 36) / 2, ty + 6, &name, is_dir);
                 // Label, centered and truncated to the tile width.
@@ -923,40 +1047,23 @@ fn toolbar_button_at(x: u32) -> Option<ToolbarAction> {
     })
 }
 
-/// Sidebar entries: Quick Access > Home, then a FOLDERS section listing
-/// the root directories (sorted) as shortcuts.
+/// Sidebar entries model a real user's home first, then expose the
+/// system-level folders like a small "This PC" section.
 fn build_sidebar() -> Vec<SidebarEntry> {
     let mut out = vec![SidebarEntry { label: "QUICK ACCESS".to_string(), target: String::new() }];
-    out.push(SidebarEntry { label: "Home".to_string(), target: "/".to_string() });
+    let home = users::home();
+    out.push(SidebarEntry { label: "Home".to_string(), target: home.clone() });
+    out.push(SidebarEntry { label: "Desktop".to_string(), target: users::desktop() });
+    out.push(SidebarEntry { label: "Documents".to_string(), target: users::documents() });
+    out.push(SidebarEntry { label: "Downloads".to_string(), target: format!("{}/Downloads", home) });
+    out.push(SidebarEntry { label: "Pictures".to_string(), target: format!("{}/Pictures", home) });
+    out.push(SidebarEntry { label: "Music".to_string(), target: format!("{}/Music", home) });
     out.push(SidebarEntry { label: String::new(), target: String::new() });
-    out.push(SidebarEntry { label: "FOLDERS".to_string(), target: String::new() });
-    if let Ok(entries) = fat::list_dir("/") {
-        let mut dirs: Vec<String> = entries.iter().filter(|e| e.is_dir).map(|e| e.name.clone()).collect();
-        sort_names(&mut dirs);
-        for name in dirs {
-            let target = join("/", &name);
-            out.push(SidebarEntry { label: name, target });
-        }
-    }
+    out.push(SidebarEntry { label: "SYSTEM".to_string(), target: String::new() });
+    out.push(SidebarEntry { label: "Applications".to_string(), target: "/bin".to_string() });
+    out.push(SidebarEntry { label: "System".to_string(), target: "/system".to_string() });
+    out.push(SidebarEntry { label: "Users".to_string(), target: "/users".to_string() });
     out
-}
-
-/// Case-insensitive insertion sort for simple string lists.
-fn sort_names(names: &mut [String]) {
-    let mut i = 1;
-    while i < names.len() {
-        let mut j = i;
-        while j > 0 {
-            let b = names[j].to_lowercase();
-            let a = names[j - 1].to_lowercase();
-            if !(b < a) {
-                break;
-            }
-            names.swap(j - 1, j);
-            j -= 1;
-        }
-        i += 1;
-    }
 }
 
 /// Sidebar item hit test: skips header rows.

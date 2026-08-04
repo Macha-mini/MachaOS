@@ -14,7 +14,7 @@ use crate::console::Console;
 use crate::cpuid;
 use crate::fat;
 use crate::fb;
-use crate::file_explorer::{FileExplorer, FsAction};
+use crate::file_explorer::{DragInfo, FileExplorer, FsAction};
 use crate::font;
 use crate::gfx::{self, Surface};
 use crate::interrupts;
@@ -226,6 +226,19 @@ struct ResizeState {
     last_rows: usize,
 }
 
+struct FileDragState {
+    source_window: usize,
+    path: String,
+    is_dir: bool,
+}
+
+struct PressState {
+    window_index: usize,
+    item: usize,
+    screen_x: i32,
+    screen_y: i32,
+}
+
 pub struct WindowManager {
     windows: Vec<Window>,
     focused: usize,
@@ -235,6 +248,8 @@ pub struct WindowManager {
     screen_h: u32,
     dragging: Option<DragState>,
     resizing: Option<ResizeState>,
+    file_drag: Option<FileDragState>,
+    press_state: Option<PressState>,
     left_was_down: bool,
     last_clock_secs: u64,
     launcher_open: bool,
@@ -246,7 +261,7 @@ pub struct WindowManager {
     remembered: [Option<RememberedWindow>; APP_ID_COUNT],
     // Desktop background image, loaded from disk once at startup (see
     // `load_wallpaper`). `None` when there's no FAT32 volume mounted, no
-    // /wallpaper.raw on it, or its size doesn't match the current mode —
+    // /system/wallpaper.raw on it, or its size doesn't match the current mode —
     // composite() falls back to the plain gradient fill in that case.
     wallpaper: Option<Vec<u32>>,
 }
@@ -335,6 +350,8 @@ impl WindowManager {
             screen_h,
             dragging: None,
             resizing: None,
+            file_drag: None,
+            press_state: None,
             left_was_down: false,
             last_clock_secs: u64::MAX,
             launcher_open: false,
@@ -544,7 +561,7 @@ impl WindowManager {
         let mut items = vec![
             ("Terminal".to_string(), LauncherAction::Terminal),
             ("Calculator".to_string(), LauncherAction::Calculator),
-            ("Files".to_string(), LauncherAction::Files),
+            ("File Explorer".to_string(), LauncherAction::Files),
             ("Notepad".to_string(), LauncherAction::Notepad),
             ("System Info".to_string(), LauncherAction::SysInfo),
         ];
@@ -589,7 +606,7 @@ impl WindowManager {
             }
             LauncherAction::Files => {
                 self.spawn_window(
-                    "Files",
+                    "File Explorer",
                     false,
                     Some(AppId::Files),
                     AppKind::FileExplorer(FileExplorer::new()),
@@ -783,6 +800,28 @@ impl WindowManager {
             return;
         }
 
+        // A file drag owns the mouse until release; it must not be
+        // mistaken for moving the whole window underneath it.
+        if self.file_drag.is_some() {
+            if just_released {
+                self.finish_file_drag();
+            }
+            return;
+        }
+
+        // A normal list click becomes a file drag only after the cursor
+        // moves a few pixels, preserving single- and double-click behavior.
+        if let Some(press) = &self.press_state {
+            if event.left
+                && (self.cursor_x - press.screen_x).abs() + (self.cursor_y - press.screen_y).abs() >= 6
+            {
+                self.begin_file_drag();
+                if self.file_drag.is_some() {
+                    return;
+                }
+            }
+        }
+
         if let Some(drag) = &self.dragging {
             if event.left {
                 let (max_x, max_y) = self.drag_bounds();
@@ -793,10 +832,73 @@ impl WindowManager {
         }
         if just_released {
             self.dragging = None;
+            self.press_state = None;
         }
         if just_pressed {
             self.handle_click();
         }
+    }
+
+    fn set_explorer_drag(&mut self, drag: Option<DragInfo>) {
+        for window in &mut self.windows {
+            if let AppKind::FileExplorer(app) = &mut window.kind {
+                app.set_drag(drag.clone());
+            }
+        }
+    }
+
+    fn begin_file_drag(&mut self) {
+        let Some(press) = self.press_state.take() else { return };
+        let Some(window) = self.windows.get(press.window_index) else { return };
+        let source = match &window.kind {
+            AppKind::FileExplorer(app) => app.entry_path(press.item),
+            _ => None,
+        };
+        let Some((path, is_dir)) = source else { return };
+        self.file_drag = Some(FileDragState {
+            source_window: press.window_index,
+            path: path.clone(),
+            is_dir,
+        });
+        self.set_explorer_drag(Some(DragInfo { path, is_dir }));
+    }
+
+    fn finish_file_drag(&mut self) {
+        let Some(drag) = self.file_drag.take() else { return };
+        let mut target_index = None;
+        for i in (0..self.windows.len()).rev() {
+            let window = &self.windows[i];
+            if !window.open || window.minimized {
+                continue;
+            }
+            let (content_w, content_h) = window.content_size();
+            let in_content = self.cursor_x >= window.x
+                && self.cursor_x < window.x + content_w as i32
+                && self.cursor_y >= window.y + TITLE_BAR_HEIGHT as i32
+                && self.cursor_y < window.y + TITLE_BAR_HEIGHT as i32 + content_h as i32;
+            if in_content {
+                target_index = Some(i);
+                break;
+            }
+        }
+
+        let mut handled = false;
+        if let Some(index) = target_index {
+            let (wx, wy) = (self.windows[index].x, self.windows[index].y);
+            let local_x = self.cursor_x - wx;
+            let local_y = self.cursor_y - wy - TITLE_BAR_HEIGHT as i32;
+            handled = match &mut self.windows[index].kind {
+                AppKind::FileExplorer(app) => app.handle_drop(local_x, local_y, &drag.path, drag.is_dir),
+                _ => false,
+            };
+            if handled && index != drag.source_window {
+                if let Some(AppKind::FileExplorer(app)) = self.windows.get_mut(drag.source_window).map(|w| &mut w.kind) {
+                    app.refresh_now();
+                }
+            }
+        }
+        self.press_state = None;
+        self.set_explorer_drag(None);
     }
 
     fn drag_bounds(&self) -> (i32, i32) {
@@ -937,19 +1039,34 @@ impl WindowManager {
                 let local_x = self.cursor_x - wx;
                 let local_y = self.cursor_y - wy - TITLE_BAR_HEIGHT as i32;
                 self.raise(i);
-                let action = {
+                let (action, item) = {
                     let window = &mut self.windows[self.focused];
                     match &mut window.kind {
                         AppKind::Calculator(app) => {
                             app.handle_click(local_x, local_y);
-                            None
+                            (None, None)
                         }
-                        AppKind::FileExplorer(app) => app.handle_click(local_x, local_y),
-                        _ => None,
+                        AppKind::FileExplorer(app) => {
+                            let item = app.item_at(local_x, local_y);
+                            let action = app.handle_click(local_x, local_y);
+                            let item = app.drag_candidate(item);
+                            (action, item)
+                        }
+                        _ => (None, None),
                     }
                 };
                 if let Some(action) = action {
+                    self.press_state = None;
                     self.dispatch_action(action);
+                } else if let Some(item) = item {
+                    self.press_state = Some(PressState {
+                        window_index: self.focused,
+                        item,
+                        screen_x: self.cursor_x,
+                        screen_y: self.cursor_y,
+                    });
+                } else {
+                    self.press_state = None;
                 }
                 return;
             }
@@ -978,6 +1095,9 @@ impl WindowManager {
             self.draw_taskbar(surface);
             if self.launcher_open {
                 self.draw_launcher(surface);
+            }
+            if let Some(drag) = &self.file_drag {
+                draw_file_drag_tag(surface, self.cursor_x, self.cursor_y, &drag.path, drag.is_dir);
             }
             draw_cursor(surface, self.cursor_x, self.cursor_y);
         });
@@ -1083,7 +1203,7 @@ fn byte_index(line: &str, char_index: usize) -> usize {
     line.char_indices().nth(char_index).map(|(i, _)| i).unwrap_or(line.len())
 }
 
-const NOTEPAD_PATH: &str = "/notepad.txt";
+const NOTEPAD_PATH: &str = "/users/macha/Documents/notepad.txt";
 
 fn editor_handle_key(
     console: &mut Console,
@@ -1432,6 +1552,28 @@ fn draw_cursor(surface: &mut dyn Surface, x: i32, y: i32) {
     paint_cursor_shape(surface, x, y, 0x00_FFFFFF);
 }
 
+fn draw_file_drag_tag(surface: &mut dyn Surface, cursor_x: i32, cursor_y: i32, path: &str, is_dir: bool) {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let max_chars = 24usize;
+    let label = if name.chars().count() > max_chars {
+        let mut shortened: String = name.chars().take(max_chars - 2).collect();
+        shortened.push_str("..");
+        shortened
+    } else {
+        name.to_string()
+    };
+    let tag_w = (label.len() as u32 * font::GLYPH_WIDTH as u32 + 30).min(260);
+    let tag_h = 20u32;
+    let x = (cursor_x + 14).max(0) as u32;
+    let y = (cursor_y + 16).max(0) as u32;
+    gfx::fill_rounded_rect(surface, x + 2, y + 2, tag_w, tag_h, 5, 0x00_070C12);
+    gfx::fill_rounded_rect(surface, x, y, tag_w, tag_h, 5, 0x00_2B3A49);
+    gfx::fill_rect(surface, x, y, tag_w, 1, 0x00_6FB1E8);
+    let icon = if is_dir { 0x00_F0C070 } else { 0x00_BBC8D4 };
+    gfx::fill_rect(surface, x + 6, y + 6, 10, 8, icon);
+    gfx::draw_string(surface, x + 22, y + 6, &label, 0x00_FFFFFF, None);
+}
+
 fn paint_cursor_shape(surface: &mut dyn Surface, x: i32, y: i32, color: u32) {
     for (row, bits) in CURSOR_BITS.iter().enumerate() {
         for col in 0..CURSOR_W {
@@ -1446,7 +1588,7 @@ fn paint_cursor_shape(surface: &mut dyn Surface, x: i32, y: i32, color: u32) {
     }
 }
 
-/// Loads `/wallpaper.raw` (see `tools/gen_wallpaper.py`): `width*height`
+/// Loads `/system/wallpaper.raw` (see `tools/gen_wallpaper.py`): `width*height`
 /// little-endian u32 pixels, row-major, no header. Returns `None` on any
 /// mismatch (no volume mounted, file missing, wrong size for the current
 /// mode) so the caller can fall back to the plain gradient background
@@ -1455,7 +1597,7 @@ fn load_wallpaper(screen_w: u32, screen_h: u32) -> Option<Vec<u32>> {
     if !fat::mounted() {
         return None;
     }
-    let bytes = fat::read_file("/wallpaper.raw").ok()?;
+    let bytes = fat::read_file("/system/wallpaper.raw").ok()?;
     let expected_len = screen_w as usize * screen_h as usize * 4;
     if bytes.len() != expected_len {
         return None;
