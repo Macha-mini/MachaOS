@@ -25,10 +25,12 @@ use alloc::vec::Vec;
 
 use crate::allocator;
 use crate::elf;
+use crate::gdt;
 use crate::interrupts;
 use crate::io;
 use crate::paging;
 use crate::pmm;
+use crate::syscall;
 use crate::task;
 
 /// Virtual address of the `.result` page every test program writes its
@@ -37,6 +39,19 @@ pub const PROC_RESULT_VIRT: u64 = 0x2FF0000;
 
 /// No process segment may start below 2 MiB (kernel image, PMM, tables).
 const MIN_SEGMENT_VADDR: u64 = 2 * 1024 * 1024;
+
+/// Every process gets the same fixed ring-3 stack address (256 MiB — well
+/// clear of the 48 MiB test-program load address and the kernel's own
+/// territory) since each process has its own private page table, so
+/// there's no collision between processes reusing it.
+const USER_STACK_TOP: u64 = 0x1000_0000;
+const USER_STACK_PAGES: u64 = 8; // 32 KiB
+const USER_STACK_BASE: u64 = USER_STACK_TOP - USER_STACK_PAGES * paging::PAGE_SIZE;
+/// One page right above the stack: where the ELF's `_start` lands when it
+/// `ret`s normally, since ring-3 code can't `ret` straight into the
+/// kernel's `exit_self` (no privilege change on a bare `ret`, and that
+/// page isn't PAGE_USER anyway). Holds `mov eax, SYS_EXIT; syscall`.
+const USER_EXIT_STUB_VIRT: u64 = USER_STACK_TOP;
 
 /// One mapped chunk of a process's address space: virtual range
 /// `[vaddr, vaddr+len)` backed by the physical range starting at `phys`.
@@ -54,6 +69,9 @@ pub enum ExitInfo {
     Normal,
     /// The process faulted; CR2 at the time.
     PageFault { cr2: u64 },
+    /// The process raised some other CPU exception (divide-by-zero,
+    /// invalid opcode, a privileged instruction causing #GP, ...).
+    Exception { vector: u8 },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -64,6 +82,8 @@ pub enum ProcessState {
 
 pub struct Process {
     pub entry: usize,
+    /// Initial ring-3 stack pointer (see `setup_user_stack`).
+    pub user_rsp: u64,
     /// Every frame the process owns: its page tables (PML4, PDPT, PDs,
     /// PTs) and the pages backing its segments. Freed on reap.
     frames: Vec<usize>,
@@ -102,6 +122,7 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
 
     let mut process = Process {
         entry: program.entry as usize,
+        user_rsp: 0,
         frames: Vec::new(),
         mappings: Vec::new(),
         state: ProcessState::Running,
@@ -120,6 +141,10 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
             free_process(process);
             return Err(e);
         }
+    }
+    if let Err(e) = setup_user_stack(&mut process, pml4) {
+        free_process(process);
+        return Err(e);
     }
 
     Ok(task::spawn_process(process_entry_trampoline, name, pml4, process))
@@ -149,6 +174,13 @@ fn validate_segments(program: &elf::Program) -> Result<(), &'static str> {
         }
         if end > paging::IDENTITY_MAP_END {
             return Err("segment beyond 4 GiB");
+        }
+        // The kernel reserves [USER_STACK_BASE, USER_EXIT_STUB_VIRT + one
+        // page) in every process for its ring-3 stack and exit trampoline
+        // (see `setup_user_stack`); a segment landing there would get
+        // silently overwritten (or overwrite them) once mapped.
+        if start < USER_EXIT_STUB_VIRT + paging::PAGE_SIZE && end > USER_STACK_BASE {
+            return Err("segment overlaps the reserved process stack region");
         }
     }
     Ok(())
@@ -265,12 +297,76 @@ const fn align_up(value: u64, align: u64) -> u64 {
     (value + align - 1) & !(align - 1)
 }
 
-/// Entry point every process task starts at: call the ELF's `_start`, and
-/// if it returns, exit normally. Runs with the process's own PML4 active.
+/// Maps a ring-3 stack and an "exit trampoline" page into the process's
+/// address space, and records the initial stack pointer for
+/// `process_entry_trampoline`. The stack's top slot holds a return address
+/// pointing at the trampoline, so when the ELF's `_start` (an ordinary
+/// `extern "C" fn`, compiled with a normal prologue/epilogue) executes its
+/// closing `ret`, it lands on `mov eax, SYS_EXIT; syscall` instead of
+/// falling into kernel code it has no ring-3 access to.
+fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str> {
+    let stack_len = USER_STACK_PAGES * paging::PAGE_SIZE;
+    let stack_phys = pmm::alloc_contiguous(USER_STACK_PAGES as usize).ok_or("out of memory")?;
+    for i in 0..USER_STACK_PAGES as usize {
+        process.frames.push(stack_phys + i * pmm::FRAME_SIZE);
+    }
+    unsafe {
+        core::ptr::write_bytes(stack_phys as *mut u8, 0, stack_len as usize);
+    }
+    if !paging::map_range_in(
+        pml4,
+        USER_STACK_BASE,
+        stack_phys as u64,
+        stack_len,
+        paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+        &mut process.frames,
+    ) {
+        return Err("failed to map user stack");
+    }
+
+    let stub_phys = alloc_frame(process)?;
+    unsafe {
+        let stub: [u8; 9] = [
+            0xB8, syscall::SYS_EXIT as u8, 0x00, 0x00, 0x00, // mov eax, SYS_EXIT
+            0x0F, 0x05, // syscall
+            0xEB, 0xFE, // jmp $ (never reached; sys_exit never returns)
+        ];
+        core::ptr::copy_nonoverlapping(stub.as_ptr(), stub_phys as *mut u8, stub.len());
+    }
+    if !paging::map_range_in(
+        pml4,
+        USER_EXIT_STUB_VIRT,
+        stub_phys as u64,
+        paging::PAGE_SIZE,
+        paging::PAGE_PRESENT | paging::PAGE_USER,
+        &mut process.frames,
+    ) {
+        return Err("failed to map exit trampoline");
+    }
+
+    // One return-address slot at the top of the stack. Written through
+    // the frame's kernel-identity address: the process's own PML4 (where
+    // USER_STACK_BASE is actually mapped) isn't active yet — CR3 only
+    // switches to it when the scheduler first runs this process.
+    let initial_rsp = USER_STACK_TOP - 8;
+    let offset = (initial_rsp - USER_STACK_BASE) as usize;
+    unsafe {
+        core::ptr::write_unaligned((stack_phys + offset) as *mut u64, USER_EXIT_STUB_VIRT);
+    }
+    process.user_rsp = initial_rsp;
+    Ok(())
+}
+
+/// Entry point every process task starts at: run the ELF's `_start` in
+/// ring 3, and once it exits (either by returning, through the exit
+/// trampoline, or via a page fault redirect — see `kill_current`), exit
+/// normally. Runs with the process's own PML4 active throughout.
 extern "C" fn process_entry_trampoline() -> ! {
     let entry = task::current_process_entry();
-    let function: extern "C" fn() = unsafe { core::mem::transmute(entry) };
-    function();
+    let user_rsp = task::current_process_user_rsp();
+    unsafe {
+        syscall::run_ring3(entry as u64, user_rsp);
+    }
     exit_self()
 }
 
@@ -288,10 +384,24 @@ extern "C" fn exit_self() -> ! {
 /// records the exit reason and redirects the ISR's return address so the
 /// CPU never returns to the faulting instruction (which would fault
 /// again immediately) — it lands in `exit_self` instead.
+/// Redirects the ISR's return address to `exit_self` so the CPU never
+/// resumes the faulting instruction (which would just fault again). The
+/// fault may have happened in ring 3 (frame.cs/ss still hold the ring-3
+/// selectors the CPU pushed); `exit_self` calls kernel functions and its
+/// page isn't PAGE_USER, so force ring 0 regardless of where the fault
+/// came from — CR3 doesn't change, and every address space deep-copies
+/// the kernel's map, so `exit_self` and the process's own (still mapped,
+/// still valid) stack are both reachable from ring 0 here.
+fn redirect_to_exit(frame: &mut interrupts::InterruptFrame) {
+    frame.rip = exit_self as extern "C" fn() -> ! as usize as u64;
+    frame.cs = gdt::KERNEL_CODE as u64;
+    frame.ss = gdt::KERNEL_DATA as u64;
+}
+
+/// Called from the #PF handler when the faulting task is a process.
 pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
     task::mark_current_exited(ExitInfo::PageFault { cr2 });
-    let exit_stub = exit_self as extern "C" fn() -> ! as usize as u64;
-    frame.rip = exit_stub;
+    redirect_to_exit(frame);
 
     let mut buf = [0u8; 160];
     let message = io::sprint(
@@ -299,6 +409,25 @@ pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
         format_args!(
             "[PROC] killed by page fault at {:#x} (error {:#x})\n",
             cr2, frame.error_code
+        ),
+    );
+    io::exception_print(message);
+}
+
+/// Called from #DE/#UD/#GP (and similar) when the faulting task is a
+/// process: a ring-3 program hitting a divide-by-zero, invalid opcode, or
+/// privileged instruction kills just that process, the same way a page
+/// fault does, rather than taking down the kernel.
+pub fn kill_current_exception(vector: u8, frame: &mut interrupts::InterruptFrame) {
+    task::mark_current_exited(ExitInfo::Exception { vector });
+    redirect_to_exit(frame);
+
+    let mut buf = [0u8; 128];
+    let message = io::sprint(
+        &mut buf,
+        format_args!(
+            "[PROC] killed by exception vector {} (error {:#x})\n",
+            vector, frame.error_code
         ),
     );
     io::exception_print(message);
@@ -352,6 +481,10 @@ pub fn describe_exit(info: &ExitInfo) -> alloc::string::String {
         ExitInfo::PageFault { cr2 } => {
             use alloc::format;
             format!("killed by page fault at {:#x}", cr2)
+        }
+        ExitInfo::Exception { vector } => {
+            use alloc::format;
+            format!("killed by exception vector {}", vector)
         }
     }
 }

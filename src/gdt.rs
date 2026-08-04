@@ -70,6 +70,23 @@ unsafe extern "C" {
     static stack_top: u8;
 }
 
+/// The boot stack's top, i.e. the kernel stack the bootstrap "main" task
+/// runs on. `task::init()` uses this as that task's `kernel_stack_top`.
+pub fn boot_stack_top() -> u64 {
+    unsafe { &stack_top as *const u8 as u64 }
+}
+
+/// Points TSS.rsp0 — where the CPU switches on any ring 3 -> ring 0
+/// transition (interrupt/exception) — at the given task's own kernel
+/// stack. Must be called on every task switch: TSS.rsp0 is a single slot,
+/// and a process left in ring 3 that gets interrupted needs *its own*
+/// stack there, not whichever task set it last (see `task::scheduler_tick`).
+pub fn set_kernel_stack(rsp0: u64) {
+    unsafe {
+        TSS.rsp0 = rsp0;
+    }
+}
+
 pub fn init() {
     unsafe {
         TSS.rsp0 = &stack_top as *const u8 as u64;

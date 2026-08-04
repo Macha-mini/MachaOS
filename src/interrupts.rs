@@ -115,8 +115,21 @@ fn dump_registers(frame: &InterruptFrame) {
     io::exception_print(text);
 }
 
+/// Shared by the exceptions a ring-3 process can plausibly trigger on its
+/// own (divide-by-zero, invalid opcode, a privileged instruction causing
+/// #GP): if the current task is a process, kill just it, mirroring how
+/// `page_fault` already handles #PF; otherwise it's a real kernel bug and
+/// stays fatal.
+fn process_or_exception(name: &str, frame: &mut InterruptFrame) {
+    if task::current_is_process() {
+        crate::process::kill_current_exception(frame.vector as u8, frame);
+        return;
+    }
+    exception(name, frame)
+}
+
 fn divide_error(frame: &mut InterruptFrame) {
-    exception("#DE Divide-by-zero", frame)
+    process_or_exception("#DE Divide-by-zero", frame)
 }
 
 fn debug_exception(frame: &mut InterruptFrame) {
@@ -136,7 +149,7 @@ fn overflow(frame: &mut InterruptFrame) {
 }
 
 fn invalid_opcode(frame: &mut InterruptFrame) {
-    exception("#UD Invalid opcode", frame)
+    process_or_exception("#UD Invalid opcode", frame)
 }
 
 fn double_fault(frame: &mut InterruptFrame) {
@@ -144,7 +157,7 @@ fn double_fault(frame: &mut InterruptFrame) {
 }
 
 fn general_protection_fault(frame: &mut InterruptFrame) {
-    exception("#GP General protection fault", frame)
+    process_or_exception("#GP General protection fault", frame)
 }
 
 fn page_fault(frame: &mut InterruptFrame) {

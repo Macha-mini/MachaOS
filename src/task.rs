@@ -97,6 +97,19 @@ struct Task {
     // PML4 the task runs with: the kernel's own map, or a process's
     // private address space.
     cr3: u64,
+    // Top of this task's own kernel stack. Written into TSS.rsp0 whenever
+    // this task becomes current: a ring 3 -> ring 0 transition (any
+    // interrupt/exception firing while a process is in ring 3) always
+    // switches SS:RSP to TSS.rsp0, so it must point at *this* task's
+    // stack, not a shared one, or an interrupt hitting a different
+    // process at the same fixed address would clobber it.
+    kernel_stack_top: u64,
+    // Resume point `syscall.rs`'s `.Lsyscall_exit` unwinds to when this
+    // task's process calls `exit`: the kernel-side rsp `run_ring3` saved
+    // just before its `iretq` into ring 3. Per-task (not a global) because
+    // a second process entering ring 3 before the first one exits would
+    // otherwise overwrite a shared slot.
+    ring3_kernel_rsp: u64,
     // `Some` exactly for processes; carries the ELF entry, the frames
     // and mappings the process owns, and its exit state.
     process: Option<Process>,
@@ -142,6 +155,8 @@ pub fn init() {
         _stack: None,
         name: "main",
         cr3: paging::kernel_pml4(),
+        kernel_stack_top: crate::gdt::boot_stack_top(),
+        ring3_kernel_rsp: 0,
         process: None,
     });
     spawn(counter_task_0, "bg-0");
@@ -189,6 +204,8 @@ fn push_task(entry: usize, name: &'static str, cr3: u64, process: Option<Process
         _stack: Some(stack),
         name,
         cr3,
+        kernel_stack_top: stack_top as u64,
+        ring3_kernel_rsp: 0,
         process,
     });
     let pid = tasks().len() - 1;
@@ -227,6 +244,7 @@ pub fn scheduler_tick() {
     if paging::read_cr3() != tasks[next].cr3 {
         paging::write_cr3(tasks[next].cr3);
     }
+    crate::gdt::set_kernel_stack(tasks[next].kernel_stack_top);
     let new_rsp = tasks[next].context.rsp;
     let old_rsp_ptr = &mut tasks[current].context.rsp as *mut usize;
     unsafe {
@@ -263,6 +281,29 @@ pub fn current_process_entry() -> usize {
         .as_ref()
         .expect("current task is not a process")
         .entry
+}
+
+/// Initial ring-3 stack pointer of the current task (only valid for
+/// processes).
+pub fn current_process_user_rsp() -> u64 {
+    tasks()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_ref()
+        .expect("current task is not a process")
+        .user_rsp
+}
+
+/// Saves the current task's kernel-side resume point for when its process
+/// exits (see `Task::ring3_kernel_rsp`). Called from `syscall::run_ring3`
+/// right before it drops into ring 3.
+pub fn set_current_ring3_return_rsp(rsp: u64) {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)].ring3_kernel_rsp = rsp;
+}
+
+/// Reads back the value `set_current_ring3_return_rsp` stored for the
+/// current task. Called from `syscall.rs`'s `.Lsyscall_exit` path.
+pub fn current_ring3_return_rsp() -> u64 {
+    tasks()[CURRENT.load(Ordering::Relaxed)].ring3_kernel_rsp
 }
 
 /// The process's exit status once it has exited, `None` while it runs
