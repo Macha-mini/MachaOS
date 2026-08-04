@@ -39,6 +39,8 @@ pub(crate) const SYS_READ: u64 = 2;
 pub(crate) const SYS_CLOCK: u64 = 3;
 pub(crate) const SYS_SEND: u64 = 4;
 pub(crate) const SYS_RECV: u64 = 5;
+pub(crate) const SYS_WIN_CREATE: u64 = 6;
+pub(crate) const SYS_WIN_UPDATE: u64 = 7;
 // Returned by write/read/send/recv when an argument (fd, or a pointer
 // range the calling process doesn't own) is rejected.
 const SYSCALL_ERROR: u64 = u64::MAX;
@@ -110,6 +112,20 @@ syscall_entry:
     mov rsp, [rip + SYSCALL_KERNEL_RSP]
     push rcx
     push r11
+    # SYSCALL only guarantees RCX/R11 survive (hardware uses them to save
+    # RIP/RFLAGS); everything else the user might be relying on across
+    # this call — the SysV arg registers, since a caller can legitimately
+    # keep a value alive in e.g. R8 across a call the way any other
+    # register is fair game — has to be saved here and restored below, or
+    # `syscall_dispatch`'s own machinery (an ordinary call, free to
+    # clobber caller-saved registers) silently corrupts user state that
+    # has nothing to do with this syscall's own arguments.
+    push rdi
+    push rsi
+    push rdx
+    push r10
+    push r8
+    push r9
     # SYS_EXIT (1) is checked here, before rax (the syscall number) gets
     # shuffled into an argument register below, and handled without ever
     # calling syscall_dispatch: unlike every other syscall it never
@@ -121,8 +137,9 @@ syscall_entry:
 
     # SysV syscall args arrive in rdi/rsi/rdx/r10/r8/r9 (r10 instead of
     # rcx, which `syscall` clobbers); shuffle num+4 args into the rdi..r8
-    # slots `extern "C" fn syscall_dispatch` expects. r11 is free to use
-    # as scratch here — its user value is already saved on the stack above.
+    # slots `extern "C" fn syscall_dispatch` expects, working off the
+    # register values (unchanged by the pushes above) rather than the
+    # stack copies, which exist purely to restore the user's originals.
     mov r11, rdx
     mov rdx, rsi
     mov rsi, rdi
@@ -131,6 +148,12 @@ syscall_entry:
     mov r8, r10
     call syscall_dispatch
 
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
     pop r11
     pop rcx
     mov rsp, [rip + SAVED_USER_RSP]
@@ -294,14 +317,63 @@ fn sys_recv(ptr: u64, maxlen: u64) -> u64 {
     n as u64
 }
 
+/// Largest window dimension/pixel count sys_win_create/sys_win_update
+/// will accept — just a sanity bound against a hostile or buggy huge
+/// allocation request, well above this kernel's 1920x1080 display.
+const MAX_WINDOW_DIM: u64 = 2048;
+
+/// Creates (or, called again, replaces) the calling process's window.
+/// Actually creating it happens later, off `wm::queue_create`, in the
+/// desktop loop — the only place a `wm::WindowManager` is reachable from
+/// (see the module docs on `wm::WinCommand`) — so this always succeeds
+/// immediately from the caller's point of view; there's no way to report
+/// a compositor-side failure back through this call.
+fn sys_win_create(width: u64, height: u64, title_ptr: u64, title_len: u64) -> u64 {
+    if width == 0 || height == 0 || width > MAX_WINDOW_DIM || height > MAX_WINDOW_DIM {
+        return SYSCALL_ERROR;
+    }
+    let title = if title_len == 0 {
+        alloc::string::String::new()
+    } else {
+        let Some(phys) = resolve_user_buffer(title_ptr, title_len) else {
+            return SYSCALL_ERROR;
+        };
+        let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, title_len as usize) };
+        alloc::string::String::from_utf8_lossy(bytes).into_owned()
+    };
+    crate::wm::queue_create(crate::task::current_pid(), width as u32, height as u32, title);
+    0
+}
+
+/// Replaces the calling process's window pixels wholesale. `pixel_count`
+/// is in `u32` pixels (not bytes) and must exactly match the window's
+/// `width * height` — a mismatch is dropped silently by the compositor
+/// side (see `wm::update_process_window`), not reported here.
+fn sys_win_update(pixels_ptr: u64, pixel_count: u64) -> u64 {
+    if pixel_count == 0 || pixel_count > MAX_WINDOW_DIM * MAX_WINDOW_DIM || pixels_ptr % 4 != 0 {
+        return SYSCALL_ERROR;
+    }
+    let Some(phys) = resolve_user_buffer(pixels_ptr, pixel_count * 4) else {
+        return SYSCALL_ERROR;
+    };
+    // `phys` inherits `pixels_ptr`'s 4-byte alignment (checked above):
+    // every mapping's physical base is page-aligned, so the offset within
+    // it preserves alignment exactly.
+    let pixels = unsafe { core::slice::from_raw_parts(phys as *const u32, pixel_count as usize) }.to_vec();
+    crate::wm::queue_update(crate::task::current_pid(), pixels);
+    0
+}
+
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, _arg4: u64) -> u64 {
+extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     match num {
         SYS_WRITE => sys_write(arg1, arg2, arg3),
         SYS_READ => sys_read(arg1, arg2, arg3),
         SYS_CLOCK => crate::interrupts::ticks(),
         SYS_SEND => sys_send(arg1, arg2, arg3),
         SYS_RECV => sys_recv(arg1, arg2),
+        SYS_WIN_CREATE => sys_win_create(arg1, arg2, arg3, arg4),
+        SYS_WIN_UPDATE => sys_win_update(arg1, arg2),
         _ => SYSCALL_ERROR,
     }
 }

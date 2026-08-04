@@ -21,7 +21,9 @@ use crate::io;
 use crate::keyboard;
 use crate::mouse::MouseEvent;
 use crate::multiboot;
+use crate::process;
 use crate::shell::{self, Feed, LineEditor};
+use crate::sync::SpinLock;
 use crate::task;
 
 const TITLE_BAR_HEIGHT: u32 = 20;
@@ -98,11 +100,75 @@ struct RememberedWindow {
     maximized: bool,
 }
 
+/// A request from `syscall::sys_win_create`/`sys_win_update`, queued in
+/// `PENDING_COMMANDS` and applied by `WindowManager::drain_commands`.
+///
+/// Syscalls run in whatever kernel context happened to be current when a
+/// process trapped in — never inside `desktop::run`'s loop, which owns
+/// the only reachable `WindowManager` — so a syscall can't just call a
+/// `&mut WindowManager` method directly. This queue is that handoff,
+/// mirroring how `keyboard`/`mouse` hand interrupt-context events to the
+/// same loop via their own static queues.
+enum WinCommand {
+    Create { pid: usize, width: u32, height: u32, title: String },
+    Update { pid: usize, pixels: Vec<u32> },
+}
+
+static PENDING_COMMANDS: SpinLock<Vec<WinCommand>> = SpinLock::new(Vec::new());
+
+/// Bound on queued-but-undrained commands, so a process spamming
+/// sys_win_update faster than the desktop loop drains it grows memory
+/// without limit instead of just losing the oldest redraws.
+const PENDING_COMMANDS_CAPACITY: usize = 64;
+
+fn push_command(command: WinCommand) {
+    let mut queue = PENDING_COMMANDS.lock();
+    if queue.len() >= PENDING_COMMANDS_CAPACITY {
+        queue.remove(0);
+    }
+    queue.push(command);
+}
+
+fn take_pending_commands() -> Vec<WinCommand> {
+    core::mem::take(&mut *PENDING_COMMANDS.lock())
+}
+
+/// Queues a window-creation request for `pid` (see `sys_win_create`).
+pub fn queue_create(pid: usize, width: u32, height: u32, title: String) {
+    push_command(WinCommand::Create { pid, width, height, title });
+}
+
+/// Queues a pixel-buffer replacement for `pid`'s window (see `sys_win_update`).
+pub fn queue_update(pid: usize, pixels: Vec<u32>) {
+    push_command(WinCommand::Update { pid, pixels });
+}
+
+/// Translates the subset of `keyboard::Event` a process window
+/// understands into the 2-byte wire format `sys_recv` hands back to it:
+/// `[tag, data]` where tag is 0 (Char, data = ASCII byte), 1
+/// (Backspace), or 2 (Enter). Arrow keys, Tab, and Ctrl+letter aren't
+/// forwarded yet — `None` for those, and for any non-ASCII char.
+fn encode_key_event(event: &keyboard::Event) -> Option<[u8; 2]> {
+    match *event {
+        keyboard::Event::Char(c) if c.is_ascii() => Some([0, c as u8]),
+        keyboard::Event::Backspace => Some([1, 0]),
+        keyboard::Event::Enter => Some([2, 0]),
+        _ => None,
+    }
+}
+
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
     Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String },
     Calculator(CalculatorApp),
+    /// A window owned by a ring-3 process (see `syscall::sys_win_create`),
+    /// as opposed to the kinds above, whose app logic lives in the kernel.
+    /// `pixels` is a plain framebuffer the process replaces wholesale via
+    /// `sys_win_update`; there is no other rendering support (no font, no
+    /// partial redraw) — the process draws its own content and hands the
+    /// kernel the finished pixels.
+    Process { pid: usize, width: u32, height: u32, pixels: Vec<u32> },
 }
 
 pub struct Window {
@@ -127,6 +193,7 @@ impl Window {
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => (console.width_px(), console.height_px()),
             AppKind::Calculator(app) => (app.width(), app.height()),
+            AppKind::Process { width, height, .. } => (*width, *height),
         }
     }
 
@@ -136,18 +203,19 @@ impl Window {
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => console.pixels(),
             AppKind::Calculator(app) => app.pixels(),
+            AppKind::Process { pixels, .. } => pixels,
         }
     }
 
     /// Cell dimensions for the console-backed kinds; `(0, 0)` for
-    /// `Calculator`, which has no grid (and is never resizable/maximizable
-    /// anyway, so this is never used for it in practice).
+    /// `Calculator`/`Process`, neither of which has a grid (and neither is
+    /// ever resizable/maximizable, so this is never used for them).
     fn cols_rows(&self) -> (usize, usize) {
         match &self.kind {
             AppKind::Terminal { console, .. }
             | AppKind::SysInfo { console }
             | AppKind::Editor { console, .. } => (console.cols(), console.rows()),
-            AppKind::Calculator(_) => (0, 0),
+            AppKind::Calculator(_) | AppKind::Process { .. } => (0, 0),
         }
     }
 }
@@ -600,6 +668,11 @@ impl WindowManager {
             AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {
                 editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, event);
             }
+            AppKind::Process { pid, .. } => {
+                if let Some(encoded) = encode_key_event(&event) {
+                    process::send_from_kernel(*pid, &encoded);
+                }
+            }
             AppKind::SysInfo { .. } | AppKind::Calculator(_) => {}
         }
     }
@@ -865,6 +938,93 @@ impl WindowManager {
         let bg_w = (bg.len() * font::GLYPH_WIDTH) as u32;
         gfx::draw_string(surface, self.screen_w - clock_w - bg_w - 24, y + 8, &bg, 0x00_9FCB6B, None);
     }
+
+    /// Applies every `WinCommand` a `sys_win_create`/`sys_win_update`
+    /// syscall queued since the last call (see `PENDING_COMMANDS`). Must
+    /// be called every iteration of the desktop loop — that's the only
+    /// place a `WindowManager` instance is reachable from, so it's also
+    /// the only place these process-originated requests can be applied.
+    /// Returns whether anything was actually applied, so the caller knows
+    /// to recomposite even if no mouse/keyboard event happened this pass
+    /// (e.g. a process animating its window purely from a clock/timer of
+    /// its own, with no user input involved at all).
+    pub fn drain_commands(&mut self) -> bool {
+        let commands = take_pending_commands();
+        let changed = !commands.is_empty();
+        for command in commands {
+            match command {
+                WinCommand::Create { pid, width, height, title } => self.create_process_window(pid, width, height, title),
+                WinCommand::Update { pid, pixels } => self.update_process_window(pid, pixels),
+            }
+        }
+        changed
+    }
+
+    /// Creates (or, if that pid already has one, replaces) a process's
+    /// window. Reuses `spawn_window`'s slot-recycling/cascade-position
+    /// logic; process windows have no `app_id`, so they never get a
+    /// remembered position — every `sys_win_create` cascades fresh.
+    fn create_process_window(&mut self, pid: usize, width: u32, height: u32, title: String) {
+        if let Some(index) = self.find_process_window(pid) {
+            self.windows[index].open = false; // drop the stale one; spawn_window recycles the slot
+        }
+        let title: &'static str = alloc::boxed::Box::leak(title.into_boxed_str());
+        let pixels = vec![0u32; width as usize * height as usize];
+        self.spawn_window(title, false, None, AppKind::Process { pid, width, height, pixels });
+    }
+
+    /// Replaces a process window's pixel buffer wholesale. Silently
+    /// dropped if the pixel count doesn't match the window's declared
+    /// size, or if the process doesn't have a window (it hasn't called
+    /// sys_win_create yet, or the window was already closed) — a
+    /// misbehaving process can only corrupt its own window, never another
+    /// one's or the compositor's state.
+    fn update_process_window(&mut self, pid: usize, pixels: Vec<u32>) {
+        let Some(index) = self.find_process_window(pid) else { return };
+        if let AppKind::Process { width, height, pixels: slot, .. } = &mut self.windows[index].kind {
+            if pixels.len() == *width as usize * *height as usize {
+                *slot = pixels;
+            }
+        }
+    }
+
+    fn find_process_window(&self, pid: usize) -> Option<usize> {
+        self.windows.iter().position(|w| matches!(&w.kind, AppKind::Process { pid: p, .. } if *p == pid))
+    }
+
+    /// The current pixel buffer of `pid`'s window, if it has one — for
+    /// the selftest to confirm a sys_win_update actually landed, without
+    /// needing to read the framebuffer back.
+    pub fn process_window_pixels(&self, pid: usize) -> Option<&[u32]> {
+        let index = self.find_process_window(pid)?;
+        match &self.windows[index].kind {
+            AppKind::Process { pixels, .. } => Some(pixels.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Closes any process window whose owning process has exited (crashed
+    /// or called sys_exit) and reaps it, so a dead process doesn't sit in
+    /// the task table forever and its window doesn't linger as an
+    /// unresponsive husk. Cheap to call every loop iteration: this is
+    /// just a linear scan with no allocation on the common "nothing
+    /// exited" path.
+    pub fn reap_exited_process_windows(&mut self) -> bool {
+        let mut changed = false;
+        for i in 0..self.windows.len() {
+            let AppKind::Process { pid, .. } = &self.windows[i].kind else { continue };
+            let pid = *pid;
+            if !self.windows[i].open || task::process_exit_status(pid).is_none() {
+                continue;
+            }
+            self.remember_geometry(i);
+            self.windows[i].open = false;
+            self.refocus_after_hide(i);
+            process::reap(pid);
+            changed = true;
+        }
+        changed
+    }
 }
 
 fn resize_window(window: &mut Window, cols: usize, rows: usize) {
@@ -879,7 +1039,7 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             console.resize(cols, rows);
             editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
         }
-        AppKind::SysInfo { .. } | AppKind::Calculator(_) => {} // not resizable
+        AppKind::SysInfo { .. } | AppKind::Calculator(_) | AppKind::Process { .. } => {} // not resizable
     }
 }
 

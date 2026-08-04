@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::sync::SpinLock;
-use crate::{ata, cpuid, fat, fat::FatError, interrupts, io, keyboard, mouse, multiboot, port, process, rtc, serial, task, vga};
+use crate::{ata, cpuid, fat, fat::FatError, interrupts, io, keyboard, mouse, multiboot, port, process, rtc, serial, task, vga, wm};
 
 const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
@@ -940,6 +940,51 @@ pub fn selftest() -> ! {
         }
         other => selftest_fail(&format!("IPC process result mismatch: {:?}", other)),
     }
+    crate::process::reap(pid);
+
+    // Process management, part 6: a window. prog_window creates a small
+    // window via sys_win_create, then loops on sys_recv for keyboard
+    // events the window manager forwards to it while its window is
+    // focused, cycling its background color and pushing the redraw via
+    // sys_win_update. Builds its own WindowManager (there's no desktop
+    // running in selftest mode) but drives it through the exact same
+    // handle_key/drain_commands path desktop::run() uses interactively.
+    let (screen_w, screen_h) = crate::fb::dimensions();
+    let mut manager = wm::WindowManager::new(screen_w, screen_h);
+    let pid = crate::process::spawn(crate::user_prog::PROG_WINDOW, "window")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+
+    // A few scheduler quanta for sys_win_create to reach the queue.
+    let deadline = interrupts::ticks() + 15;
+    while interrupts::ticks() < deadline {
+        interrupts::halt();
+    }
+    manager.drain_commands();
+    if manager.process_window_pixels(pid).is_none() {
+        selftest_fail("prog_window's sys_win_create never reached the window manager");
+    }
+    println!("[OK] process window created via sys_win_create");
+
+    // A freshly created window is raised and focused (spawn_window), so
+    // this reaches prog_window's sys_recv loop.
+    manager.handle_key(keyboard::Event::Char('x'));
+    let deadline = interrupts::ticks() + 15;
+    while interrupts::ticks() < deadline {
+        interrupts::halt();
+    }
+    manager.drain_commands();
+
+    match crate::process::read_result(pid) {
+        Some(1) => println!("[OK] process window received the keystroke and redrew once"),
+        other => selftest_fail(&format!("process window redraw count mismatch: {:?}", other)),
+    }
+    match manager.process_window_pixels(pid) {
+        Some(pixels) if !pixels.is_empty() && pixels.iter().all(|&p| p == 0x00_B33A3A) => {
+            println!("[OK] sys_win_update pixels landed in the compositor's window")
+        }
+        other => selftest_fail(&format!("process window pixels mismatch: {:?}", other.map(|p| p.first().copied()))),
+    }
+    manager.composite(); // smoke-test the AppKind::Process draw path
     crate::process::reap(pid);
 
     let frames_after = crate::pmm::free_frames();

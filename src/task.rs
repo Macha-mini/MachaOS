@@ -343,8 +343,10 @@ pub fn process_mappings(pid: usize) -> Option<&'static [crate::process::Mapping]
         .and_then(|task| task.process.as_ref().map(|p| p.mappings.as_slice()))
 }
 
-/// Delivers `bytes` to `pid`'s single-message inbox (a mailbox, not a
-/// queue: a second delivery before the first is read overwrites it).
+/// Delivers `bytes` to `pid`'s inbox queue, dropping the oldest queued
+/// message if it's already at `process::INBOX_CAPACITY` (bursty senders —
+/// e.g. the window manager forwarding keystrokes to a process's window —
+/// matter more here than guaranteeing no message is ever dropped).
 /// Returns false if `pid` isn't a running process. Safe to call from
 /// syscall context: interrupts are already disabled there for the whole
 /// non-blocking, non-reentrant duration (see syscall.rs's module docs),
@@ -359,16 +361,19 @@ pub fn deliver_message(pid: usize, bytes: &[u8]) -> bool {
     if process.is_exited() {
         return false;
     }
-    process.inbox = Some(bytes.to_vec());
+    if process.inbox.len() >= crate::process::INBOX_CAPACITY {
+        process.inbox.pop_front();
+    }
+    process.inbox.push_back(bytes.to_vec());
     true
 }
 
-/// Takes (clearing) the current task's pending message, if any.
+/// Takes (dequeuing) the current task's oldest pending message, if any.
 pub fn take_current_message() -> Option<alloc::vec::Vec<u8>> {
     tasks_mut()[CURRENT.load(Ordering::Relaxed)]
         .process
         .as_mut()
-        .and_then(|process| process.inbox.take())
+        .and_then(|process| process.inbox.pop_front())
 }
 
 /// Marks the current task's process as exited. Keeps the first exit info

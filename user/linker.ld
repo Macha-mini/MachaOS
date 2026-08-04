@@ -33,6 +33,22 @@ SECTIONS
     . = ALIGN(16);
     .data : {
         *(.data .data.*)
+        /* Not dynamically linked (static relocation model, no PIC), so
+         * there's no real GOT to fill in at load time — but rustc/LLVM
+         * still emit a GOT slot for some intrinsic calls (observed: the
+         * memset used to zero-init a large stack array goes through one),
+         * and code that indirectly calls through it needs the slot to
+         * actually be *somewhere valid*. Left unmentioned, the linker
+         * places these at address 0, which the loader rejects outright
+         * (segments below ~2 MiB are kernel territory; see
+         * MIN_SEGMENT_VADDR) — and even mapped, address 0 is exactly the
+         * one address a stray null pointer would also land on, which is
+         * worth avoiding on principle. Folding them into .data gives them
+         * a normal, valid home instead.
+         */
+        *(.got)
+        *(.got.plt)
+        *(.data.rel.ro*)
     }
 
     . = ALIGN(16);
@@ -43,6 +59,8 @@ SECTIONS
 
     /DISCARD/ : {
         *(.eh_frame)
+        *(.eh_frame_hdr)
         *(.comment)
+        *(.plt) /* no dynamic symbols to stub out; should always be empty */
     }
 }

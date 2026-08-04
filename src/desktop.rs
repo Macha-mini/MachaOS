@@ -19,6 +19,12 @@ pub fn run() -> ! {
             manager.handle_key(event);
             dirty = true;
         }
+        // Requests queued by sys_win_create/sys_win_update (and processes
+        // that exited since the last pass) — this loop is the only place
+        // a `WindowManager` is reachable from, so it's the only place
+        // either can be applied. See wm.rs's module docs on `WinCommand`.
+        dirty |= manager.drain_commands();
+        dirty |= manager.reap_exited_process_windows();
         if dirty || manager.clock_tick_due() {
             manager.composite();
         }

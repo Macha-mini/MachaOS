@@ -29,6 +29,7 @@ user:
 	cp user/target/x86_64-unknown-none/release/prog_fault target/user-fault.elf
 	cp user/target/x86_64-unknown-none/release/prog_syscall target/user-syscall.elf
 	cp user/target/x86_64-unknown-none/release/prog_ipc target/user-ipc.elf
+	cp user/target/x86_64-unknown-none/release/prog_window target/user-window.elf
 
 build: gen user
 	cargo build --release
@@ -62,6 +63,7 @@ disk: wallpaper
 	mmd -i $(DISK) ::/bin
 	mcopy -i $(DISK) target/user-exit.elf ::/bin/prog_exit.elf
 	mcopy -i $(DISK) target/user-fault.elf ::/bin/prog_fault.elf
+	mcopy -i $(DISK) target/user-window.elf ::/bin/prog_window.elf
 	mcopy -i $(DISK) $(WALLPAPER) ::/wallpaper.raw
 	rm -f target/fixture.txt target/fixture2.txt
 

@@ -40,6 +40,9 @@ pub const PROC_RESULT_VIRT: u64 = 0x2FF0000;
 /// No process segment may start below 2 MiB (kernel image, PMM, tables).
 const MIN_SEGMENT_VADDR: u64 = 2 * 1024 * 1024;
 
+/// Cap on `Process::inbox` — see `task::deliver_message`.
+pub const INBOX_CAPACITY: usize = 16;
+
 /// Every process gets the same fixed ring-3 stack address (256 MiB — well
 /// clear of the 48 MiB test-program load address and the kernel's own
 /// territory) since each process has its own private page table, so
@@ -93,8 +96,9 @@ pub struct Process {
     /// `wait` loop can observe the mark without an optimizer barrier.
     pub(crate) state: ProcessState,
     pub(crate) exit_info: Option<ExitInfo>,
-    /// Single-slot mailbox for `sys_send`/`sys_recv` (see `task::deliver_message`).
-    pub(crate) inbox: Option<Vec<u8>>,
+    /// Inbox queue for `sys_send`/`sys_recv` (see `task::deliver_message`),
+    /// capped at `INBOX_CAPACITY` messages (oldest dropped past that).
+    pub(crate) inbox: alloc::collections::VecDeque<Vec<u8>>,
 }
 
 impl Process {
@@ -129,7 +133,7 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         mappings: Vec::new(),
         state: ProcessState::Running,
         exit_info: None,
-        inbox: None,
+        inbox: alloc::collections::VecDeque::new(),
     };
 
     let pml4 = match build_address_space(&mut process) {
