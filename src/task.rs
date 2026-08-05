@@ -488,20 +488,30 @@ pub fn remove_process(pid: usize) -> Option<Process> {
     task.process
 }
 
-fn counter_task_0() -> ! {
+// Background demo tasks: bump a counter to prove preemptive
+// multitasking works. They deliberately pace themselves with `hlt`
+// (waking on the next timer tick) instead of spinning: an unconditional
+// `loop { fetch_add }` in three tasks would burn 100% of one core and
+// starve the desktop/main task for CPU, which makes the whole OS feel
+// sluggish in QEMU. Pacing keeps the counters visibly advancing while
+// leaving the CPU to the UI.
+fn counter_task(index: usize) -> ! {
     loop {
-        COUNTERS[0].fetch_add(1, Ordering::Relaxed);
+        for _ in 0..100 {
+            COUNTERS[index].fetch_add(1, Ordering::Relaxed);
+        }
+        interrupts::halt();
     }
+}
+
+fn counter_task_0() -> ! {
+    counter_task(0)
 }
 
 fn counter_task_1() -> ! {
-    loop {
-        COUNTERS[1].fetch_add(1, Ordering::Relaxed);
-    }
+    counter_task(1)
 }
 
 fn counter_task_2() -> ! {
-    loop {
-        COUNTERS[2].fetch_add(1, Ordering::Relaxed);
-    }
+    counter_task(2)
 }
