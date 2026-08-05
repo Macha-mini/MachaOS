@@ -156,6 +156,30 @@ impl Surface for Console {
             self.buffer[idx] = color;
         }
     }
+
+    // Fast paths over the contiguous `buffer` (see `fb::State`); the
+    // console's own pixel buffer is the window content the compositor
+    // blits every frame.
+
+    fn blit_span(&mut self, x: u32, y: u32, src: &[u32], offset: usize, len: u32) {
+        let w = self.width_px() as usize;
+        if y as usize >= self.buffer.len() / w.max(1) || x as usize >= w || len == 0 {
+            return;
+        }
+        let n = (len as usize).min(w - x as usize);
+        let row_start = y as usize * w + x as usize;
+        self.buffer[row_start..row_start + n].copy_from_slice(&src[offset..offset + n]);
+    }
+
+    fn fill_span(&mut self, x: u32, y: u32, len: u32, color: u32) {
+        let w = self.width_px() as usize;
+        if y as usize >= self.buffer.len() / w.max(1) || x as usize >= w || len == 0 {
+            return;
+        }
+        let n = (len as usize).min(w - x as usize);
+        let row_start = y as usize * w + x as usize;
+        self.buffer[row_start..row_start + n].fill(color);
+    }
 }
 
 impl fmt::Write for Console {

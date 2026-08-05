@@ -68,6 +68,55 @@ impl Surface for State {
             None
         }
     }
+
+    // Fast paths over the contiguous `vback_buffer`: one slice copy /
+    // fill / blend per row instead of one virtual `put_pixel` call per
+    // pixel. This is the hot path — the compositor blits the full
+    // wallpaper and every window's pixels through here each frame.
+
+    fn blit_span(&mut self, x: u32, y: u32, src: &[u32], offset: usize, len: u32) {
+        if y >= self.vheight || x >= self.vwidth || len == 0 {
+            return;
+        }
+        let n = len.min(self.vwidth - x) as usize;
+        let row_start = (y * self.vwidth + x) as usize;
+        self.vback_buffer[row_start..row_start + n].copy_from_slice(&src[offset..offset + n]);
+    }
+
+    fn fill_span(&mut self, x: u32, y: u32, len: u32, color: u32) {
+        if y >= self.vheight || x >= self.vwidth || len == 0 {
+            return;
+        }
+        let n = len.min(self.vwidth - x) as usize;
+        let row_start = (y * self.vwidth + x) as usize;
+        self.vback_buffer[row_start..row_start + n].fill(color);
+    }
+
+    fn blend_span(&mut self, x: u32, y: u32, len: u32, color: u32, alpha: u32) {
+        if y >= self.vheight || x >= self.vwidth || len == 0 {
+            return;
+        }
+        if alpha >= 255 {
+            return self.fill_span(x, y, len, color);
+        }
+        if alpha == 0 {
+            return;
+        }
+        let n = len.min(self.vwidth - x) as usize;
+        let row_start = (y * self.vwidth + x) as usize;
+        let row = &mut self.vback_buffer[row_start..row_start + n];
+        let inv = 255 - alpha;
+        for px in row {
+            let mut out = 0u32;
+            for shift in [16u32, 8, 0] {
+                let f = (color >> shift) & 0xFF;
+                let b = (*px >> shift) & 0xFF;
+                let v = (f * alpha + b * inv) / 255;
+                out |= (v & 0xFF) << shift;
+            }
+            *px = out;
+        }
+    }
 }
 
 static STATE: SpinLock<Option<State>> = SpinLock::new(None);

@@ -20,15 +20,53 @@ pub trait Surface {
         let _ = (x, y);
         None
     }
+
+    /// Copies `len` pixels from `src[offset..offset+len]` onto this
+    /// surface's row `y` starting at column `x`. The default walks
+    /// `put_pixel`; surfaces backed by a contiguous pixel buffer
+    /// override this with a slice copy (the hot path for full-screen
+    /// blits, window content, and wallpaper).
+    fn blit_span(&mut self, x: u32, y: u32, src: &[u32], offset: usize, len: u32) {
+        for i in 0..len {
+            self.put_pixel(x + i, y, src[offset + i as usize]);
+        }
+    }
+
+    /// Fills `len` pixels on row `y` starting at column `x` with `color`.
+    /// Same override story as `blit_span`.
+    fn fill_span(&mut self, x: u32, y: u32, len: u32, color: u32) {
+        for i in 0..len {
+            self.put_pixel(x + i, y, color);
+        }
+    }
+
+    /// Blends `color` over `len` pixels on row `y` starting at column `x`
+    /// with opacity `alpha` (0-255). Same override story as `blit_span`.
+    fn blend_span(&mut self, x: u32, y: u32, len: u32, color: u32, alpha: u32) {
+        if alpha >= 255 {
+            return self.fill_span(x, y, len, color);
+        }
+        if alpha == 0 {
+            return;
+        }
+        for i in 0..len {
+            if let Some(base) = self.get_pixel(x + i, y) {
+                self.put_pixel(x + i, y, blend(color, base, alpha));
+            } else {
+                self.put_pixel(x + i, y, color);
+            }
+        }
+    }
 }
 
 pub fn fill_rect(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32, color: u32) {
     let x_end = (x + w).min(surface.width());
     let y_end = (y + h).min(surface.height());
+    if x_end <= x || y_end <= y {
+        return;
+    }
     for yy in y..y_end {
-        for xx in x..x_end {
-            surface.put_pixel(xx, yy, color);
-        }
+        surface.fill_span(x, yy, x_end - x, color);
     }
 }
 
@@ -49,8 +87,17 @@ pub fn fill_rect_gradient_v(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h
             let v = a + (b - a) * row as i32 / denom;
             color |= (v as u32 & 0xFF) << shift;
         }
-        fill_rect(surface, x, y + row, w, 1, color);
+        fill_span_clipped(surface, x, y + row, w, color);
     }
+}
+
+/// `fill_rect`'s row loop for a single scanline, clipped to the surface.
+fn fill_span_clipped(surface: &mut dyn Surface, x: u32, y: u32, w: u32, color: u32) {
+    let x_end = (x + w).min(surface.width());
+    if y >= surface.height() || x_end <= x {
+        return;
+    }
+    surface.fill_span(x, y, x_end - x, color);
 }
 
 /// Horizontal inset for a given scanline of a rectangle with rounded
@@ -79,7 +126,7 @@ pub fn fill_rounded_rect(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u
         let inset = rounded_inset(row, h, r);
         let inner = w.saturating_sub(2 * inset);
         if inner >= 2 {
-            fill_rect(surface, x + inset, y + row, inner, 1, color);
+            fill_span_clipped(surface, x + inset, y + row, inner, color);
         }
     }
 }
@@ -112,7 +159,7 @@ pub fn fill_rounded_rect_gradient_v(
         let inset = rounded_inset(row, h, r);
         let inner = w.saturating_sub(2 * inset);
         if inner >= 2 {
-            fill_rect(surface, x + inset, y + row, inner, 1, color);
+            fill_span_clipped(surface, x + inset, y + row, inner, color);
         }
     }
 }
@@ -138,6 +185,15 @@ pub fn blend(fg: u32, bg: u32, alpha: u32) -> u32 {
     out
 }
 
+/// `fill_rect_blend`'s row loop for a single scanline, clipped to the surface.
+fn blend_span_clipped(surface: &mut dyn Surface, x: u32, y: u32, w: u32, color: u32, alpha: u32) {
+    let x_end = (x + w).min(surface.width());
+    if y >= surface.height() || x_end <= x {
+        return;
+    }
+    surface.blend_span(x, y, x_end - x, color, alpha);
+}
+
 /// `fill_rect` with translucency: blends `color` over whatever is
 /// already on the surface (which must implement `get_pixel` for the
 /// blend to do anything; otherwise it degrades to a solid fill).
@@ -145,16 +201,15 @@ pub fn fill_rect_blend(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32
     if alpha >= 255 {
         return fill_rect(surface, x, y, w, h, color);
     }
-    let x_end = (x + w).min(surface.width());
+    if alpha == 0 {
+        return;
+    }
     let y_end = (y + h).min(surface.height());
+    if y_end <= y {
+        return;
+    }
     for yy in y..y_end {
-        for xx in x..x_end {
-            if let Some(base) = surface.get_pixel(xx, yy) {
-                surface.put_pixel(xx, yy, blend(color, base, alpha));
-            } else {
-                surface.put_pixel(xx, yy, color);
-            }
-        }
+        blend_span_clipped(surface, x, yy, w, color, alpha);
     }
 }
 
@@ -176,7 +231,7 @@ pub fn fill_rounded_rect_blend(
         let inset = rounded_inset(row, h, r);
         let inner = w.saturating_sub(2 * inset);
         if inner >= 2 {
-            fill_rect_blend(surface, x + inset, y + row, inner, 1, color, alpha);
+            blend_span_clipped(surface, x + inset, y + row, inner, color, alpha);
         }
     }
 }
@@ -220,11 +275,14 @@ pub fn draw_string(surface: &mut dyn Surface, x: u32, y: u32, s: &str, fg: u32, 
 
 /// Copies a `src_w`x`src_h` pixel buffer onto `surface` at (`dst_x`, `dst_y`).
 pub fn blit(surface: &mut dyn Surface, dst_x: u32, dst_y: u32, src: &[u32], src_w: u32, src_h: u32) {
-    for y in 0..src_h {
-        for x in 0..src_w {
-            let color = src[(y * src_w + x) as usize];
-            surface.put_pixel(dst_x + x, dst_y + y, color);
-        }
+    let x_end = (dst_x + src_w).min(surface.width());
+    let y_end = (dst_y + src_h).min(surface.height());
+    if x_end <= dst_x || y_end <= dst_y {
+        return;
+    }
+    let span = x_end - dst_x;
+    for y in 0..(y_end - dst_y) {
+        surface.blit_span(dst_x, dst_y + y, src, (y * src_w) as usize, span);
     }
 }
 
@@ -246,10 +304,13 @@ pub fn blit_rounded(
         if inner == 0 {
             continue;
         }
-        let src_row = &src[row as usize * src_w as usize..(row as usize + 1) * src_w as usize];
-        for col in inset..inset + inner {
-            surface.put_pixel(dst_x + col, dst_y + row, src_row[col as usize]);
-        }
+        surface.blit_span(
+            dst_x + inset,
+            dst_y + row,
+            src,
+            (row as usize * src_w as usize) + inset as usize,
+            inner,
+        );
     }
 }
 

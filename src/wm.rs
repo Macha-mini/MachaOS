@@ -336,6 +336,12 @@ pub struct WindowManager {
     wallpaper: Option<Vec<u32>>,
     // Persistent system settings loaded from /system/settings.conf.
     settings: Settings,
+    // Taskbar clock cache: (uptime second the string was rendered for,
+    // formatted "HH:MM  up MM:SS"). Reading the CMOS RTC is slow port
+    // I/O, so the clock is only re-read when the displayed second
+    // actually changes — never on every composite (mouse moves trigger
+    // composites constantly).
+    clock_cache: (u64, String),
 }
 
 impl WindowManager {
@@ -364,6 +370,7 @@ impl WindowManager {
             remembered: [None; APP_ID_COUNT],
             wallpaper: load_wallpaper(screen_w, screen_h),
             settings: Settings::load(),
+            clock_cache: (u64::MAX, String::new()),
         };
         manager.restore_session();
         manager
@@ -1374,6 +1381,22 @@ impl WindowManager {
     }
 
     pub fn composite(&mut self) {
+        // Refresh the taskbar clock cache when the displayed second
+        // changes. CMOS RTC reads are slow port I/O, so this runs at
+        // most once per second, not on every composite (mouse moves
+        // trigger composites constantly).
+        let secs = interrupts::ticks() / 100;
+        if secs != self.clock_cache.0 {
+            self.clock_cache.0 = secs;
+            let now = crate::rtc::now();
+            self.clock_cache.1 = format!(
+                "{:02}:{:02}  up {:02}:{:02}",
+                now.hour,
+                now.minute,
+                secs / 60,
+                secs % 60
+            );
+        }
         fb::with_surface(|surface| {
             // Use wallpaper only if settings enable it and it's available.
             if self.settings.wallpaper {
@@ -1481,16 +1504,9 @@ impl WindowManager {
         }
 
         // System tray: clock on the right, optional bg-task counters.
-        let ticks = interrupts::ticks();
-        let secs = ticks / 100;
-        let now = crate::rtc::now();
-        let clock = format!(
-            "{:02}:{:02}  up {:02}:{:02}",
-            now.hour,
-            now.minute,
-            secs / 60,
-            secs % 60
-        );
+        // The clock string is cached and only refreshed (via the slow
+        // CMOS RTC port reads) when the displayed second changes.
+        let clock = &self.clock_cache.1;
         let clock_w = (clock.len() * font::glyph_w()) as u32;
         let clock_x = self.screen_w - clock_w - 12;
         gfx::draw_string(surface, clock_x, y + (TASKBAR_HEIGHT - font::glyph_h() as u32) / 2, &clock, TASKBAR_TEXT, None);
