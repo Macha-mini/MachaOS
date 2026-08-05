@@ -1,5 +1,10 @@
-//! Linear framebuffer access. Drawing goes into a heap-backed back buffer
-//! (`present()` flushes it to the real MMIO framebuffer) to avoid flicker.
+//! Linear framebuffer access. The window manager composites at a
+//! *virtual* resolution (chosen by the user in Settings; defaults to the
+//! physical mode) into a heap-backed back buffer, then `present()`
+//! scales it onto the real MMIO framebuffer when the virtual and
+//! physical resolutions differ. This is how "changing the OS
+//! resolution" works: GRUB picks the physical VBE mode at boot, and the
+//! virtual desktop can be any supported size below it.
 //! `emergency_*` functions bypass the lock and the back buffer entirely so
 //! the panic handler can still put something on screen even if the
 //! allocator or the lock holder is in a bad state.
@@ -9,32 +14,58 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::font;
-use crate::gfx::Surface;
+use crate::gfx::{self, Surface};
 use crate::multiboot::MultibootInfo;
 use crate::paging;
 use crate::sync::SpinLock;
+
+/// Resolutions the Settings app offers. Must stay <= the physical
+/// framebuffer in both axes; anything else is rejected.
+pub const SUPPORTED_RESOLUTIONS: [(u32, u32); 6] = [
+    (1920, 1080),
+    (1600, 900),
+    (1366, 768),
+    (1280, 720),
+    (1024, 576),
+    (800, 600),
+];
 
 struct State {
     addr: u64,
     pitch: u32,
     width: u32,
     height: u32,
+    // Virtual desktop resolution: the compositor draws into
+    // `vback_buffer` at this size, and present() scales it to the
+    // physical buffer.
+    vwidth: u32,
+    vheight: u32,
+    vback_buffer: Vec<u32>,
+    // Physical back buffer: `vback_buffer` scaled to the real mode.
     back_buffer: Vec<u32>,
 }
 
 impl Surface for State {
     fn width(&self) -> u32 {
-        self.width
+        self.vwidth
     }
 
     fn height(&self) -> u32 {
-        self.height
+        self.vheight
     }
 
     fn put_pixel(&mut self, x: u32, y: u32, color: u32) {
-        if x < self.width && y < self.height {
-            let idx = (y * self.width + x) as usize;
-            self.back_buffer[idx] = color;
+        if x < self.vwidth && y < self.vheight {
+            let idx = (y * self.vwidth + x) as usize;
+            self.vback_buffer[idx] = color;
+        }
+    }
+
+    fn get_pixel(&self, x: u32, y: u32) -> Option<u32> {
+        if x < self.vwidth && y < self.vheight {
+            Some(self.vback_buffer[(y * self.vwidth + x) as usize])
+        } else {
+            None
         }
     }
 }
@@ -49,7 +80,8 @@ static FB_WIDTH: AtomicU32 = AtomicU32::new(0);
 static FB_HEIGHT: AtomicU32 = AtomicU32::new(0);
 
 /// Only 32bpp linear RGB framebuffers are supported (the overwhelming
-/// majority of VBE modes GRUB will hand back).
+/// majority of VBE modes GRUB will hand back). The virtual resolution
+/// starts out equal to the physical one.
 pub fn init(info: &MultibootInfo) -> bool {
     let fb = match info.framebuffer() {
         Some(fb) if fb.bpp == 32 => fb,
@@ -59,12 +91,16 @@ pub fn init(info: &MultibootInfo) -> bool {
         return false;
     }
 
+    let vback_buffer = vec![0u32; (fb.width * fb.height) as usize];
     let back_buffer = vec![0u32; (fb.width * fb.height) as usize];
     *STATE.lock() = Some(State {
         addr: fb.addr,
         pitch: fb.pitch,
         width: fb.width,
         height: fb.height,
+        vwidth: fb.width,
+        vheight: fb.height,
+        vback_buffer,
         back_buffer,
     });
 
@@ -80,6 +116,7 @@ pub fn is_graphics_mode() -> bool {
     GRAPHICS_MODE.load(Ordering::Acquire)
 }
 
+/// The physical (VBE) framebuffer size, as chosen by GRUB at boot.
 pub fn dimensions() -> (u32, u32) {
     (
         FB_WIDTH.load(Ordering::Acquire),
@@ -87,8 +124,38 @@ pub fn dimensions() -> (u32, u32) {
     )
 }
 
-/// Runs `f` against the back buffer as a `gfx::Surface`. No-op if the
-/// framebuffer was never initialized.
+/// The virtual desktop resolution — what the window manager lays out
+/// against. Differs from `dimensions()` while a non-native resolution
+/// is active.
+pub fn virtual_dimensions() -> (u32, u32) {
+    let guard = STATE.lock();
+    let state = guard.as_ref();
+    match state {
+        Some(state) => (state.vwidth, state.vheight),
+        None => dimensions(),
+    }
+}
+
+/// Changes the virtual desktop resolution. The back buffer is
+/// reallocated (cleared to black); `present()` rescales from here on.
+/// The new size must be no larger than the physical framebuffer.
+pub fn set_virtual_resolution(w: u32, h: u32) -> bool {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return false;
+    };
+    if w == 0 || h == 0 || w > state.width || h > state.height {
+        return false;
+    }
+    state.vwidth = w;
+    state.vheight = h;
+    state.vback_buffer = Vec::new();
+    state.vback_buffer = vec![0u32; (w * h) as usize];
+    true
+}
+
+/// Runs `f` against the virtual back buffer as a `gfx::Surface`. No-op
+/// if the framebuffer was never initialized.
 pub fn with_surface<F: FnOnce(&mut dyn Surface)>(f: F) {
     let mut guard = STATE.lock();
     if let Some(state) = guard.as_mut() {
@@ -96,9 +163,10 @@ pub fn with_surface<F: FnOnce(&mut dyn Surface)>(f: F) {
     }
 }
 
-/// Reads back a pixel from the back buffer — used by `wayland.rs`'s
-/// selftest hook to verify a client's shared-memory buffer actually made
-/// it onto the real framebuffer, not just that the handshake completed.
+/// Reads back a pixel from the *physical* back buffer (after scaling) —
+/// used by `wayland.rs`'s selftest hook to verify a client's
+/// shared-memory buffer actually made it onto the real framebuffer, not
+/// just that the handshake completed.
 pub fn get_pixel(x: u32, y: u32) -> Option<u32> {
     let guard = STATE.lock();
     let state = guard.as_ref()?;
@@ -108,12 +176,25 @@ pub fn get_pixel(x: u32, y: u32) -> Option<u32> {
     Some(state.back_buffer[(y * state.width + x) as usize])
 }
 
-/// Copies the back buffer to the real MMIO framebuffer.
+/// Scales the virtual back buffer to the physical one and copies it to
+/// the real MMIO framebuffer.
 pub fn present() {
-    let guard = STATE.lock();
-    let Some(state) = guard.as_ref() else {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
         return;
     };
+    if state.vwidth != state.width || state.vheight != state.height {
+        gfx::scale_into(
+            &state.vback_buffer,
+            state.vwidth,
+            state.vheight,
+            &mut state.back_buffer,
+            state.width,
+            state.height,
+        );
+    } else {
+        state.back_buffer.copy_from_slice(&state.vback_buffer);
+    }
     let dst = state.addr as *mut u32;
     for y in 0..state.height as usize {
         let row_offset = y * state.width as usize;

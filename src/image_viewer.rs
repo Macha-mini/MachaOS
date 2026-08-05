@@ -15,10 +15,10 @@ use crate::keyboard;
 const WIDTH: u32 = 640;
 const HEIGHT: u32 = 480;
 
-const BG: u32 = 0x00_1A1A1A;
+const BG: u32 = 0x00_202020;
 const TOOLBAR_BG: u32 = 0x00_2A2A2A;
 const TEXT: u32 = 0x00_FFFFFF;
-const TEXT_DIM: u32 = 0x00_999999;
+const TEXT_DIM: u32 = 0x00_9A9A9A;
 
 const TOOLBAR_HEIGHT: u32 = 30;
 
@@ -212,7 +212,7 @@ impl ImageViewerApp {
         } else {
             // No image - show message
             let msg = "No image loaded";
-            let msg_width = (msg.len() * font::GLYPH_WIDTH) as u32;
+            let msg_width = (msg.len() * font::glyph_w()) as u32;
             let msg_x = (WIDTH - msg_width) / 2;
             let msg_y = HEIGHT / 2;
             gfx::draw_string(self, msg_x, msg_y, msg, TEXT_DIM, None);

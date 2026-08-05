@@ -65,14 +65,27 @@ runs. The disk only holds fixtures if you recreate it with `make disk`.
 
 On normal boot, MachaOS switches to a 1920x1080 graphical desktop with four
 windows: a **Terminal** (the interactive shell), a **System Info** panel, a
-**Calculator**, and a **Notepad** text editor. Click a title bar to
-focus/raise a window and drag it around; click `_` to minimize it (it stays
-in the taskbar, click it there to restore) or the red `x` to close it.
-Terminal and Notepad have a resize grip in their bottom-right corner — drag
-it to resize the window. The taskbar at the bottom lists open windows,
-three counters (`bg: ...`) incrementing in the background scheduler tasks,
-and uptime. If no linear framebuffer is available, MachaOS falls back to
-the plain VGA text shell automatically.
+**Calculator**, and a **Notepad** text editor. The chrome follows the
+Windows 11 design language: rounded windows with soft shadows and flat dark
+title bars (hover the min/max/close buttons — close turns red), a
+translucent acrylic taskbar with a centered button group and the four-pane
+start logo, and a centered start-menu popup with a search box and a grid of
+pinned app tiles. Click a title bar to focus/raise a window and drag it
+around; click `_` to minimize it (it stays in the taskbar, click it there
+to restore) or the `x` to close it. Terminal and Notepad have a resize grip
+in their bottom-right corner — drag it to resize the window. The taskbar
+shows open windows, the clock, three counters (`bg: ...`) incrementing in
+the background scheduler tasks, and uptime. If no linear framebuffer is
+available, MachaOS falls back to the plain VGA text shell automatically.
+
+The **Settings** app (start menu -> Settings) is a Win11-style panel with a
+left navigation sidebar: *System* lets you change the display **resolution**
+(any of 1920x1080, 1600x900, 1366x768, 1280x720, 1024x576, 800x600 that fit
+the physical mode — the desktop scales to fill the real framebuffer) and
+the **font size** (100% / 200% — the whole UI relayouts and the desktop
+rebuilds at the new scale), *Personalization* has the accent color,
+wallpaper and background-task toggles, and *About* shows system info.
+Settings persist to `/system/settings.conf` and are applied at boot.
 
 The Notepad is a text editor with arrow-key cursor movement and
 Enter/Backspace line editing. Press **Ctrl+S** to save the document to

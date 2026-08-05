@@ -9,7 +9,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::fat;
-use crate::font;
 use crate::gfx::{self, Surface};
 use crate::keyboard;
 
@@ -19,11 +18,11 @@ const TOOLBAR_HEIGHT: u32 = 40;
 const WIDTH: u32 = CANVAS_WIDTH;
 const HEIGHT: u32 = CANVAS_HEIGHT + TOOLBAR_HEIGHT;
 
-const BG: u32 = 0x00_1A1A1A;
+const BG: u32 = 0x00_202020;
 const TOOLBAR_BG: u32 = 0x00_2A2A2A;
 const CANVAS_BG: u32 = 0x00_FFFFFF;
 const TEXT: u32 = 0x00_FFFFFF;
-const TEXT_DIM: u32 = 0x00_999999;
+const TEXT_DIM: u32 = 0x00_9A9A9A;
 
 // Color palette (8 colors)
 const COLORS: [u32; 8] = [

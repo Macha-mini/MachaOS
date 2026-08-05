@@ -39,37 +39,34 @@ const GRID_TILE_H: u32 = 54;
 const DOUBLE_CLICK_TICKS: u64 = 30; // ~300 ms at the 100 Hz clock
 const DELETE_ARM_TICKS: u64 = 120; // ~1.2 s to confirm a delete
 
-const BG: u32 = 0x00_141B23;
-const LIST_BG: u32 = 0x00_10161C;
-const SIDEBAR_BG: u32 = 0x00_0D131A;
-const PATH_BG_TOP: u32 = 0x00_22303E;
-const PATH_BG_BOTTOM: u32 = 0x00_1A2632;
-const TOOLBAR_BG_TOP: u32 = 0x00_1D2834;
-const TOOLBAR_BG_BOTTOM: u32 = 0x00_17212B;
-const STATUS_BG: u32 = 0x00_1A2430;
-const HEADER_BG_TOP: u32 = 0x00_202C38;
-const HEADER_BG_BOTTOM: u32 = 0x00_1A2530;
-const TEXT: u32 = 0x00_DBE6F0;
-const TEXT_DIM: u32 = 0x00_8FA0AE;
-const TEXT_FAINT: u32 = 0x00_5E6E7D;
+const BG: u32 = 0x00_1F1F1F;
+const LIST_BG: u32 = 0x00_1C1C1C;
+const SIDEBAR_BG: u32 = 0x00_1A1A1A;
+const PATH_BG: u32 = 0x00_252525;
+const TOOLBAR_BG: u32 = 0x00_232323;
+const STATUS_BG: u32 = 0x00_242424;
+const HEADER_BG: u32 = 0x00_242424;
+const TEXT: u32 = 0x00_FFFFFF;
+const TEXT_DIM: u32 = 0x00_9A9A9A;
+const TEXT_FAINT: u32 = 0x00_6A6A6A;
 const DIR_TEXT: u32 = 0x00_F0C070;
 const ELF_TEXT: u32 = 0x00_86C77B;
-const SELECTED_TOP: u32 = 0x00_3C6EA8;
-const SELECTED_BOTTOM: u32 = 0x00_244A78;
-const HOVER_BG: u32 = 0x00_26333F;
-const CRUMB_BG: u32 = 0x00_2B3A49;
-const ACCENT: u32 = 0x00_6FB1E8;
-const SCROLL_TRACK: u32 = 0x00_1B2632;
-const SCROLL_THUMB: u32 = 0x00_3A4753;
-const BTN_TOP: u32 = 0x00_2A3642;
-const BTN_BOTTOM: u32 = 0x00_1C262F;
-const BTN_HOVER_TOP: u32 = 0x00_35424F;
-const BTN_HOVER_BOTTOM: u32 = 0x00_25303A;
-const BTN_EDGE: u32 = 0x00_0E141B;
+const SELECTED_TOP: u32 = 0x00_3A3A3A;
+const SELECTED_BOTTOM: u32 = 0x00_333333;
+const HOVER_BG: u32 = 0x00_2A2A2A;
+const CRUMB_BG: u32 = 0x00_2C2C2C;
+const ACCENT: u32 = 0x00_4CC2FF;
+const SCROLL_TRACK: u32 = 0x00_202020;
+const SCROLL_THUMB: u32 = 0x00_3A3A3A;
+const BTN_TOP: u32 = 0x00_2C2C2C;
+const BTN_BOTTOM: u32 = 0x00_2C2C2C;
+const BTN_HOVER_TOP: u32 = 0x00_343434;
+const BTN_HOVER_BOTTOM: u32 = 0x00_343434;
+const BTN_EDGE: u32 = 0x00_1A1A1A;
 const ICON_FOLDER: u32 = 0x00_F0C070;
 const ICON_FILE: u32 = 0x00_BBC8D4;
 const ICON_ELF: u32 = 0x00_86C77B;
-const STATUS_TEXT: u32 = 0x00_8FB8D8;
+const STATUS_TEXT: u32 = 0x00_9AB8D8;
 const STATUS_TEXT_BAD: u32 = 0x00_E06060;
 
 /// What the explorer asks the window manager to do after a click or key.
@@ -789,8 +786,8 @@ impl FileExplorer {
     }
 
     fn render_toolbar(&mut self, cx: i32, cy: i32) {
-        gfx::fill_rect_gradient_v(self, 0, PATH_H, WIDTH, TOOLBAR_H, TOOLBAR_BG_TOP, TOOLBAR_BG_BOTTOM);
-        gfx::fill_rect(self, 0, PATH_H + TOOLBAR_H - 1, WIDTH, 1, 0x00_0E141B);
+        gfx::fill_rect(self, 0, PATH_H, WIDTH, TOOLBAR_H, TOOLBAR_BG);
+        gfx::fill_rect(self, 0, PATH_H + TOOLBAR_H - 1, WIDTH, 1, 0x00_1A1A1A);
         for action in [ToolbarAction::Up, ToolbarAction::New, ToolbarAction::Del, ToolbarAction::Refresh] {
             if let Some((bx, bw)) = toolbar_button_rect(action) {
                 let hovered = cx >= bx as i32 && cx < (bx + bw) as i32 && cy >= PATH_H as i32 + 3 && cy < (PATH_H + TOOLBAR_H - 3) as i32;
@@ -818,13 +815,13 @@ impl FileExplorer {
             View::Details => "Icons",
             View::Grid => "List",
         };
-        let lx = bx + (bw - (label.len() as u32 * font::GLYPH_WIDTH as u32)) / 2;
+        let lx = bx + (bw - (label.len() as u32 * font::glyph_w() as u32)) / 2;
         gfx::draw_string(self, lx, PATH_H + 9, label, TEXT, None);
     }
 
     fn render_breadcrumbs(&mut self, cx: i32, cy: i32) {
-        gfx::fill_rect_gradient_v(self, 0, 0, WIDTH, PATH_H, PATH_BG_TOP, PATH_BG_BOTTOM);
-        gfx::fill_rect(self, 0, PATH_H - 1, WIDTH, 1, 0x00_0E141B);
+        gfx::fill_rect(self, 0, 0, WIDTH, PATH_H, PATH_BG);
+        gfx::fill_rect(self, 0, PATH_H - 1, WIDTH, 1, 0x00_1A1A1A);
         let crumbs = crumb_layout(&self.path, LIST_W - 6);
         let last_index = crumbs.len().saturating_sub(1);
         for (i, crumb) in crumbs.iter().enumerate() {
@@ -856,8 +853,8 @@ impl FileExplorer {
         let (nx, sx, tx) = details_columns();
         let drop_target = if self.drag.is_some() { self.drop_target_at(cx, cy) } else { None };
         // Column headers.
-        gfx::fill_rect_gradient_v(self, SIDEBAR_W, LIST_Y, LIST_W, HEADER_H, HEADER_BG_TOP, HEADER_BG_BOTTOM);
-        gfx::fill_rect(self, SIDEBAR_W, LIST_Y + HEADER_H - 1, LIST_W, 1, 0x00_0E141B);
+        gfx::fill_rect(self, SIDEBAR_W, LIST_Y, LIST_W, HEADER_H, HEADER_BG);
+        gfx::fill_rect(self, SIDEBAR_W, LIST_Y + HEADER_H - 1, LIST_W, 1, 0x00_1A1A1A);
         draw_header(self, "Name", nx, cx, cy);
         draw_header(self, "Size", sx, cx, cy);
         draw_header(self, "Type", tx, cx, cy);
@@ -895,11 +892,11 @@ impl FileExplorer {
             gfx::draw_string(self, SIDEBAR_W + 26, ry + 5, &name, name_color, None);
             if !is_dir {
                 let size = fmt_size(size as u64);
-                let sw = (size.len() * font::GLYPH_WIDTH) as u32;
+                let sw = (size.len() * font::glyph_w()) as u32;
                 gfx::draw_string(self, sx.1 - sw - 10, ry + 5, &size, size_color, None);
             }
             let kind = if is_dir { "Folder" } else { file_type(&name) };
-            let kw = (kind.len() * font::GLYPH_WIDTH) as u32;
+            let kw = (kind.len() * font::glyph_w()) as u32;
             let kx = tx.0 + 8;
             if kx + kw <= tx.1 {
                 gfx::draw_string(self, kx, ry + 5, kind, if selected { 0x00_C9DAE8 } else { TEXT_DIM }, None);
@@ -934,7 +931,7 @@ impl FileExplorer {
                 }
                 draw_big_icon(self, tx + (GRID_TILE_W - 36) / 2, ty + 6, &name, is_dir);
                 // Label, centered and truncated to the tile width.
-                let max_chars = ((GRID_TILE_W - 10) / font::GLYPH_WIDTH as u32) as usize;
+                let max_chars = ((GRID_TILE_W - 10) / font::glyph_w() as u32) as usize;
                 let label = if name.chars().count() > max_chars {
                     let mut s: String = name.chars().take(max_chars - 2).collect();
                     s.push_str("..");
@@ -942,7 +939,7 @@ impl FileExplorer {
                 } else {
                     name
                 };
-                let lw = (label.len() * font::GLYPH_WIDTH) as u32;
+                let lw = (label.len() * font::glyph_w()) as u32;
                 let lx = tx + (GRID_TILE_W - lw) / 2;
                 let color = if selected {
                     0x00_FFFFFF
@@ -986,7 +983,7 @@ impl FileExplorer {
         let color = if is_error { STATUS_TEXT_BAD } else { STATUS_TEXT };
         gfx::draw_string(self, 6, HEIGHT - STATUS_H + 4, &status, color, None);
         let free = format!("free {}", fmt_size(self.free_bytes));
-        let fw = (free.len() * font::GLYPH_WIDTH) as u32;
+        let fw = (free.len() * font::glyph_w()) as u32;
         gfx::draw_string(self, WIDTH - fw - 8, HEIGHT - STATUS_H + 4, &free, TEXT_DIM, None);
     }
 }
@@ -1009,7 +1006,7 @@ fn crumb_layout(path: &str, max_w: u32) -> Vec<Crumb> {
         acc.push_str(seg);
         segs.push((seg.to_string(), acc.clone()));
     }
-    let width_of = |label: &str| (label.len() as u32) * font::GLYPH_WIDTH as u32 + 16;
+    let width_of = |label: &str| (label.len() as u32) * font::glyph_w() as u32 + 16;
     let mut start = 0;
     if segs.len() > 2 {
         while start + 2 < segs.len() {

@@ -21,11 +21,14 @@ const WIDTH: u32 = BUTTON_SIZE * GRID_COLS;
 const HEIGHT: u32 = DISPLAY_HEIGHT + BUTTON_SIZE * GRID_ROWS;
 
 const BG: u32 = 0x00_202020;
-const BUTTON_BG: u32 = 0x00_333333;
+const BUTTON_BG: u32 = 0x00_2F2F2F;
+const BUTTON_BG_OP: u32 = 0x00_3D3D3D;
 const BUTTON_FG: u32 = 0x00_FFFFFF;
-const DISPLAY_BG: u32 = 0x00_10161C;
-const DISPLAY_FG: u32 = 0x00_9FCB6B;
+const BUTTON_FG_OP: u32 = 0x00_FFFFFF;
+const DISPLAY_BG: u32 = 0x00_202020;
+const DISPLAY_FG: u32 = 0x00_FFFFFF;
 const ERROR_FG: u32 = 0x00_E06060;
+const ACCENT: u32 = 0x00_4CC2FF;
 
 const BUTTONS: [(&str, u32, u32); 16] = [
     ("7", 0, 0), ("8", 1, 0), ("9", 2, 0), ("/", 3, 0),
@@ -147,19 +150,28 @@ impl CalculatorApp {
         gfx::fill_rect(self, 0, 0, WIDTH, HEIGHT, BG);
         gfx::fill_rect(self, 0, 0, WIDTH, DISPLAY_HEIGHT, DISPLAY_BG);
         let fg = if self.error { ERROR_FG } else { DISPLAY_FG };
-        let text_w = (self.display.len() * font::GLYPH_WIDTH) as u32;
+        let text_w = (self.display.len() * font::glyph_w()) as u32;
         let x = WIDTH.saturating_sub(text_w + 10);
-        let y = (DISPLAY_HEIGHT - font::GLYPH_HEIGHT as u32) / 2;
+        let y = (DISPLAY_HEIGHT - font::glyph_h() as u32) / 2;
         let display = self.display.clone();
         gfx::draw_string(self, x, y, &display, fg, None);
 
         for (label, col, row) in BUTTONS {
             let bx = col * BUTTON_SIZE;
             let by = DISPLAY_HEIGHT + row * BUTTON_SIZE;
-            gfx::fill_rect(self, bx + 2, by + 2, BUTTON_SIZE - 4, BUTTON_SIZE - 4, BUTTON_BG);
-            let lx = bx + (BUTTON_SIZE - font::GLYPH_WIDTH as u32) / 2;
-            let ly = by + (BUTTON_SIZE - font::GLYPH_HEIGHT as u32) / 2;
-            gfx::draw_string(self, lx, ly, label, BUTTON_FG, None);
+            let operator = matches!(label, "/" | "*" | "-" | "+" | "=");
+            let clear = label == "C";
+            let (bg, fg) = if clear {
+                (BUTTON_BG_OP, BUTTON_FG_OP)
+            } else if operator {
+                (ACCENT, 0x00_000000)
+            } else {
+                (BUTTON_BG, BUTTON_FG)
+            };
+            gfx::fill_rounded_rect(self, bx + 2, by + 2, BUTTON_SIZE - 4, BUTTON_SIZE - 4, 8, bg);
+            let lx = bx + (BUTTON_SIZE - font::glyph_w() as u32) / 2;
+            let ly = by + (BUTTON_SIZE - font::glyph_h() as u32) / 2;
+            gfx::draw_string(self, lx, ly, label, fg, None);
         }
     }
 }

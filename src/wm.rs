@@ -1,6 +1,8 @@
 //! Window management: window rectangles, z-order, drag/resize/focus/close
 //! hit testing, the taskbar, and the compositor that draws everything
-//! into the framebuffer's back buffer each frame.
+//! into the framebuffer's back buffer each frame. The chrome follows the
+//! Windows 11 design language: rounded windows over a translucent,
+//! centered taskbar, a centered start-menu popup, and flat dark surfaces.
 
 use alloc::format;
 use alloc::string::String;
@@ -24,105 +26,92 @@ use crate::keyboard;
 use crate::mouse::MouseEvent;
 use crate::multiboot;
 use crate::paint::{PaintAction, PaintApp};
-use crate::settings::{Settings, SettingsApp};
+use crate::settings::{Settings, SettingsApp, SettingsChange};
 use crate::shell::{self, Feed, LineEditor};
 use crate::task;
 
-const TITLE_BAR_HEIGHT: u32 = 22;
-const TASKBAR_HEIGHT: u32 = 30;
-const CLOSE_BUTTON_SIZE: u32 = 16;
-const MINIMIZE_BUTTON_SIZE: u32 = 16;
-const MAXIMIZE_BUTTON_SIZE: u32 = 16;
-const BUTTON_RADIUS: u32 = 4;
+const TITLE_BAR_HEIGHT: u32 = 32;
+const TASKBAR_HEIGHT: u32 = 48;
+const WINDOW_RADIUS: u32 = 8;
+const TITLE_BTN_W: u32 = 40;
+const TITLE_BTN_H: u32 = 28;
+const TITLE_BTN_GAP: u32 = 2;
+const TITLE_BTN_MARGIN_RIGHT: u32 = 6;
 const RESIZE_GRIP_SIZE: u32 = 12;
 const MIN_COLS: usize = 20;
 const MIN_ROWS: usize = 5;
-const DESKTOP_BG_TOP: u32 = 0x00_3A5680;
-const DESKTOP_BG_BOTTOM: u32 = 0x00_1B2A42;
+const MAX_TERMINAL_COLS: usize = 100;
+const MAX_TERMINAL_ROWS: usize = 30;
+const MAX_EDITOR_COLS: usize = 100;
+const MAX_EDITOR_ROWS: usize = 20;
+const DESKTOP_BG_TOP: u32 = 0x00_0F2E5F;
+const DESKTOP_BG_BOTTOM: u32 = 0x00_061630;
 
-// Title bar
-const TITLE_FOCUSED_TOP: u32 = 0x00_4481C8;
-const TITLE_FOCUSED_BOTTOM: u32 = 0x00_1D4A7C;
-const TITLE_UNFOCUSED_TOP: u32 = 0x00_4D5863;
-const TITLE_UNFOCUSED_BOTTOM: u32 = 0x00_313A43;
-const TITLE_HILITE: u32 = 0x00_9CC9F2;
+/// Console cell counts for a new window, sized so the window fits the
+/// current virtual screen at the current font scale — a 100x30 console
+/// that was comfortable at 8px glyphs overflows a scaled-down desktop.
+/// Terminals take roughly 3/4 of the screen width, like Windows' own.
+fn fit_console_cells(screen_w: u32, screen_h: u32, max_cols: usize, max_rows: usize) -> (usize, usize) {
+    let avail_w = (screen_w * 3 / 4).saturating_sub(40) / font::glyph_w() as u32;
+    let avail_h = screen_h.saturating_sub(TASKBAR_HEIGHT + 80) / font::glyph_h() as u32;
+    (
+        (avail_w as usize).clamp(MIN_COLS, max_cols),
+        (avail_h as usize).clamp(MIN_ROWS, max_rows),
+    )
+}
+
+// Windows: flat dark surfaces with subtle borders, like Win11 dark mode.
+const WIN_BG: u32 = 0x00_202020;
+const WIN_BORDER: u32 = 0x00_2B2B2B;
+const WIN_BORDER_FOCUSED: u32 = 0x00_4A4A4A;
 const TITLE_TEXT: u32 = 0x00_FFFFFF;
-const TITLE_TEXT_UNFOCUSED: u32 = 0x00_B6C2CD;
-const TITLE_TEXT_SHADOW: u32 = 0x00_0F2A45;
-const TITLE_UNDERLINE: u32 = 0x00_0F1E2E;
+const TITLE_TEXT_UNFOCUSED: u32 = 0x00_8A8A8A;
+const TITLE_DIVIDER: u32 = 0x00_2A2A2A;
 
-// Window frame and drop shadow (drawn as three nested offsets, darkest
-// furthest from the window, so the edge fades out like a soft shadow)
-const WINDOW_BORDER_FOCUSED: u32 = 0x00_74B3E9;
-const WINDOW_BORDER: u32 = 0x00_2A3642;
-const WINDOW_SHADOW_OUTER: u32 = 0x00_070C12;
-const WINDOW_SHADOW_MID: u32 = 0x00_0E161F;
-const WINDOW_SHADOW_INNER: u32 = 0x00_18232F;
-
-// Title bar buttons
-const BTN_CLOSE_BASE: u32 = 0x00_C04E45;
-const BTN_CLOSE_HOVER: u32 = 0x00_E2685E;
-const BTN_CLOSE_HILITE: u32 = 0x00_E2877E;
-const BTN_NEUTRAL_BASE: u32 = 0x00_39454F;
-const BTN_NEUTRAL_HOVER: u32 = 0x00_505D6B;
-const BTN_NEUTRAL_HILITE: u32 = 0x00_55626F;
+// Title bar buttons: invisible until hover, close turns red.
+const BTN_HOVER: u32 = 0x00_2C2C2C;
+const BTN_CLOSE_HOVER: u32 = 0x00_C42B1C;
 const BTN_GLYPH: u32 = 0x00_FFFFFF;
-const BTN_GLYPH_SHADOW: u32 = 0x00_1A1A1A;
-const RESIZE_GRIP_COLOR: u32 = 0x00_9AABBB;
+const BTN_GLYPH_DIM: u32 = 0x00_9A9A9A;
+const RESIZE_GRIP_COLOR: u32 = 0x00_4A4A4A;
 
-// Taskbar
-const TASKBAR_BG_TOP: u32 = 0x00_25313E;
-const TASKBAR_BG_BOTTOM: u32 = 0x00_121B24;
-const TASKBAR_TOP_LINE: u32 = 0x00_3E5878;
-const TASKBAR_DIVIDER: u32 = 0x00_33414F;
-const TASKBAR_TEXT: u32 = 0x00_DBE6F0;
-const TASKBAR_TEXT_DIM: u32 = 0x00_9AA8B5;
+// Taskbar: translucent acrylic bar, centered icon group.
+const TASKBAR_BG: u32 = 0x00_1F1F1F;
+const TASKBAR_BG_ALPHA: u32 = 235;
+const TASKBAR_TOP_LINE: u32 = 0x00_2E2E2E;
+const TASKBAR_TEXT: u32 = 0x00_FFFFFF;
+const TASKBAR_TEXT_DIM: u32 = 0x00_8A8A8A;
+const TB_BTN_HOVER: u32 = 0x00_2C2C2C;
+const TB_BTN_ACTIVE: u32 = 0x00_3A3A3A;
+const TB_DIVIDER: u32 = 0x00_2E2E2E;
+const START_BTN_W: u32 = 40;
+const START_BTN_H: u32 = 36;
+const TASKBAR_GAP: i32 = 4;
+// Left-edge padding for the taskbar button group and the start menu.
+const TASKBAR_PAD: i32 = 12;
+// Start-button four-pane logo color (Windows yellow).
+const START_LOGO_COLOR: u32 = 0x00_FFB900;
 
-// Start button
-const START_BUTTON_WIDTH: u32 = 90;
-const START_BTN_TOP: u32 = 0x00_3A6A9C;
-const START_BTN_BOTTOM: u32 = 0x00_21456E;
-const START_BTN_HOVER_TOP: u32 = 0x00_4478AE;
-const START_BTN_HOVER_BOTTOM: u32 = 0x00_295180;
-const START_BTN_EDGE: u32 = 0x00_12253C;
-const START_LOGO_BG: u32 = 0x00_1C3A5E;
-const START_LOGO_GLYPH: u32 = 0x00_8FD0FF;
-
-// Taskbar window buttons
-const TB_BTN_FOCUSED_TOP: u32 = 0x00_3C6EA8;
-const TB_BTN_FOCUSED_BOTTOM: u32 = 0x00_244A78;
-const TB_BTN_TOP: u32 = 0x00_2A3642;
-const TB_BTN_BOTTOM: u32 = 0x00_1C262F;
-const TB_BTN_HOVER_TOP: u32 = 0x00_35424F;
-const TB_BTN_HOVER_BOTTOM: u32 = 0x00_25303A;
-const TB_BTN_MIN_TOP: u32 = 0x00_1B242D;
-const TB_BTN_MIN_BOTTOM: u32 = 0x00_131A22;
-const TB_BTN_EDGE: u32 = 0x00_0E141B;
-const TB_ACCENT: u32 = 0x00_6FB1E8;
-
-// Launcher popup
-const LAUNCHER_BG: u32 = 0x00_1B2530;
-const LAUNCHER_BORDER: u32 = 0x00_74B3E9;
-const LAUNCHER_HEADER_TOP: u32 = 0x00_2C4E7A;
-const LAUNCHER_HEADER_BOTTOM: u32 = 0x00_1D3A5E;
-const LAUNCHER_HEADER_TEXT: u32 = 0x00_FFFFFF;
-const LAUNCHER_ITEM_HOVER_TOP: u32 = 0x00_2D4967;
-const LAUNCHER_ITEM_HOVER_BOTTOM: u32 = 0x00_223B54;
-const LAUNCHER_TEXT: u32 = 0x00_DAE5EE;
-const LAUNCHER_TEXT_DIM: u32 = 0x00_93A2B0;
-const LAUNCHER_ACCENT: u32 = 0x00_6FB1E8;
-const LAUNCHER_WIDTH: u32 = 280;
-const LAUNCHER_HEADER_H: u32 = 18;
-const LAUNCHER_ITEM_HEIGHT: u32 = 30;
-const LAUNCHER_SHADOW: u32 = 0x00_070C12;
-// Where taskbar window buttons begin, past the Start button.
-const WINDOW_BUTTONS_START_X: i32 = 8 + START_BUTTON_WIDTH as i32 + 10;
+// Start-menu popup (Win11 style: search box + pinned tile grid).
+const LAUNCHER_BG: u32 = 0x00_262626;
+const LAUNCHER_BG_ALPHA: u32 = 235;
+const LAUNCHER_BORDER: u32 = 0x00_3F3F3F;
+const LAUNCHER_SEARCH_BG: u32 = 0x00_3A3A3A;
+const LAUNCHER_TEXT: u32 = 0x00_FFFFFF;
+const LAUNCHER_TEXT_DIM: u32 = 0x00_8A8A8A;
+const LAUNCHER_TILE_HOVER: u32 = 0x00_2C2C2C;
+const LAUNCHER_W: u32 = 408;
+const LAUNCHER_COLS: usize = 4;
+const LAUNCHER_TILE_W: u32 = 92;
+const LAUNCHER_TILE_H: u32 = 84;
+const LAUNCHER_ICON: u32 = 56;
+const LAUNCHER_TILES_Y: u32 = 64;
 
 // Console / editor content colors
-const CONSOLE_FG: u32 = 0x00_E0E0E0;
-const CONSOLE_BG: u32 = 0x00_10161C;
+const CONSOLE_FG: u32 = 0x00_E6E6E6;
+const CONSOLE_BG: u32 = 0x00_202020;
 const EDITOR_CURSOR_COLOR: u32 = 0x00_FFCC66;
-const EDITOR_STATUS_BG: u32 = 0x00_1A2430;
+const EDITOR_STATUS_BG: u32 = 0x00_262626;
 const EDITOR_STATUS_FG: u32 = 0x00_8FB8D8;
 
 #[derive(Clone)]
@@ -323,7 +312,12 @@ impl WindowManager {
             kind: AppKind::Calculator(CalculatorApp::new()),
         };
 
-        let mut editor_console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
+        let mut editor_console = Console::new(
+            fit_console_cells(screen_w, screen_h, MAX_EDITOR_COLS, MAX_EDITOR_ROWS).0,
+            fit_console_cells(screen_w, screen_h, MAX_EDITOR_COLS, MAX_EDITOR_ROWS).1,
+            CONSOLE_FG,
+            CONSOLE_BG,
+        );
         let editor_lines = vec![String::new()];
         let mut editor_scroll = 0usize;
         let mut editor_status = String::new();
@@ -360,7 +354,12 @@ impl WindowManager {
             app_id: Some(AppId::Terminal),
             restore_geometry: None,
             kind: AppKind::Terminal {
-                console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
+                console: Console::new(
+                    fit_console_cells(screen_w, screen_h, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS).0,
+                    fit_console_cells(screen_w, screen_h, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS).1,
+                    CONSOLE_FG,
+                    CONSOLE_BG,
+                ),
                 editor: LineEditor::new(),
             },
         };
@@ -486,10 +485,32 @@ impl WindowManager {
 
     fn start_button_hit(&self) -> bool {
         let y = self.screen_h as i32 - TASKBAR_HEIGHT as i32;
-        self.cursor_x >= 8
-            && self.cursor_x < 8 + START_BUTTON_WIDTH as i32
-            && self.cursor_y >= y + 4
-            && self.cursor_y < y + TASKBAR_HEIGHT as i32 - 4
+        let start_x = self.taskbar_layout().0;
+        self.cursor_x >= start_x
+            && self.cursor_x < start_x + START_BTN_W as i32
+            && self.cursor_y >= y + 6
+            && self.cursor_y < y + 6 + START_BTN_H as i32
+    }
+
+    /// The left-aligned taskbar group: returns (start-button x, then one
+    /// (window_index, x, width) per open window). Shared by hit-testing
+    /// and drawing so they can never disagree about button placement.
+    fn taskbar_layout(&self) -> (i32, Vec<(usize, i32, i32)>) {
+        let mut buttons = Vec::new();
+        for (i, window) in self.windows.iter().enumerate() {
+            if !window.open {
+                continue;
+            }
+            let w = taskbar_label_width(window.title);
+            buttons.push((i, 0, w));
+        }
+        let group_x = TASKBAR_PAD;
+        let mut x = group_x + START_BTN_W as i32 + TASKBAR_GAP;
+        for b in &mut buttons {
+            b.1 = x;
+            x += b.2 + TASKBAR_GAP;
+        }
+        (group_x, buttons)
     }
 
     /// The cell grid a maximized window should fill: the whole screen
@@ -497,7 +518,7 @@ impl WindowManager {
     fn max_content_cells(&self) -> (usize, usize) {
         let max_w = self.screen_w;
         let max_h = self.screen_h - TASKBAR_HEIGHT - TITLE_BAR_HEIGHT;
-        ((max_w / font::GLYPH_WIDTH as u32) as usize, (max_h / font::GLYPH_HEIGHT as u32) as usize)
+        ((max_w / font::glyph_w() as u32) as usize, (max_h / font::glyph_h() as u32) as usize)
     }
 
     fn maximize_window(&mut self, index: usize) {
@@ -527,6 +548,50 @@ impl WindowManager {
         }
     }
 
+    /// Applies a display-resolution change requested by the Settings
+    /// app: rescales the virtual framebuffer, re-clamps every window
+    /// onto the new screen, and reloads the wallpaper at the new size.
+    fn apply_resolution(&mut self, w: u32, h: u32) {
+        if !fb::set_virtual_resolution(w, h) {
+            return;
+        }
+        self.screen_w = w;
+        self.screen_h = h;
+        self.wallpaper = None;
+        self.wallpaper = load_wallpaper(w, h);
+        self.cursor_x = self.cursor_x.clamp(0, w as i32 - 1);
+        self.cursor_y = self.cursor_y.clamp(0, h as i32 - 1);
+        let max_x = (w as i32 - 40).max(0);
+        let max_y = (h as i32 - TASKBAR_HEIGHT as i32 - TITLE_BAR_HEIGHT as i32).max(0);
+        let (max_cols, max_rows) = self.max_content_cells();
+        for window in &mut self.windows {
+            if window.open && !window.minimized {
+                window.x = window.x.clamp(0, max_x);
+                window.y = window.y.clamp(0, max_y);
+                if window.maximized {
+                    let (cols, rows) = window.cols_rows();
+                    if cols != max_cols || rows != max_rows {
+                        resize_window(window, max_cols, max_rows);
+                    }
+                }
+            }
+        }
+        self.settings = Settings::load();
+    }
+
+    pub     fn apply_font_scale(&mut self, scale: u8) {
+        font::set_scale(scale);
+        let (w, h) = fb::virtual_dimensions();
+        // Free the old desktop's large buffers before building the
+        // replacement so the heap peak stays flat (the old wallpaper +
+        // back buffers are ~8 MB each at native resolution).
+        self.windows = Vec::new();
+        self.wallpaper = None;
+        self.launcher_items = Vec::new();
+        self.remembered = [None; APP_ID_COUNT];
+        *self = WindowManager::new(w, h);
+    }
+
     /// Records a window's current geometry as "where this app was last
     /// left", so the launcher restores it there next time. No-op for
     /// windows without an `app_id` (e.g. `run`-launched programs, which
@@ -552,10 +617,11 @@ impl WindowManager {
     }
 
     fn launcher_popup_rect(&self) -> (i32, i32, u32, u32) {
-        let items_h = LAUNCHER_ITEM_HEIGHT * self.launcher_items.len().max(1) as u32;
-        let popup_h = LAUNCHER_HEADER_H + items_h + 6;
-        let popup_y = self.screen_h as i32 - TASKBAR_HEIGHT as i32 - popup_h as i32;
-        (8, popup_y, LAUNCHER_WIDTH, popup_h)
+        let rows = (self.launcher_items.len().max(1) + LAUNCHER_COLS - 1) / LAUNCHER_COLS;
+        let popup_h = LAUNCHER_TILES_Y + rows as u32 * LAUNCHER_TILE_H + 10;
+        let popup_y = self.screen_h as i32 - TASKBAR_HEIGHT as i32 - popup_h as i32 - 10;
+        let popup_x = TASKBAR_PAD;
+        (popup_x, popup_y, LAUNCHER_W, popup_h)
     }
 
     fn launcher_hit_test(&self) -> Option<usize> {
@@ -567,16 +633,22 @@ impl WindowManager {
         {
             return None;
         }
-        let rel_y = self.cursor_y - py - LAUNCHER_HEADER_H as i32 - 2;
-        if rel_y < 0 {
-            return None;
+        let base_x = px + 20;
+        let base_y = py + LAUNCHER_TILES_Y as i32;
+        for (i, _) in self.launcher_items.iter().enumerate() {
+            let col = (i % LAUNCHER_COLS) as i32;
+            let row = (i / LAUNCHER_COLS) as i32;
+            let tx = base_x + col * LAUNCHER_TILE_W as i32;
+            let ty = base_y + row * LAUNCHER_TILE_H as i32;
+            if self.cursor_x >= tx
+                && self.cursor_x < tx + LAUNCHER_TILE_W as i32
+                && self.cursor_y >= ty
+                && self.cursor_y < ty + LAUNCHER_TILE_H as i32
+            {
+                return Some(i);
+            }
         }
-        let idx = (rel_y as u32 / LAUNCHER_ITEM_HEIGHT) as usize;
-        if idx < self.launcher_items.len() {
-            Some(idx)
-        } else {
-            None
-        }
+        None
     }
 
     /// Built-in apps first, then any `.elf` file found in `/bin` on the
@@ -609,12 +681,13 @@ impl WindowManager {
     fn run_launcher_action(&mut self, action: LauncherAction) {
         match action {
             LauncherAction::Terminal => {
+                let (cols, rows) = fit_console_cells(self.screen_w, self.screen_h, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS);
                 let idx = self.spawn_window(
                     "Terminal",
                     true,
                     Some(AppId::Terminal),
                     AppKind::Terminal {
-                        console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
+                        console: Console::new(cols, rows, CONSOLE_FG, CONSOLE_BG),
                         editor: LineEditor::new(),
                     },
                 );
@@ -641,7 +714,8 @@ impl WindowManager {
                 );
             }
             LauncherAction::Notepad => {
-                let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
+                let (cols, rows) = fit_console_cells(self.screen_w, self.screen_h, MAX_EDITOR_COLS, MAX_EDITOR_ROWS);
+                let mut console = Console::new(cols, rows, CONSOLE_FG, CONSOLE_BG);
                 let lines = vec![String::new()];
                 let mut scroll = 0usize;
                 let mut status = String::new();
@@ -666,6 +740,8 @@ impl WindowManager {
                     accent_color: self.settings.accent_color.clone(),
                     wallpaper: self.settings.wallpaper,
                     show_bg_tasks: self.settings.show_bg_tasks,
+                    resolution: self.settings.resolution,
+                    font_scale_percent: self.settings.font_scale_percent,
                 };
                 self.spawn_window(
                     "Settings",
@@ -700,12 +776,13 @@ impl WindowManager {
     /// launcher's `/bin` entries and by the file explorer for `.elf`).
     fn launch_elf_in_terminal(&mut self, path: String) {
         let title: &'static str = alloc::boxed::Box::leak(format!("Terminal: {}", path).into_boxed_str());
+        let (cols, rows) = fit_console_cells(self.screen_w, self.screen_h, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS);
         let idx = self.spawn_window(
             title,
             true,
             None,
             AppKind::Terminal {
-                console: Console::new(100, 30, CONSOLE_FG, CONSOLE_BG),
+                console: Console::new(cols, rows, CONSOLE_FG, CONSOLE_BG),
                 editor: LineEditor::new(),
             },
         );
@@ -722,7 +799,8 @@ impl WindowManager {
     /// Spawns a Notepad window preloaded with a text file (used by the
     /// file explorer when opening `.txt`/`.md`/... files).
     fn open_notepad_with(&mut self, path: String, content: &[u8]) {
-        let mut console = Console::new(100, 20, CONSOLE_FG, CONSOLE_BG);
+        let (cols, rows) = fit_console_cells(self.screen_w, self.screen_h, MAX_EDITOR_COLS, MAX_EDITOR_ROWS);
+        let mut console = Console::new(cols, rows, CONSOLE_FG, CONSOLE_BG);
         let mut lines: Vec<String> = core::str::from_utf8(content)
             .unwrap_or("")
             .split('\n')
@@ -768,48 +846,52 @@ impl WindowManager {
         }
     }
 
+    /// Win11-style start menu: acrylic panel centered above the taskbar
+    /// with a search box and a grid of pinned app tiles.
     fn draw_launcher(&self, surface: &mut dyn Surface) {
         let (px, py, pw, ph) = self.launcher_popup_rect();
-        let px = px as u32;
-        let py = py as u32;
+        let (px, py) = (px as u32, py as u32);
 
-        gfx::fill_rect(surface, px + 4, py + 4, pw, ph, LAUNCHER_SHADOW);
-        gfx::fill_rounded_rect(surface, px - 1, py - 1, pw + 2, ph + 2, 7, LAUNCHER_BORDER);
-        gfx::fill_rounded_rect(surface, px, py, pw, ph, 6, LAUNCHER_BG);
-        gfx::fill_rounded_rect_gradient_v(
-            surface,
-            px,
-            py,
-            pw,
-            LAUNCHER_HEADER_H,
-            6,
-            LAUNCHER_HEADER_TOP,
-            LAUNCHER_HEADER_BOTTOM,
-        );
-        gfx::fill_rect(surface, px, py + LAUNCHER_HEADER_H, pw, 1, 0x00_14263C);
-        gfx::draw_string(surface, px + 10, py + 5, "Applications", LAUNCHER_HEADER_TEXT, None);
+        gfx::fill_rounded_rect_blend(surface, px + 6, py + 6, pw, ph, 12, 0x00_000000, 90);
+        gfx::fill_rounded_rect(surface, px - 1, py - 1, pw + 2, ph + 2, 13, LAUNCHER_BORDER);
+        gfx::fill_rounded_rect_blend(surface, px, py, pw, ph, 12, LAUNCHER_BG, LAUNCHER_BG_ALPHA);
 
-        let item_y0 = py + LAUNCHER_HEADER_H + 2;
+        // Search box (decorative for now).
+        let search_h = 28;
+        gfx::fill_rounded_rect(surface, px + 16, py + 12, pw - 32, search_h, 8, LAUNCHER_SEARCH_BG);
+        gfx::draw_string(surface, px + 28, py + 12 + (search_h - font::glyph_h() as u32) / 2, "Search", LAUNCHER_TEXT_DIM, None);
+
+        // "Pinned" header.
+        gfx::draw_string(surface, px + 20, py + 48, "Pinned", LAUNCHER_TEXT_DIM, None);
+
+        // App tiles: colored rounded square + letter, label underneath.
+        let base_x = px + 20;
+        let base_y = py + LAUNCHER_TILES_Y;
         for (i, (label, _)) in self.launcher_items.iter().enumerate() {
-            let iy = item_y0 + i as u32 * LAUNCHER_ITEM_HEIGHT;
-            let hovered = self.cursor_y >= iy as i32
-                && self.cursor_y < (iy + LAUNCHER_ITEM_HEIGHT) as i32
-                && self.cursor_x >= px as i32 + 2
-                && self.cursor_x < px as i32 + pw as i32 - 2;
+            let col = (i % LAUNCHER_COLS) as u32;
+            let row = (i / LAUNCHER_COLS) as u32;
+            let tx = base_x + col * LAUNCHER_TILE_W;
+            let ty = base_y + row * LAUNCHER_TILE_H;
+            let hovered = self.cursor_x >= tx as i32
+                && self.cursor_x < (tx + LAUNCHER_TILE_W) as i32
+                && self.cursor_y >= ty as i32
+                && self.cursor_y < (ty + LAUNCHER_TILE_H) as i32;
             if hovered {
-                gfx::fill_rect(surface, px + 3, iy + 3, 2, LAUNCHER_ITEM_HEIGHT - 6, LAUNCHER_ACCENT);
-                gfx::fill_rect_gradient_v(
-                    surface,
-                    px + 2,
-                    iy,
-                    pw - 4,
-                    LAUNCHER_ITEM_HEIGHT,
-                    LAUNCHER_ITEM_HOVER_TOP,
-                    LAUNCHER_ITEM_HOVER_BOTTOM,
-                );
+                gfx::fill_rounded_rect(surface, tx, ty, LAUNCHER_TILE_W, LAUNCHER_TILE_H, 8, LAUNCHER_TILE_HOVER);
             }
-            let text_color = if hovered { LAUNCHER_TEXT } else { LAUNCHER_TEXT_DIM };
-            gfx::draw_string(surface, px + 12, iy + 11, label, text_color, None);
+            let icon_x = tx + (LAUNCHER_TILE_W - LAUNCHER_ICON) / 2;
+            let icon_y = ty + 6;
+            gfx::fill_rounded_rect(surface, icon_x, icon_y, LAUNCHER_ICON, LAUNCHER_ICON, 12, launcher_icon_color(label));
+            let letter = label.bytes().next().unwrap_or(b'?');
+            let lx = icon_x + (LAUNCHER_ICON - font::glyph_w() as u32) / 2;
+            let ly = icon_y + (LAUNCHER_ICON - font::glyph_h() as u32) / 2;
+            gfx::draw_char(surface, lx, ly, letter, 0x00_FFFFFF, None);
+
+            let label_text = truncate_label(label, 10);
+            let label_w = (label_text.len() as u32 * font::glyph_w() as u32) as u32;
+            let lx = tx + (LAUNCHER_TILE_W - label_w) / 2;
+            let ly = ty + 6 + LAUNCHER_ICON + 6;
+            gfx::draw_string(surface, lx, ly, &label_text, LAUNCHER_TEXT, None);
         }
     }
 
@@ -873,8 +955,8 @@ impl WindowManager {
                 let (wx, wy) = (self.windows[index].x, self.windows[index].y);
                 let local_w = (self.cursor_x - wx).max(0) as u32;
                 let local_h = (self.cursor_y - wy - TITLE_BAR_HEIGHT as i32).max(0) as u32;
-                let cols = ((local_w / font::GLYPH_WIDTH as u32) as usize).max(MIN_COLS);
-                let rows = ((local_h / font::GLYPH_HEIGHT as u32) as usize).max(MIN_ROWS);
+                let cols = ((local_w / font::glyph_w() as u32) as usize).max(MIN_COLS);
+                let rows = ((local_h / font::glyph_h() as u32) as usize).max(MIN_ROWS);
                 if cols != resize.last_cols || rows != resize.last_rows {
                     resize.last_cols = cols;
                     resize.last_rows = rows;
@@ -1027,18 +1109,13 @@ impl WindowManager {
                 self.launcher_open = true;
                 return;
             }
-            let mut x = WINDOW_BUTTONS_START_X;
-            for i in 0..self.windows.len() {
-                if !self.windows[i].open {
-                    continue;
-                }
-                let label_w = taskbar_label_width(self.windows[i].title);
-                if self.cursor_x >= x && self.cursor_x < x + label_w {
+            let (_, buttons) = self.taskbar_layout();
+            for (i, x, w) in buttons {
+                if self.cursor_x >= x && self.cursor_x < x + w {
                     self.windows[i].minimized = false;
                     self.raise(i);
                     return;
                 }
-                x += label_w + 6;
             }
             return;
         }
@@ -1063,8 +1140,8 @@ impl WindowManager {
                 {
                     self.raise(i);
                     let focused_index = self.focused;
-                    let cols = content_w as usize / font::GLYPH_WIDTH;
-                    let rows = content_h as usize / font::GLYPH_HEIGHT;
+                    let cols = content_w as usize / font::glyph_w();
+                    let rows = content_h as usize / font::glyph_h();
                     self.resizing = Some(ResizeState { window_index: focused_index, last_cols: cols, last_rows: rows });
                     return;
                 }
@@ -1077,14 +1154,15 @@ impl WindowManager {
             if in_title {
                 let (minimize_x, maximize_x, close_x) = title_button_positions(wx, content_w, resizable);
 
-                if self.cursor_x >= close_x && self.cursor_x < close_x + CLOSE_BUTTON_SIZE as i32 {
+                let in_button_row = self.cursor_y >= wy + 2 && self.cursor_y < wy + 2 + TITLE_BTN_H as i32;
+                if in_button_row && self.cursor_x >= close_x && self.cursor_x < close_x + TITLE_BTN_W as i32 {
                     self.remember_geometry(i);
                     self.windows[i].open = false;
                     self.refocus_after_hide(i);
                     return;
                 }
                 if let Some(max_x) = maximize_x {
-                    if self.cursor_x >= max_x && self.cursor_x < max_x + MAXIMIZE_BUTTON_SIZE as i32 {
+                    if in_button_row && self.cursor_x >= max_x && self.cursor_x < max_x + TITLE_BTN_W as i32 {
                         self.raise(i);
                         let focused_index = self.focused;
                         if maximized {
@@ -1095,7 +1173,7 @@ impl WindowManager {
                         return;
                     }
                 }
-                if self.cursor_x >= minimize_x && self.cursor_x < minimize_x + MINIMIZE_BUTTON_SIZE as i32 {
+                if in_button_row && self.cursor_x >= minimize_x && self.cursor_x < minimize_x + TITLE_BTN_W as i32 {
                     self.windows[i].minimized = true;
                     self.refocus_after_hide(i);
                     return;
@@ -1126,9 +1204,10 @@ impl WindowManager {
                 let local_x = self.cursor_x - wx;
                 let local_y = self.cursor_y - wy - TITLE_BAR_HEIGHT as i32;
                 self.raise(i);
-                let (action, item) = {
+                let (action, item, settings_change) = {
                     let window = &mut self.windows[self.focused];
-                    match &mut window.kind {
+                    let mut settings_change = SettingsChange::None;
+                    let (action, item) = match &mut window.kind {
                         AppKind::Calculator(app) => {
                             app.handle_click(local_x, local_y);
                             (None, None)
@@ -1140,11 +1219,7 @@ impl WindowManager {
                             (action, item)
                         }
                         AppKind::Settings(app) => {
-                            let changed = app.handle_click(local_x, local_y);
-                            if changed {
-                                // Reload settings from disk after a change.
-                                self.settings = Settings::load();
-                            }
+                            settings_change = app.handle_click(local_x, local_y);
                             (None, None)
                         }
                         AppKind::Paint(app) => {
@@ -1156,7 +1231,8 @@ impl WindowManager {
                             (None, None)
                         }
                         _ => (None, None),
-                    }
+                    };
+                    (action, item, settings_change)
                 };
                 if let Some(action) = action {
                     self.press_state = None;
@@ -1170,6 +1246,12 @@ impl WindowManager {
                     });
                 } else {
                     self.press_state = None;
+                }
+                match settings_change {
+                    SettingsChange::None => {}
+                    SettingsChange::Reload => self.settings = Settings::load(),
+                    SettingsChange::Resolution(w, h) => self.apply_resolution(w, h),
+                    SettingsChange::FontScale(scale) => self.apply_font_scale(scale),
                 }
                 return;
             }
@@ -1228,56 +1310,62 @@ impl WindowManager {
         fb::present();
     }
 
+    /// Win11-style taskbar: a translucent acrylic bar with a centered
+    /// group of rounded buttons, the start button at the front of the
+    /// group, and the clock in a tray on the right.
     fn draw_taskbar(&self, surface: &mut dyn Surface) {
         let y = self.screen_h - TASKBAR_HEIGHT;
-        gfx::fill_rect_gradient_v(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, TASKBAR_BG_TOP, TASKBAR_BG_BOTTOM);
+        gfx::fill_rect_blend(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, TASKBAR_BG, TASKBAR_BG_ALPHA);
         gfx::fill_rect(surface, 0, y, self.screen_w, 1, TASKBAR_TOP_LINE);
 
-        // Start button: gradient pill with a small logo tile.
-        let start_hovered = self.start_button_hit();
-        let (start_top, start_bottom) = if start_hovered || self.launcher_open {
-            (START_BTN_HOVER_TOP, START_BTN_HOVER_BOTTOM)
-        } else {
-            (START_BTN_TOP, START_BTN_BOTTOM)
-        };
-        gfx::fill_rounded_rect_gradient_v(surface, 8, y + 3, START_BUTTON_WIDTH, TASKBAR_HEIGHT - 6, 5, start_top, start_bottom);
-        gfx::fill_rect(surface, 9, y + TASKBAR_HEIGHT - 4, START_BUTTON_WIDTH - 2, 1, START_BTN_EDGE);
-        gfx::fill_rounded_rect(surface, 8 + 5, y + 7, 16, 16, 3, START_LOGO_BG);
-        gfx::draw_string(surface, 8 + 9, y + 11, "M", START_LOGO_GLYPH, None);
-        gfx::draw_string(surface, 8 + 27, y + 11, "Apps", 0x00_FFFFFF, None);
+        let accent = self.settings.accent_color_rgb();
+        let (start_x, buttons) = self.taskbar_layout();
+        let start_hovered = self.start_button_hit() || self.launcher_open;
 
-        let btn_h = TASKBAR_HEIGHT - 6;
-        let mut x = WINDOW_BUTTONS_START_X as u32;
-        for (i, window) in self.windows.iter().enumerate() {
-            if !window.open {
-                continue;
-            }
-            let label_w = taskbar_label_width(window.title) as u32;
+        // Start button: Win11 four-pane logo in a hover pill.
+        if start_hovered {
+            gfx::fill_rounded_rect(surface, start_x as u32, y + 6, START_BTN_W, START_BTN_H, 8, TB_BTN_HOVER);
+        }
+        let pane = 4 + font::scale() as u32 * 2;
+        let logo = 2 * pane + 2;
+        let lx = start_x as u32 + (START_BTN_W - logo) / 2;
+        let ly = y + 6 + (START_BTN_H - logo) / 2;
+        gfx::fill_rounded_rect(surface, lx, ly, pane, pane, 2, START_LOGO_COLOR);
+        gfx::fill_rounded_rect(surface, lx + pane + 2, ly, pane, pane, 2, START_LOGO_COLOR);
+        gfx::fill_rounded_rect(surface, lx, ly + pane + 2, pane, pane, 2, START_LOGO_COLOR);
+        gfx::fill_rounded_rect(surface, lx + pane + 2, ly + pane + 2, pane, pane, 2, START_LOGO_COLOR);
+
+        // Centered app buttons: icon tile + label.
+        for (i, x, w) in buttons {
+            let window = &self.windows[i];
             let focused = i == self.focused;
-            let hovered = self.cursor_x >= x as i32
-                && self.cursor_x < (x + label_w) as i32
-                && self.cursor_y >= y as i32 + 3
-                && self.cursor_y < y as i32 + TASKBAR_HEIGHT as i32 - 3;
-            let (top, bottom) = if focused {
-                (TB_BTN_FOCUSED_TOP, TB_BTN_FOCUSED_BOTTOM)
-            } else if window.minimized {
-                (TB_BTN_MIN_TOP, TB_BTN_MIN_BOTTOM)
+            let hovered = self.cursor_x >= x
+                && self.cursor_x < x + w
+                && self.cursor_y >= y as i32 + 6
+                && self.cursor_y < y as i32 + 6 + START_BTN_H as i32;
+            let (bx, bw) = (x as u32, w as u32);
+            let bg = if focused {
+                TB_BTN_ACTIVE
             } else if hovered {
-                (TB_BTN_HOVER_TOP, TB_BTN_HOVER_BOTTOM)
+                TB_BTN_HOVER
             } else {
-                (TB_BTN_TOP, TB_BTN_BOTTOM)
+                TASKBAR_BG
             };
-            gfx::fill_rounded_rect_gradient_v(surface, x, y + 3, label_w, btn_h, BUTTON_RADIUS, top, bottom);
-            gfx::fill_rect(surface, x + 1, y + 3 + btn_h - 1, label_w - 2, 1, TB_BTN_EDGE);
-            if focused {
-                // Small accent pill on the top edge marks the active window.
-                gfx::fill_rounded_rect(surface, x + 3, y + 2, label_w - 6, 3, 2, TB_ACCENT);
-            }
+            gfx::fill_rounded_rect(surface, bx, y + 6, bw, START_BTN_H, 6, bg);
+            let icon = icon_size(16);
+            let ix = bx + 8;
+            let iy = y + 6 + (START_BTN_H - icon) / 2;
+            draw_app_icon(surface, ix, iy, icon, &window.kind, window.title);
             let text_color = if window.minimized { TASKBAR_TEXT_DIM } else { TASKBAR_TEXT };
-            gfx::draw_string(surface, x + 6, y + 11, window.title, text_color, None);
-            x += label_w + 6;
+            let ty = y + 6 + (START_BTN_H - font::glyph_h() as u32) / 2;
+            gfx::draw_string(surface, bx + 8 + icon + 6, ty, window.title, text_color, None);
+            if focused {
+                // Active indicator pill under the icon.
+                gfx::fill_rounded_rect(surface, ix, y + 42, icon, 3, 2, accent);
+            }
         }
 
+        // System tray: clock on the right, optional bg-task counters.
         let ticks = interrupts::ticks();
         let secs = ticks / 100;
         let now = crate::rtc::now();
@@ -1288,9 +1376,9 @@ impl WindowManager {
             secs / 60,
             secs % 60
         );
-        let clock_w = (clock.len() * font::GLYPH_WIDTH) as u32;
+        let clock_w = (clock.len() * font::glyph_w()) as u32;
         let clock_x = self.screen_w - clock_w - 12;
-        gfx::draw_string(surface, clock_x, y + 11, &clock, TASKBAR_TEXT, None);
+        gfx::draw_string(surface, clock_x, y + (TASKBAR_HEIGHT - font::glyph_h() as u32) / 2, &clock, TASKBAR_TEXT, None);
 
         // Background counter tasks keep running (preemptively, via the
         // scheduler in task.rs) whether or not anyone is looking at the
@@ -1301,10 +1389,10 @@ impl WindowManager {
                 .map(|c| c.load(core::sync::atomic::Ordering::Relaxed))
                 .collect::<Vec<_>>();
             let bg = format!("bg: {} {} {}", counters[0], counters[1], counters[2]);
-            let bg_w = (bg.len() * font::GLYPH_WIDTH) as u32;
+            let bg_w = (bg.len() * font::glyph_w()) as u32;
             let bg_x = clock_x - bg_w - 16;
-            gfx::draw_string(surface, bg_x, y + 11, &bg, 0x00_86C77B, None);
-            gfx::fill_rect(surface, bg_x - 9, y + 4, 1, TASKBAR_HEIGHT - 8, TASKBAR_DIVIDER);
+            gfx::draw_string(surface, bg_x, y + (TASKBAR_HEIGHT - font::glyph_h() as u32) / 2, &bg, 0x00_86C77B, None);
+            gfx::fill_rect(surface, bg_x - 9, y + 6, 1, TASKBAR_HEIGHT - 12, TB_DIVIDER);
         }
     }
 }
@@ -1463,19 +1551,82 @@ fn editor_render(
     for line in lines.iter().skip(*scroll_offset).take(doc_rows) {
         let _ = writeln!(console, "{}", line);
     }
-    let sx = font::GLYPH_WIDTH as u32;
-    let sy = (doc_rows * font::GLYPH_HEIGHT) as u32;
+    let sx = font::glyph_w() as u32;
+    let sy = (doc_rows * font::glyph_h()) as u32;
     let cw = console.width_px();
-    gfx::fill_rect(console, 0, sy, cw, font::GLYPH_HEIGHT as u32, EDITOR_STATUS_BG);
+    gfx::fill_rect(console, 0, sy, cw, font::glyph_h() as u32, EDITOR_STATUS_BG);
     gfx::draw_string(console, sx, sy, status, EDITOR_STATUS_FG, None);
     let visible = (cursor_row.saturating_sub(*scroll_offset)).min(doc_rows.saturating_sub(1));
-    let cx = (cursor_col * font::GLYPH_WIDTH) as u32;
-    let cy = (visible * font::GLYPH_HEIGHT) as u32;
-    gfx::fill_rect(console, cx, cy, font::GLYPH_WIDTH as u32, font::GLYPH_HEIGHT as u32, EDITOR_CURSOR_COLOR);
+    let cx = (cursor_col * font::glyph_w()) as u32;
+    let cy = (visible * font::glyph_h()) as u32;
+    gfx::fill_rect(console, cx, cy, font::glyph_w() as u32, font::glyph_h() as u32, EDITOR_CURSOR_COLOR);
 }
 
 fn taskbar_label_width(title: &str) -> i32 {
-    (title.len() * font::GLYPH_WIDTH + 12) as i32
+    (icon_size(16) + 6 + title.len() as u32 * font::glyph_w() as u32 + 20) as i32
+}
+
+/// An app-tile size that grows a little with the font scale.
+fn icon_size(base: u32) -> u32 {
+    base + (font::scale() as u32 - 1) * 8
+}
+
+/// Win11-ish color per built-in app (used for title-bar and taskbar
+/// tiles); `run`-launched programs get a neutral gray.
+fn app_icon_color(kind: &AppKind) -> u32 {
+    match kind {
+        AppKind::Terminal { .. } => 0x00_2D7D46,
+        AppKind::Calculator(_) => 0x00_4A6EE0,
+        AppKind::FileExplorer(_) => 0x00_E8A33D,
+        AppKind::Editor { .. } => 0x00_0078D4,
+        AppKind::Paint(_) => 0x00_C5423B,
+        AppKind::ImageViewer(_) => 0x00_7B5CD6,
+        AppKind::SysInfo { .. } => 0x00_3E5C76,
+        AppKind::Settings(_) => 0x00_5C6BC0,
+    }
+}
+
+fn launcher_icon_color(label: &str) -> u32 {
+    if label.starts_with("Terminal") {
+        0x00_2D7D46
+    } else if label.starts_with("Calculator") {
+        0x00_4A6EE0
+    } else if label.starts_with("File Explorer") {
+        0x00_E8A33D
+    } else if label.starts_with("Notepad") {
+        0x00_0078D4
+    } else if label.starts_with("Paint") {
+        0x00_C5423B
+    } else if label.starts_with("Image Viewer") {
+        0x00_7B5CD6
+    } else if label.starts_with("System Info") {
+        0x00_3E5C76
+    } else if label.starts_with("Settings") {
+        0x00_5C6BC0
+    } else {
+        0x00_4A4A4A
+    }
+}
+
+/// A rounded colored tile with the app's first letter inside, the
+/// Win11 "pinned app" look for our text-only renderer.
+fn draw_app_icon(surface: &mut dyn Surface, x: u32, y: u32, size: u32, kind: &AppKind, title: &str) {
+    let color = app_icon_color(kind);
+    gfx::fill_rounded_rect(surface, x, y, size, size, size / 4, color);
+    let letter = title.bytes().next().unwrap_or(b'?');
+    let lx = x + (size - font::glyph_w() as u32) / 2;
+    let ly = y + (size - font::glyph_h() as u32) / 2;
+    gfx::draw_char(surface, lx, ly, letter, 0x00_FFFFFF, None);
+}
+
+fn truncate_label(label: &str, max_chars: usize) -> String {
+    if label.chars().count() > max_chars {
+        let mut shortened: String = label.chars().take(max_chars - 1).collect();
+        shortened.push_str("..");
+        shortened
+    } else {
+        label.to_string()
+    }
 }
 
 /// (minimize_x, maximize_x, close_x) in screen coordinates. `maximize_x`
@@ -1483,9 +1634,13 @@ fn taskbar_label_width(title: &str) -> i32 {
 /// button at all — shared between hit-testing and drawing so they can
 /// never disagree about where the buttons are.
 fn title_button_positions(wx: i32, content_w: u32, resizable: bool) -> (i32, Option<i32>, i32) {
-    let close_x = wx + content_w as i32 - CLOSE_BUTTON_SIZE as i32 - 3;
-    let maximize_x = if resizable { Some(close_x - MAXIMIZE_BUTTON_SIZE as i32 - 6) } else { None };
-    let minimize_x = maximize_x.unwrap_or(close_x) - MINIMIZE_BUTTON_SIZE as i32 - 6;
+    let close_x = wx + content_w as i32 - TITLE_BTN_W as i32 - TITLE_BTN_MARGIN_RIGHT as i32;
+    let maximize_x = if resizable {
+        Some(close_x - TITLE_BTN_W as i32 - TITLE_BTN_GAP as i32)
+    } else {
+        None
+    };
+    let minimize_x = maximize_x.unwrap_or(close_x) - TITLE_BTN_W as i32 - TITLE_BTN_GAP as i32;
     (minimize_x, maximize_x, close_x)
 }
 
@@ -1517,51 +1672,45 @@ fn draw_diagonal(surface: &mut dyn Surface, x0: u32, y0: u32, x1: u32, y1: u32, 
     }
 }
 
-/// Close glyph: a thick X filling an `s`x`s` box at (x, y).
+/// Close glyph: a 45-degree X in the center of a title button.
 fn draw_close_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
-    for i in 0..s {
-        surface.put_pixel(x + i, y + i, color);
-        surface.put_pixel(x + i + 1, y + i, color);
-        surface.put_pixel(x + s - 1 - i, y + i, color);
-        if i + 2 <= s {
-            surface.put_pixel(x + s - 2 - i, y + i, color);
-        }
-    }
+    draw_diagonal(surface, x, y, x + s - 1, y + s - 1, color);
+    draw_diagonal(surface, x + s - 1, y, x, y + s - 1, color);
 }
 
-/// Minimize glyph: a thick bottom bar.
+/// Minimize glyph: a short horizontal bar.
 fn draw_minimize_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
-    gfx::fill_rect(surface, x, y + s - 2, s, 2, color);
+    gfx::fill_rect(surface, x, y + s - 1, s, 2, color);
 }
 
 /// Maximize glyph: a square outline with a thick top edge.
 fn draw_maximize_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
     gfx::fill_rect(surface, x, y, s, 2, color);
-    gfx::fill_rect(surface, x, y, 1, s, color);
-    gfx::fill_rect(surface, x + s - 1, y, 1, s, color);
-    gfx::fill_rect(surface, x, y + s - 1, s, 1, color);
+    gfx::fill_rect(surface, x, y, 2, s, color);
+    gfx::fill_rect(surface, x + s - 2, y, 2, s, color);
+    gfx::fill_rect(surface, x, y + s - 2, s, 2, color);
 }
 
 /// Restore glyph (shown on a maximized window's maximize button): a
 /// small square behind a slightly larger one, offset to the bottom-right.
 fn draw_restore_icon(surface: &mut dyn Surface, x: u32, y: u32, s: u32, color: u32) {
-    gfx::fill_rect(surface, x, y, s - 1, 2, color);
-    gfx::fill_rect(surface, x, y, 1, s - 1, color);
-    let (ox, oy) = (x + 2, y + 2);
-    let os = s - 2;
-    gfx::fill_rect(surface, ox, oy, os, 2, color);
-    gfx::fill_rect(surface, ox, oy, 1, os, color);
-    gfx::fill_rect(surface, ox + os - 1, oy, 1, os, color);
-    gfx::fill_rect(surface, ox, oy + os - 1, os, 1, color);
+    gfx::fill_rect(surface, x + 3, y, s, 2, color);
+    gfx::fill_rect(surface, x + 3, y, 2, s, color);
+    gfx::fill_rect(surface, x + 3, y + s - 2, s, 2, color);
+    let (ox, oy) = (x, y + 3);
+    gfx::fill_rect(surface, ox, oy, s - 3, 2, color);
+    gfx::fill_rect(surface, ox, oy, 2, s - 3, color);
+    gfx::fill_rect(surface, ox + s - 3 - 2, oy, 2, s - 3, color);
+    gfx::fill_rect(surface, ox, oy + s - 3 - 2, s - 3, 2, color);
 }
 
-/// One rounded title-bar button: gradient-free flat base with a 1px
-/// inner top highlight, brightening on hover. The glyph is drawn by the
-/// caller afterwards.
-fn draw_title_button(surface: &mut dyn Surface, x: u32, y: u32, hovered: bool, base: u32, hover: u32, hilite: u32) {
-    let color = if hovered { hover } else { base };
-    gfx::fill_rounded_rect(surface, x, y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, BUTTON_RADIUS, color);
-    gfx::fill_rect(surface, x + 1, y + 1, CLOSE_BUTTON_SIZE - 2, 1, hilite);
+/// One title-bar button: a flat hover pill (red for close) behind the
+/// glyph, drawn by the caller afterwards.
+fn draw_title_button(surface: &mut dyn Surface, x: u32, y: u32, hovered: bool, close: bool) {
+    if hovered {
+        let bg = if close { BTN_CLOSE_HOVER } else { BTN_HOVER };
+        gfx::fill_rounded_rect(surface, x, y, TITLE_BTN_W, TITLE_BTN_H, 4, bg);
+    }
 }
 
 fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool, cursor_x: i32, cursor_y: i32) {
@@ -1570,71 +1719,64 @@ fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool, cursor
     let y = window.y as u32;
     let total_h = TITLE_BAR_HEIGHT + content_h;
 
-    // Soft drop shadow: three nested offsets, darkest furthest away.
-    gfx::fill_rect(surface, x + 6, y + 6, content_w, total_h, WINDOW_SHADOW_OUTER);
-    gfx::fill_rect(surface, x + 4, y + 4, content_w, total_h, WINDOW_SHADOW_MID);
-    gfx::fill_rect(surface, x + 2, y + 2, content_w, total_h, WINDOW_SHADOW_INNER);
-    let border_color = if focused { WINDOW_BORDER_FOCUSED } else { WINDOW_BORDER };
-    let bx = x.saturating_sub(1);
-    let by = y.saturating_sub(1);
-    gfx::fill_rect(surface, bx, by, content_w + 2, total_h + 2, border_color);
-
-    // Title bar: gradient, bright top edge when focused, text with a
-    // soft drop shadow, dark underline separating it from the content.
-    let (title_top, title_bottom) = if focused {
-        (TITLE_FOCUSED_TOP, TITLE_FOCUSED_BOTTOM)
+    if window.maximized {
+        // Maximized windows bleed edge to edge: no shadow, no rounding.
+        gfx::fill_rect(surface, x, y, content_w, total_h, WIN_BG);
     } else {
-        (TITLE_UNFOCUSED_TOP, TITLE_UNFOCUSED_BOTTOM)
-    };
-    gfx::fill_rect_gradient_v(surface, x, y, content_w, TITLE_BAR_HEIGHT, title_top, title_bottom);
-    if focused {
-        gfx::fill_rect(surface, x, y, content_w, 1, TITLE_HILITE);
+        // Soft drop shadow (three nested offsets, darkest furthest out).
+        gfx::fill_rounded_rect_blend(surface, x + 7, y + 7, content_w + 2, total_h + 2, WINDOW_RADIUS + 2, 0x00_000000, 70);
+        gfx::fill_rounded_rect_blend(surface, x + 5, y + 5, content_w + 2, total_h + 2, WINDOW_RADIUS + 1, 0x00_000000, 50);
+        gfx::fill_rounded_rect_blend(surface, x + 3, y + 3, content_w + 2, total_h + 2, WINDOW_RADIUS, 0x00_000000, 30);
+        let border_color = if focused { WIN_BORDER_FOCUSED } else { WIN_BORDER };
+        gfx::fill_rounded_rect(surface, x - 1, y - 1, content_w + 2, total_h + 2, WINDOW_RADIUS + 1, border_color);
+        gfx::fill_rounded_rect(surface, x, y, content_w, total_h, WINDOW_RADIUS, WIN_BG);
     }
+
+    // Title bar: flat, same surface as the window body, with a thin
+    // divider above the content and an app tile + title on the left.
     let title_color = if focused { TITLE_TEXT } else { TITLE_TEXT_UNFOCUSED };
-    let ty = y + (TITLE_BAR_HEIGHT - font::GLYPH_HEIGHT as u32) / 2;
-    gfx::draw_string(surface, x + 5, ty + 1, window.title, TITLE_TEXT_SHADOW, None);
-    gfx::draw_string(surface, x + 5, ty, window.title, title_color, None);
-    gfx::fill_rect(surface, x, y + TITLE_BAR_HEIGHT - 1, content_w, 1, TITLE_UNDERLINE);
+    let ty = y + (TITLE_BAR_HEIGHT - font::glyph_h() as u32) / 2;
+    let icon = icon_size(16);
+    draw_app_icon(surface, x + 8, y + (TITLE_BAR_HEIGHT - icon) / 2, icon, &window.kind, window.title);
+    let title_x = x + 8 + icon + 6;
+    gfx::draw_string(surface, title_x, ty, window.title, title_color, None);
+    gfx::fill_rect(surface, x, y + TITLE_BAR_HEIGHT - 1, content_w, 1, TITLE_DIVIDER);
 
     let (minimize_x, maximize_x, close_x) = title_button_positions(window.x, content_w, window.resizable);
+    let button_y = y + 2;
 
-    // Buttons: hover state tracks the cursor so they brighten on mouseover.
-    let in_button_row = cursor_y >= y as i32 + 3 && cursor_y < y as i32 + 3 + CLOSE_BUTTON_SIZE as i32;
-    let hover_min = in_button_row && cursor_x >= minimize_x && cursor_x < minimize_x + MINIMIZE_BUTTON_SIZE as i32;
-    let hover_close = in_button_row && cursor_x >= close_x && cursor_x < close_x + CLOSE_BUTTON_SIZE as i32;
+    // Hover states track the cursor so the buttons light up on mouseover.
+    let in_button_row = cursor_y >= button_y as i32 && cursor_y < (button_y + TITLE_BTN_H) as i32;
+    let hover_min = in_button_row && cursor_x >= minimize_x && cursor_x < minimize_x + TITLE_BTN_W as i32;
+    let hover_close = in_button_row && cursor_x >= close_x && cursor_x < close_x + TITLE_BTN_W as i32;
+    let glyph_color = if focused { BTN_GLYPH } else { BTN_GLYPH_DIM };
 
     let minimize_x = minimize_x as u32;
-    draw_title_button(surface, minimize_x, y + 3, hover_min, BTN_NEUTRAL_BASE, BTN_NEUTRAL_HOVER, BTN_NEUTRAL_HILITE);
-    draw_minimize_icon(surface, minimize_x + 4, y + 6, 8, BTN_GLYPH_SHADOW);
-    draw_minimize_icon(surface, minimize_x + 4, y + 5, 8, BTN_GLYPH);
+    draw_title_button(surface, minimize_x, button_y, hover_min, false);
+    draw_minimize_icon(surface, minimize_x + 12, button_y + 8, 16, glyph_color);
 
     if let Some(max_x) = maximize_x {
         let max_x = max_x as u32;
-        let hover_max = in_button_row && cursor_x >= max_x as i32 && cursor_x < max_x as i32 + MAXIMIZE_BUTTON_SIZE as i32;
-        draw_title_button(surface, max_x, y + 3, hover_max, BTN_NEUTRAL_BASE, BTN_NEUTRAL_HOVER, BTN_NEUTRAL_HILITE);
-        let icon_x = max_x + 4;
+        let hover_max = in_button_row && cursor_x >= max_x as i32 && cursor_x < max_x as i32 + TITLE_BTN_W as i32;
+        draw_title_button(surface, max_x, button_y, hover_max, false);
+        let icon_x = max_x + 14;
         if window.maximized {
-            draw_restore_icon(surface, icon_x, y + 7, 8, BTN_GLYPH_SHADOW);
-            draw_restore_icon(surface, icon_x, y + 6, 8, BTN_GLYPH);
+            draw_restore_icon(surface, icon_x, button_y + 8, 12, glyph_color);
         } else {
-            draw_maximize_icon(surface, icon_x, y + 7, 8, BTN_GLYPH_SHADOW);
-            draw_maximize_icon(surface, icon_x, y + 6, 8, BTN_GLYPH);
+            draw_maximize_icon(surface, icon_x, button_y + 8, 12, glyph_color);
         }
     }
 
     let close_x = close_x as u32;
-    draw_title_button(surface, close_x, y + 3, hover_close, BTN_CLOSE_BASE, BTN_CLOSE_HOVER, BTN_CLOSE_HILITE);
-    draw_close_icon(surface, close_x + 4, y + 7, 8, BTN_GLYPH_SHADOW);
-    draw_close_icon(surface, close_x + 4, y + 6, 8, BTN_GLYPH);
+    draw_title_button(surface, close_x, button_y, hover_close, true);
+    draw_close_icon(surface, close_x + 14, button_y + 9, 12, glyph_color);
 
-    gfx::blit(surface, x, y + TITLE_BAR_HEIGHT, window.content_pixels(), content_w, content_h);
+    gfx::blit_rounded(surface, x, y + TITLE_BAR_HEIGHT, window.content_pixels(), content_w, content_h, WINDOW_RADIUS);
 
     if window.resizable && !window.maximized {
         let grip_x = x + content_w - RESIZE_GRIP_SIZE;
         let grip_y = y + TITLE_BAR_HEIGHT + content_h - RESIZE_GRIP_SIZE;
-        // A clearly visible resize handle: a shaded block with diagonal
-        // stripe lines, so it reads as "grab this corner to resize".
-        gfx::fill_rect(surface, grip_x, grip_y, RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE, 0x00_141B23);
+        gfx::fill_rounded_rect(surface, grip_x, grip_y, RESIZE_GRIP_SIZE, RESIZE_GRIP_SIZE, 3, 0x00_141414);
         draw_diagonal(surface, grip_x, grip_y + 11, grip_x + 11, grip_y, RESIZE_GRIP_COLOR);
         draw_diagonal(surface, grip_x + 2, grip_y + 11, grip_x + 11, grip_y + 2, RESIZE_GRIP_COLOR);
         draw_diagonal(surface, grip_x, grip_y + 9, grip_x + 9, grip_y, RESIZE_GRIP_COLOR);
@@ -1693,7 +1835,7 @@ fn draw_file_drag_tag(surface: &mut dyn Surface, cursor_x: i32, cursor_y: i32, p
     } else {
         name.to_string()
     };
-    let tag_w = (label.len() as u32 * font::GLYPH_WIDTH as u32 + 30).min(260);
+    let tag_w = (label.len() as u32 * font::glyph_w() as u32 + 30).min(260);
     let tag_h = 20u32;
     let x = (cursor_x + 14).max(0) as u32;
     let y = (cursor_y + 16).max(0) as u32;
@@ -1719,21 +1861,50 @@ fn paint_cursor_shape(surface: &mut dyn Surface, x: i32, y: i32, color: u32) {
     }
 }
 
-/// Loads `/system/wallpaper.raw` (see `tools/gen_wallpaper.py`): `width*height`
-/// little-endian u32 pixels, row-major, no header. Returns `None` on any
-/// mismatch (no volume mounted, file missing, wrong size for the current
-/// mode) so the caller can fall back to the plain gradient background
-/// instead of showing a corrupted image.
+/// Loads `/system/wallpaper.raw` (see `tools/gen_wallpaper.py`):
+/// `width*height` little-endian u32 pixels, row-major, no header. The
+/// file is generated at the physical resolution, so if the virtual
+/// resolution differs it is scaled down to fit (bilinear, fixed-point,
+/// without materializing a full-size intermediate copy). Returns `None`
+/// on any mismatch (no volume mounted, file missing, wrong size) so the
+/// caller can fall back to the plain gradient background instead of
+/// showing a corrupted image.
 fn load_wallpaper(screen_w: u32, screen_h: u32) -> Option<Vec<u32>> {
     if !fat::mounted() {
         return None;
     }
     let bytes = fat::read_file("/system/wallpaper.raw").ok()?;
-    let expected_len = screen_w as usize * screen_h as usize * 4;
-    if bytes.len() != expected_len {
-        return None;
+    let virt_len = (screen_w as usize * screen_h as usize) * 4;
+    if bytes.len() == virt_len {
+        return Some(raw_bytes_to_pixels(bytes));
     }
-    Some(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    let (phys_w, phys_h) = fb::dimensions();
+    let phys_len = (phys_w as usize * phys_h as usize) * 4;
+    if bytes.len() == phys_len {
+        return Some(gfx::scale_bytes(&bytes, phys_w, phys_h, screen_w, screen_h));
+    }
+    None
+}
+
+/// Reinterprets a freshly-read little-endian `0x00RRGGBB` `.raw` file
+/// buffer as pixels **without copying**, halving the transient heap need
+/// when the desktop reloads its wallpaper (a second full-size buffer is
+/// what previously exhausted the heap under fragmentation). Safe because
+/// `fat::read_file` allocates exactly `size` bytes and the allocator
+/// hands out 16-byte-aligned buffers (u32 needs 4). Falls back to a
+/// per-pixel copy if the capacity ever differs from the length.
+fn raw_bytes_to_pixels(bytes: Vec<u8>) -> Vec<u32> {
+    let len = bytes.len() / 4;
+    if len * 4 == bytes.len() && bytes.capacity() == bytes.len() {
+        let ptr = bytes.as_ptr() as *mut u32;
+        core::mem::forget(bytes);
+        unsafe { Vec::from_raw_parts(ptr, len, len) }
+    } else {
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
 }
 
 /// Integer square root (Newton's method), used to guess square dimensions
@@ -1774,7 +1945,7 @@ fn build_sysinfo_console() -> Console {
         crate::allocator::allocated_bytes() / 1024,
         crate::allocator::total_bytes() / 1024
     );
-    let (fb_w, fb_h) = fb::dimensions();
+    let (fb_w, fb_h) = fb::virtual_dimensions();
     let _ = writeln!(console, "display: {}x{}x32", fb_w, fb_h);
 
     console
