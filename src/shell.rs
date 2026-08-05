@@ -983,6 +983,31 @@ pub fn selftest() -> ! {
         );
     }
 
+    // FAT integrity: the dirty marker must exist (the mount sets it and
+    // only a clean shutdown removes it), and the FSINFO repair path has
+    // to restore a corrupted free count from the scanned FAT.
+    if fat::exists("/system/dirty") {
+        println!("[OK] FAT dirty-shutdown marker present");
+    } else {
+        selftest_fail("FAT dirty marker missing after mount");
+    }
+    match fat::fsinfo_free() {
+        Some(on_disk) => {
+            fat::debug_corrupt_fsinfo();
+            let repairs = fat::check_integrity();
+            match (fat::fsinfo_free(), fat::info()) {
+                (Some(after), Some(info)) if after == info.free_clusters && repairs == 1 => {
+                    println!(
+                        "[OK] FAT FSINFO repaired ({} -> {} free clusters)",
+                        on_disk, after
+                    );
+                }
+                _ => selftest_fail("FAT FSINFO repair did not restore the free count"),
+            }
+        }
+        None => selftest_fail("FAT FSINFO sector missing"),
+    }
+
     // Trash: a file moved to the trash is gone from its original
     // location, still readable from the trash, and can be restored to
     // its exact original path (then emptied). The FAT test above

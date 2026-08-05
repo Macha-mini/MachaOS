@@ -21,6 +21,7 @@ use crate::settings::Settings;
 /// Never returns.
 pub fn shutdown(settings: &Settings) -> ! {
     let _ = settings.save();
+    let _ = crate::fat::remove("/system/dirty"); // clean shutdown marker
     unsafe { port::outb(0xF4, 0) }; // QEMU isa-debug-exit
     crate::interrupts::halt_forever()
 }
@@ -28,6 +29,7 @@ pub fn shutdown(settings: &Settings) -> ! {
 /// Saves settings and reboots the machine (8042 reset). Never returns.
 pub fn reboot(settings: &Settings) -> ! {
     let _ = settings.save();
+    let _ = crate::fat::remove("/system/dirty"); // clean shutdown marker
     unsafe { port::outb(0x64, 0xFE) }; // 8042 reset
     crate::interrupts::halt_forever()
 }

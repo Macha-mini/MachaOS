@@ -288,6 +288,130 @@ impl Fat32 {
         self.free_clusters = free;
     }
 
+    // ---- integrity ----------------------------------------------------------
+
+    /// Highest valid cluster number (the FAT holds one entry per
+    /// cluster plus the reserved entries 0 and 1).
+    fn max_cluster(&self) -> u32 {
+        self.fat.len() as u32 - 1
+    }
+
+    /// Reads the FSINFO sector (always the second sector of the
+    /// reserved region, LBA 1) as (free_count, next_free), or None if
+    /// the signatures are wrong.
+    fn read_fsinfo(&self) -> Option<(u32, u32)> {
+        let mut sector = [0u8; 512];
+        self.device
+            .read_sectors(1, 1, &mut sector)
+            .ok()?;
+        let lead = u32::from_le_bytes(sector[0..4].try_into().ok()?);
+        let sig = u32::from_le_bytes(sector[0x1E4..0x1E8].try_into().ok()?);
+        if lead != 0x4161_5252 || sig != 0x6141_7272 {
+            return None;
+        }
+        Some((
+            u32::from_le_bytes(sector[0x1E8..0x1EC].try_into().ok()?),
+            u32::from_le_bytes(sector[0x1EC..0x1F0].try_into().ok()?),
+        ))
+    }
+
+    /// Rewrites the FSINFO free-cluster count and next-free hint.
+    fn write_fsinfo(&mut self, free: u32) {
+        let mut sector = [0u8; 512];
+        if self.device.read_sectors(1, 1, &mut sector).is_err() {
+            return;
+        }
+        sector[0x1E8..0x1EC].copy_from_slice(&free.to_le_bytes());
+        sector[0x1EC..0x1F0].copy_from_slice(&2u32.to_le_bytes());
+        let _ = self.device.write_sectors(1, 1, &sector);
+    }
+
+    /// Rewrites the FSINFO free count when it disagrees with the scanned
+    /// FAT. Returns true if it was stale.
+    fn fix_fsinfo_if_stale(&mut self) -> bool {
+        match self.read_fsinfo() {
+            Some((on_disk, _)) if on_disk != self.free_clusters => {
+                self.write_fsinfo(self.free_clusters);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Boot-time consistency scan after an unclean shutdown: repairs
+    /// FAT entries that point nowhere (become end-of-chain), truncates
+    /// broken or cyclic root-directory chains, and syncs the FSINFO.
+    /// Returns the number of repairs.
+    fn consistency_scan(&mut self) -> u32 {
+        let mut repairs = 0u32;
+        let max = self.max_cluster();
+        for entry in 2..self.fat.len() {
+            let value = self.fat[entry] & CLUSTER_MASK;
+            let terminal = value == 0x0FFF_FFF7 || value >= 0x0FFF_FFF8;
+            if value == 0 || terminal || (2..=max).contains(&value) {
+                continue;
+            }
+            self.set_cluster(entry as u32, EOF_MARK);
+            repairs += 1;
+        }
+        // Walk the root chain; cut the link that entered a cycle or an
+        // invalid cluster.
+        let mut cluster = self.root_cluster;
+        let mut visited: Vec<u32> = Vec::new();
+        let mut guard = 0u32;
+        while !Fat32::is_eof(cluster) && guard < CHAIN_GUARD {
+            if cluster < 2 || cluster > max || visited.contains(&cluster) {
+                if let Some(prev) = visited.last() {
+                    self.set_cluster(*prev, EOF_MARK);
+                    repairs += 1;
+                }
+                break;
+            }
+            visited.push(cluster);
+            cluster = self.fat[cluster as usize] & CLUSTER_MASK;
+            guard += 1;
+        }
+        if repairs > 0 {
+            let _ = self.flush_fat();
+        }
+        repairs
+    }
+
+    /// True when `path` exists on the volume (file or directory).
+    fn path_exists(&self, path: &str) -> bool {
+        let mut parts: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let Some(name) = parts.pop() else {
+            return false;
+        };
+        let mut cluster = self.root_cluster;
+        for comp in parts {
+            let mut entries = Vec::new();
+            if self.read_dir(cluster, &mut entries).is_err() {
+                return false;
+            }
+            let Some(e) = entries.iter().find(|e| e.is_dir && name_matches(&e.name, comp)) else {
+                return false;
+            };
+            cluster = e.first_cluster;
+        }
+        let mut entries = Vec::new();
+        if self.read_dir(cluster, &mut entries).is_err() {
+            return false;
+        }
+        entries.iter().any(|e| name_matches(&e.name, name))
+    }
+
+    /// Marks the volume as dirty: /system/dirty is removed only by a
+    /// clean shutdown, so its presence at boot means the last session
+    /// ended abruptly. (A leading-dot name would be nicer, but the
+    /// name validator rejects those.)
+    fn set_dirty_marker(&mut self) {
+        if !self.path_exists("/system") {
+            let _ = self.make_dir_impl("/system");
+        }
+        let _ = self.write_file_impl("/system/dirty", b"dirty");
+    }
+
     // ---- mutating operations -------------------------------------------------
 
     fn set_cluster(&mut self, cluster: u32, value: u32) {
@@ -776,8 +900,63 @@ pub fn mount() -> Result<(), FatError> {
     let device = crate::disk::first_disk().ok_or(FatError::NoDisk)?;
     let mut fat = Fat32::open(device)?;
     fat.scan_free_clusters();
+    // Integrity: the presence of /system/dirty means the last session
+    // was cut off (a clean shutdown removes it). Scan and repair, then
+    // mark this session as dirty so the next boot can tell.
+    if fat.path_exists("/system/dirty") {
+        crate::io::exception_print(crate::io::sprint(
+            &mut [0u8; 64],
+            format_args!("[WARN] unclean shutdown detected; scanning FAT\n"),
+        ));
+        let repairs = fat.consistency_scan();
+        if repairs > 0 {
+            crate::io::exception_print(crate::io::sprint(
+                &mut [0u8; 96],
+                format_args!("[WARN] FAT repaired {} broken entr{}\n", repairs, if repairs == 1 { "y" } else { "ies" }),
+            ));
+        }
+        crate::io::exception_print(crate::io::sprint(
+            &mut [0u8; 64],
+            format_args!("[OK] FAT integrity scan complete\n"),
+        ));
+    } else {
+        fat.fix_fsinfo_if_stale();
+    }
+    fat.set_dirty_marker();
     *MOUNTED.lock() = Some(fat);
     Ok(())
+}
+
+/// True when a file or directory exists at `path` on the mounted volume.
+pub fn exists(path: &str) -> bool {
+    let guard = MOUNTED.lock();
+    guard.as_ref().map(|fat| fat.path_exists(path)).unwrap_or(false)
+}
+
+/// The free-cluster count recorded in the on-disk FSINFO sector.
+pub fn fsinfo_free() -> Option<u32> {
+    let guard = MOUNTED.lock();
+    guard.as_ref().and_then(|fat| fat.read_fsinfo()).map(|(free, _)| free)
+}
+
+/// Rewrites the FSINFO free count to match the scanned FAT. Returns the
+/// number of repairs (1 when the count was stale).
+pub fn check_integrity() -> usize {
+    let mut guard = MOUNTED.lock();
+    let Some(fat) = guard.as_mut() else {
+        return 0;
+    };
+    fat.scan_free_clusters();
+    usize::from(fat.fix_fsinfo_if_stale())
+}
+
+/// Selftest hook: scribbles a bogus free count into the FSINFO so the
+/// repair path can be exercised. Never called outside the selftest.
+pub fn debug_corrupt_fsinfo() {
+    let mut guard = MOUNTED.lock();
+    if let Some(fat) = guard.as_mut() {
+        fat.write_fsinfo(0xFEED_FACE);
+    }
 }
 
 pub fn info() -> Option<VolumeInfo> {
