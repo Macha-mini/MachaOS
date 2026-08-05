@@ -1,6 +1,7 @@
 //! A text-cell grid virtual console, the graphics-mode analogue of
 //! `vga::Writer`. Instead of writing `ScreenChar`s into the fixed 0xB8000
-//! VGA buffer, it blits glyphs (via `gfx::draw_char`) into its own pixel
+//! VGA buffer, it blits glyphs (via `font::draw_console_cp`: 8x16 ASCII
+//! and 16x16 kana/kanji sharing one row height) into its own pixel
 //! buffer, which a `wm::Window` owns and the compositor blits onward.
 
 use alloc::vec;
@@ -8,7 +9,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::font;
-use crate::gfx::{self, Surface};
+use crate::gfx::Surface;
 
 pub struct Console {
     cols: usize,
@@ -30,7 +31,7 @@ pub struct Console {
 impl Console {
     pub fn new(cols: usize, rows: usize, fg: u32, bg: u32) -> Self {
         let width = cols * font::glyph_w();
-        let height = rows * font::glyph_h();
+        let height = rows * font::console_row_h() as usize;
         Self {
             cols,
             rows,
@@ -50,7 +51,13 @@ impl Console {
     }
 
     pub fn height_px(&self) -> u32 {
-        (self.rows * font::glyph_h()) as u32
+        (self.rows * font::console_row_h() as usize) as u32
+    }
+
+    /// Pixel height of one row in this console (16x16 at scale 1, so
+    /// ASCII and Japanese glyphs share a line height).
+    pub fn row_h(&self) -> u32 {
+        font::console_row_h()
     }
 
     pub fn pixels(&self) -> &[u32] {
@@ -82,7 +89,7 @@ impl Console {
         self.row = 0;
         self.col = 0;
         let width = cols * font::glyph_w();
-        let height = rows * font::glyph_h();
+        let height = rows * font::console_row_h() as usize;
         self.buffer = vec![self.bg; width * height];
     }
 
@@ -131,15 +138,11 @@ impl Console {
                         self.scroll();
                     }
                 }
-                if c.is_ascii() {
-                    self.draw_cell(self.col, self.row, c as u8);
-                } else {
-                    let x = (self.col * font::glyph_w()) as u32;
-                    let y = (self.row * font::glyph_h()) as u32;
-                    let fg = self.fg;
-                    let bg = self.bg;
-                    gfx::draw_cp(self, x, y, c, fg, Some(bg));
-                }
+                let x = (self.col * font::glyph_w()) as u32;
+                let y = (self.row as u32) * font::console_row_h();
+                let fg = self.fg;
+                let bg = self.bg;
+                font::draw_console_cp(self, x, y, c, fg, Some(bg));
                 self.col += cells;
                 self.last_width = cells as u8;
             }
@@ -184,15 +187,15 @@ impl Console {
 
     fn draw_cell(&mut self, col: usize, row: usize, byte: u8) {
         let x = (col * font::glyph_w()) as u32;
-        let y = (row * font::glyph_h()) as u32;
+        let y = (row as u32) * font::console_row_h();
         let fg = self.fg;
         let bg = self.bg;
-        gfx::draw_char(self, x, y, byte, fg, Some(bg));
+        font::draw_console_cp(self, x, y, byte as char, fg, Some(bg));
     }
 
     fn scroll(&mut self) {
         let width = self.width_px() as usize;
-        let row_height = font::glyph_h();
+        let row_height = font::console_row_h() as usize;
         let total_rows_px = self.rows * row_height;
         self.buffer.copy_within(width * row_height..width * total_rows_px, 0);
         let last_row_start = width * (total_rows_px - row_height);

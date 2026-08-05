@@ -187,6 +187,53 @@ pub fn char_cells(c: char) -> u32 {
     }
 }
 
+/// Pixel height of one console text row: 16x16 at scale 1, matching
+/// the Japanese glyphs. ASCII is rendered 8x16 (halfwidth, same
+/// height) so mixed Japanese/English text lines up.
+pub fn console_row_h() -> u32 {
+    16 * scale() as u32
+}
+
+/// Draws `c` the way the console renders it: halfwidth ASCII uses the
+/// 8x16 glyph (same row height as the kana/kanji), Japanese uses the
+/// 16x16 glyph. Returns the pixel advance (one 8px column for ASCII,
+/// two for Japanese).
+pub fn draw_console_cp(
+    surface: &mut dyn crate::gfx::Surface,
+    x: u32,
+    y: u32,
+    c: char,
+    fg: u32,
+    bg: Option<u32>,
+) -> u32 {
+    let s = scale() as u32;
+    if c.is_ascii() {
+        let blank = [0u8; 16];
+        let g = crate::jp_font::glyph8x16(c as u8).unwrap_or(&blank);
+        for row in 0..16u32 {
+            let bits = g[row as usize];
+            for col in 0..8u32 {
+                let set = bits & (1 << (7 - col)) != 0;
+                if set {
+                    if s == 1 {
+                        surface.put_pixel(x + col, y + row, fg);
+                    } else {
+                        crate::gfx::fill_rect(surface, x + col * s, y + row * s, s, s, fg);
+                    }
+                } else if let Some(bg) = bg {
+                    if s == 1 {
+                        surface.put_pixel(x + col, y + row, bg);
+                    } else {
+                        crate::gfx::fill_rect(surface, x + col * s, y + row * s, s, s, bg);
+                    }
+                }
+            }
+        }
+        return glyph_w() as u32;
+    }
+    draw_cp(surface, x, y, c, fg, bg)
+}
+
 /// Horizontal advance in pixels for `c` at the current font scale: one
 /// 8x8 cell for ASCII, two cells (16x16) for Japanese glyphs, one cell
 /// as a fallback for anything not in the embedded Japanese subset.

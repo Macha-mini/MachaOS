@@ -53,7 +53,7 @@ const DESKTOP_BG_BOTTOM: u32 = 0x00_061630;
 /// Terminals take roughly 3/4 of the screen width, like Windows' own.
 fn fit_console_cells(screen_w: u32, screen_h: u32, max_cols: usize, max_rows: usize) -> (usize, usize) {
     let avail_w = (screen_w * 3 / 4).saturating_sub(40) / font::glyph_w() as u32;
-    let avail_h = screen_h.saturating_sub(TASKBAR_HEIGHT + 80) / font::glyph_h() as u32;
+    let avail_h = screen_h.saturating_sub(TASKBAR_HEIGHT + 80) / font::console_row_h();
     (
         (avail_w as usize).clamp(MIN_COLS, max_cols),
         (avail_h as usize).clamp(MIN_ROWS, max_rows),
@@ -672,7 +672,10 @@ impl WindowManager {
     fn max_content_cells(&self) -> (usize, usize) {
         let max_w = self.screen_w;
         let max_h = self.screen_h - TASKBAR_HEIGHT - TITLE_BAR_HEIGHT;
-        ((max_w / font::glyph_w() as u32) as usize, (max_h / font::glyph_h() as u32) as usize)
+        (
+            (max_w / font::glyph_w() as u32) as usize,
+            (max_h / font::console_row_h()) as usize,
+        )
     }
 
     fn maximize_window(&mut self, index: usize) {
@@ -1201,7 +1204,7 @@ impl WindowManager {
                 let local_w = (self.cursor_x - wx).max(0) as u32;
                 let local_h = (self.cursor_y - wy - TITLE_BAR_HEIGHT as i32).max(0) as u32;
                 let cols = ((local_w / font::glyph_w() as u32) as usize).max(MIN_COLS);
-                let rows = ((local_h / font::glyph_h() as u32) as usize).max(MIN_ROWS);
+                let rows = ((local_h / font::console_row_h()) as usize).max(MIN_ROWS);
                 if cols != resize.last_cols || rows != resize.last_rows {
                     resize.last_cols = cols;
                     resize.last_rows = rows;
@@ -1634,7 +1637,7 @@ impl WindowManager {
                     self.raise(i);
                     let focused_index = self.focused;
                     let cols = content_w as usize / font::glyph_w();
-                    let rows = content_h as usize / font::glyph_h();
+                    let rows = content_h as usize / font::console_row_h() as usize;
                     self.resizing = Some(ResizeState { window_index: focused_index, last_cols: cols, last_rows: rows });
                     return;
                 }
@@ -2571,12 +2574,14 @@ fn editor_render(console: &mut Console, ed: &mut EditorState) {
         let text: String = ed.lines[li].chars().skip(cs).collect();
         let _ = writeln!(console, "{}", text);
     }
+    let row_h = font::console_row_h();
     let sx = font::glyph_w() as u32;
-    let sy = (doc_rows * font::glyph_h()) as u32;
+    let sy = doc_rows as u32 * row_h;
     let cw = console.width_px();
-    gfx::fill_rect(console, 0, sy, cw, font::glyph_h() as u32, EDITOR_STATUS_BG);
+    gfx::fill_rect(console, 0, sy, cw, row_h, EDITOR_STATUS_BG);
     // The status line shows the live search prompt while in
-    // find/replace mode, otherwise the editor's own status.
+    // find/replace mode, otherwise the editor's own status. Drawn at
+    // console size (8x16 ASCII, 16x16 kanji) so it matches the text.
     let status_text = if ed.find_mode {
         format!("検索: {}|", ed.find)
     } else if ed.replace_mode {
@@ -2585,7 +2590,10 @@ fn editor_render(console: &mut Console, ed: &mut EditorState) {
     } else {
         ed.status.clone()
     };
-    gfx::draw_string(console, sx, sy, &status_text, EDITOR_STATUS_FG, None);
+    let mut tx = sx;
+    for ch in status_text.chars() {
+        tx += font::draw_console_cp(console, tx, sy, ch, EDITOR_STATUS_FG, None);
+    }
     let visible = cursor_vr
         .saturating_sub(ed.scroll_offset)
         .min(doc_rows.saturating_sub(1));
@@ -2599,8 +2607,14 @@ fn editor_render(console: &mut Console, ed: &mut EditorState) {
         .take(ed.cursor_col.saturating_sub(row_start))
         .map(font::char_width)
         .sum();
-    let cy = (visible * font::glyph_h()) as u32;
-    gfx::fill_rect(console, cx, cy, font::glyph_w() as u32, font::glyph_h() as u32, EDITOR_CURSOR_COLOR);
+    let cy = visible as u32 * row_h;
+    // The cursor block covers the char under it (one or two columns).
+    let cw_cursor = line
+        .chars()
+        .nth(ed.cursor_col)
+        .map(font::char_width)
+        .unwrap_or(font::glyph_w() as u32);
+    gfx::fill_rect(console, cx, cy, cw_cursor, row_h, EDITOR_CURSOR_COLOR);
 }
 
 fn taskbar_label_width(title: &str) -> i32 {
