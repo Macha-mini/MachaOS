@@ -109,7 +109,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "run", "runlinux",
+    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
 ];
 
 pub fn run() -> ! {
@@ -235,6 +235,7 @@ fn read_line() -> String {
                 }
                 // The plain VGA fallback shell has no cursor movement.
                 keyboard::Event::Left | keyboard::Event::Right => {}
+                keyboard::Event::Escape | keyboard::Event::F2 => {}
                 keyboard::Event::Ctrl(_) => {}
             }
         }
@@ -310,6 +311,7 @@ pub fn execute(line: &str) {
         "write" => cmd_write(&args),
         "mkdir" => cmd_mkdir(&args),
         "rm" => cmd_rm(&args),
+        "mv" => cmd_mv(&args),
         "run" => cmd_run(&args),
         "runlinux" => cmd_runlinux(&args),
         "cd" => cmd_cd(&args),
@@ -346,6 +348,8 @@ fn cmd_help() {
     println!("               write text to a file (LFN supported)");
     println!("  mkdir <path> create a directory");
     println!("  rm <path>   remove a file or empty directory");
+    println!("  mv <path> <new-name>");
+    println!("               rename a file or directory in place");
     println!("  run <path>  load and run an ELF program as a process");
     println!("  runlinux <path> [args...]");
     println!("               load and run a Linux ELF binary (Linux ABI, see linux_abi.rs)");
@@ -447,6 +451,19 @@ fn cmd_rm(args: &[&str]) {
     match fat::remove(&path) {
         Ok(()) => println!("removed {}", path),
         Err(e) => println!("rm: {}: {}", path, e),
+    }
+}
+
+fn cmd_mv(args: &[&str]) {
+    if args.len() != 2 {
+        println!("usage: mv <path> <new-name>");
+        return;
+    }
+    let path = abs_path(args[0]);
+    let new_name = args[1].to_string();
+    match fat::rename(&path, &new_name) {
+        Ok(()) => println!("renamed {} to {}", path, new_name),
+        Err(e) => println!("mv: {}: {}", path, e),
     }
 }
 
@@ -945,6 +962,110 @@ pub fn selftest() -> ! {
         selftest_fail("desktop session lenient parsing failed");
     }
     println!("[OK] desktop session parsing skips malformed lines");
+
+    // File rename (FAT32 rename-impl): a file keeps its contents under
+    // the new name and disappears from the old one; a non-empty
+    // directory renames in place too (its children move with it).
+    if fat::make_dir("/selftest").is_err() {
+        selftest_fail("rename test mkdir failed");
+    }
+    if let Err(_e) = fat::write_file("/selftest/old name.txt", b"rename payload") {
+        selftest_fail("rename test source write failed");
+    }
+    if let Err(e) = fat::rename("/selftest/old name.txt", "new name.txt") {
+        selftest_fail(&format!("file rename failed: {}", e));
+    }
+    match fat::read_file("/selftest/new name.txt") {
+        Ok(data) if data == b"rename payload" && fat::read_file("/selftest/old name.txt").is_err() => {
+            println!("[OK] FAT32 rename keeps file contents under the new name")
+        }
+        _ => selftest_fail("file rename result mismatch"),
+    }
+    if let Err(_e) = fat::write_file("/selftest/taken.txt", b"taken") {
+        selftest_fail("rename collision setup failed");
+    }
+    match fat::rename("/selftest/new name.txt", "taken.txt") {
+        Err(FatError::AlreadyExists) => println!("[OK] FAT32 rename rejects an existing name"),
+        _ => selftest_fail("rename collision was not rejected"),
+    }
+    if fat::make_dir("/selftest/dir").is_err() {
+        selftest_fail("rename dir setup mkdir failed");
+    }
+    if let Err(_e) = fat::write_file("/selftest/dir/child.txt", b"child") {
+        selftest_fail("rename dir child write failed");
+    }
+    if let Err(e) = fat::rename("/selftest/dir", "moved-dir") {
+        selftest_fail(&format!("directory rename failed: {}", e));
+    }
+    match fat::read_file("/selftest/moved-dir/child.txt") {
+        Ok(data) if data == b"child" && fat::list_dir("/selftest/dir").is_err() => {
+            println!("[OK] FAT32 rename moves a non-empty directory in place")
+        }
+        _ => selftest_fail("directory rename result mismatch"),
+    }
+
+    // Empty files: writing zero bytes creates a 0-byte entry that reads
+    // back empty — what the explorer's "New File" button produces.
+    if let Err(e) = fat::write_file("/selftest/empty file.txt", b"") {
+        selftest_fail(&format!("empty file write failed: {}", e));
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Ok(data) if data.is_empty() => println!("[OK] FAT32 empty file round trip"),
+        _ => selftest_fail("empty file read mismatch"),
+    }
+
+    // Overwriting an existing empty file (first_cluster == 0) must not
+    // free reserved cluster 0: the file survives, both as an empty
+    // overwrite and then as a content write. Removing an empty file
+    // must succeed for the same reason.
+    if fat::write_file("/selftest/empty file.txt", b"").is_err() {
+        selftest_fail("empty file overwrite failed");
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Ok(data) if data.is_empty() => println!("[OK] FAT32 empty file overwrite keeps the file"),
+        _ => selftest_fail("empty file overwrite lost the file"),
+    }
+    if fat::write_file("/selftest/empty file.txt", b"now has content").is_err() {
+        selftest_fail("empty file content write failed");
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Ok(data) if data == b"now has content" => {
+            println!("[OK] FAT32 empty file grows content on overwrite")
+        }
+        _ => selftest_fail("empty file content overwrite mismatch"),
+    }
+    if fat::remove("/selftest/empty file.txt").is_err() {
+        selftest_fail("empty file remove failed");
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Err(FatError::NotFound) => println!("[OK] FAT32 empty file removes cleanly"),
+        _ => selftest_fail("empty file remove left it behind"),
+    }
+
+    // The shell's `mv` command drives the same rename path (quote paths
+    // with spaces, like `write`).
+    if let Err(e) = fat::write_file("/selftest/mv source.txt", b"mv me") {
+        selftest_fail(&format!("mv test setup failed: {}", e));
+    }
+    execute("mv \"/selftest/mv source.txt\" \"renamed-empty.txt\"");
+    if fat::read_file("/selftest/renamed-empty.txt").is_err() || fat::read_file("/selftest/mv source.txt").is_ok() {
+        selftest_fail("shell mv did not rename the file");
+    }
+    println!("[OK] shell mv command renames files");
+
+    // Clean up every rename-test artifact.
+    for leftover in ["/selftest/renamed-empty.txt", "/selftest/taken.txt", "/selftest/new name.txt"] {
+        let _ = fat::remove(leftover);
+    }
+    if let Err(_e) = fat::remove("/selftest/moved-dir/child.txt") {
+        selftest_fail("rename test cleanup file failed");
+    }
+    if let Err(_e) = fat::remove("/selftest/moved-dir") {
+        selftest_fail("rename test cleanup dir failed");
+    }
+    if let Err(_e) = fat::remove("/selftest") {
+        selftest_fail("rename test cleanup root failed");
+    }
 
     // Shell path handling: cd/pwd, `..`, home expansion, and relative access.
     execute("cd /users/macha/Documents");
@@ -1536,7 +1657,11 @@ impl LineEditor {
             }
             // Not supported yet: LineEditor only ever appends/removes at
             // the end of `line`, it has no notion of a cursor within it.
-            keyboard::Event::Left | keyboard::Event::Right | keyboard::Event::Ctrl(_) => Feed::Pending,
+            keyboard::Event::Left
+            | keyboard::Event::Right
+            | keyboard::Event::Escape
+            | keyboard::Event::F2
+            | keyboard::Event::Ctrl(_) => Feed::Pending,
         }
     }
 }

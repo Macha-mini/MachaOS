@@ -96,10 +96,19 @@ it back where it was.) The session file is plain text and is ignored
 entirely if it is missing or malformed.
 
 The Notepad is a text editor with arrow-key cursor movement and
-Enter/Backspace line editing. Press **Ctrl+S** to save the document to
-`/notepad.txt` and **Ctrl+O** to load it back (the bottom row shows a
-status message for both). The Calculator does integer-only four-function
-arithmetic via mouse clicks.
+Enter/Backspace line editing. Press **Ctrl+S** to save the document and
+**Ctrl+O** to load it back (the bottom row shows a status message for
+both). The plain Notepad edits `/users/macha/Documents/notepad.txt`, but
+a document opened from the File Explorer remembers the file it came from
+and saves straight back to it with Ctrl+S. The Calculator does
+integer-only four-function arithmetic via mouse clicks.
+
+The File Explorer has sidebar shortcuts, breadcrumbs, a details/grid
+view, drag-and-drop moves, two-step deletes, and (toolbar buttons or
+`n`/`f` keys) new folders and new empty text files. Press **F2** on a
+selected item to rename it inline — type a new name and press Enter to
+confirm or Esc to cancel — and text files open in Notepad and save back
+to the same path.
 
 ## Shell
 
@@ -111,7 +120,8 @@ text-mode fallback). Available commands: `help`, `clear`/`cls`, `echo`,
 processes with their running/exited state), `run <path>` (loads an ELF from
 disk as a process and waits for it to exit), and the filesystem commands
 `ls [path]`, `cat <path>`, `write <path> <text>`, `mkdir <path>`,
-`rm <path>`, `fatinfo`, `cd [path]`, and `pwd`. Paths may be relative to
+`rm <path>`, `mv <path> <new-name>` (renames a file or directory in
+place), `fatinfo`, `cd [path]`, and `pwd`. Paths may be relative to
 the current directory (the prompt shows it), and arguments containing
 spaces can be double-quoted: `write notes.txt "hello world"`. Up/Down
 recall command history and Tab completes command names (in both the

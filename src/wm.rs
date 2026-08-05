@@ -217,7 +217,7 @@ struct RememberedWindow {
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
-    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String },
+    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String, path: String },
     Calculator(CalculatorApp),
     FileExplorer(FileExplorer),
     Settings(SettingsApp),
@@ -825,7 +825,7 @@ impl WindowManager {
                     "Notepad",
                     true,
                     Some(AppId::Notepad),
-                    AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status },
+                    AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path: String::new() },
                 );
             }
             LauncherAction::SysInfo => {
@@ -910,6 +910,11 @@ impl WindowManager {
         if lines.last().map(String::is_empty) == Some(true) {
             lines.pop();
         }
+        if lines.is_empty() {
+            // An empty (or newline-only) file still gets one empty line
+            // to type into.
+            lines.push(String::new());
+        }
         let mut scroll = 0usize;
         let mut status = format!("opened {} ({} bytes)", path, content.len());
         editor_render(&mut console, &lines, 0, 0, &mut scroll, &mut status);
@@ -919,7 +924,7 @@ impl WindowManager {
             title,
             true,
             None,
-            AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status },
+            AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path },
         );
     }
 
@@ -1015,8 +1020,8 @@ impl WindowManager {
                     io::set_console_sink(None);
                     None
                 }
-                AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {
-                    editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, event);
+                AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status, path } => {
+                    editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, path, event);
                     None
                 }
                 AppKind::FileExplorer(app) => app.handle_key(event),
@@ -1515,7 +1520,7 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             print!("{}{}", shell::prompt(), editor.current_line());
             io::set_console_sink(None);
         }
-        AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status } => {
+        AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status, .. } => {
             console.resize(cols, rows);
             editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
         }
@@ -1543,21 +1548,26 @@ fn editor_handle_key(
     cursor_col: &mut usize,
     scroll_offset: &mut usize,
     status: &mut String,
+    path: &str,
     event: keyboard::Event,
 ) {
+    // An editor opened from the file explorer saves to (and reloads
+    // from) the file it was opened with; the launcher's plain Notepad
+    // keeps the classic fixed default.
+    let save_path = if path.is_empty() { NOTEPAD_PATH } else { path };
     match event {
         keyboard::Event::Ctrl('s') => {
             let mut text = lines.join("\n");
             if !text.is_empty() {
                 text.push('\n');
             }
-            match fat::write_file(NOTEPAD_PATH, text.as_bytes()) {
-                Ok(()) => *status = format!("saved {} bytes to {}", text.len(), NOTEPAD_PATH),
+            match fat::write_file(save_path, text.as_bytes()) {
+                Ok(()) => *status = format!("saved {} bytes to {}", text.len(), save_path),
                 Err(e) => *status = format!("save failed: {}", e),
             }
         }
         keyboard::Event::Ctrl('o') => {
-            match fat::read_file(NOTEPAD_PATH) {
+            match fat::read_file(save_path) {
                 Ok(data) => {
                     let text = core::str::from_utf8(&data).unwrap_or("");
                     lines.clear();
@@ -1569,7 +1579,7 @@ fn editor_handle_key(
                     *cursor_col = 0;
                     *status = format!(
                         "opened {} ({} bytes)",
-                        NOTEPAD_PATH,
+                        save_path,
                         data.len()
                     );
                 }
@@ -1634,6 +1644,7 @@ fn editor_handle_key(
                 *cursor_col = (*cursor_col).min(lines[*cursor_row].chars().count());
             }
         }
+        keyboard::Event::Escape | keyboard::Event::F2 => {}
     }
     editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
 }

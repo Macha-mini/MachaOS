@@ -379,7 +379,11 @@ impl Fat32 {
                 return Err(FatError::NotDir);
             }
             self.delete_entry_at(existing.location.0, existing.location.1)?;
-            self.free_chain(existing.first_cluster)?;
+            // A zero-length file has no clusters (first_cluster == 0);
+            // cluster 0 is reserved and must not be walked/freed.
+            if existing.first_cluster != 0 {
+                self.free_chain(existing.first_cluster)?;
+            }
         }
 
         let cluster_bytes = self.cluster_bytes();
@@ -463,7 +467,31 @@ impl Fat32 {
             }
         }
         self.delete_entry_at(entry.location.0, entry.location.1)?;
-        self.free_chain(entry.first_cluster)?;
+        // Zero-length files have no clusters; cluster 0 is reserved.
+        if entry.first_cluster != 0 {
+            self.free_chain(entry.first_cluster)?;
+        }
+        self.flush_fat()
+    }
+
+    /// Renames `path`'s entry to `new_name` in its own directory: the
+    /// old LFN+SFN pair is deleted and re-created under the new name with
+    /// the same first cluster, size and directory flag, so neither the
+    /// contents nor (for directories) any child entries move.
+    fn rename_impl(&mut self, path: &str, new_name: &str) -> Result<(), FatError> {
+        let (parent, name) = self.resolve_parent(path)?;
+        validate_name(new_name)?;
+        if name == new_name {
+            return Ok(());
+        }
+        let entry = self
+            .find_dir_entry(parent, &name)
+            .ok_or(FatError::NotFound)?;
+        if self.find_dir_entry(parent, new_name).is_some() {
+            return Err(FatError::AlreadyExists);
+        }
+        self.delete_entry_at(entry.location.0, entry.location.1)?;
+        self.write_dir_entries(parent, new_name, entry.first_cluster, entry.size, entry.is_dir)?;
         self.flush_fat()
     }
 
@@ -551,10 +579,20 @@ impl Fat32 {
                 }
                 let _ = k;
             }
-            if i == 0 && n < 13 {
-                part[n] = 0x0000; // terminator in the last part
+            // The LFN chain's first entry (highest ordinal, holding the
+            // END of the name) carries the 0x40 "last entry" flag and,
+            // when its part isn't full, the 0x0000 terminator. The chain
+            // is stored in reverse name order, so both go on the entry
+            // pushed first (i == lfn_count - 1), not on ordinal 1.
+            if i == lfn_count - 1 && n < 13 {
+                part[n] = 0x0000; // terminator
             }
-            entries.push(lfn_entry_bytes((i + 1) as u8, &part, i == 0, checksum));
+            entries.push(lfn_entry_bytes(
+                (i + 1) as u8,
+                &part,
+                i == lfn_count - 1,
+                checksum,
+            ));
         }
 
         let mut sfn_entry = [0u8; 32];
@@ -803,6 +841,18 @@ pub fn remove(path: &str) -> Result<(), FatError> {
     let mut guard = MOUNTED.lock();
     let fat = guard.as_mut().ok_or(FatError::NoDisk)?;
     fat.remove_impl(path)
+}
+
+/// Renames a file or directory in place (same directory).
+///
+/// Unlike `move_file` (copy + delete), this rewrites only the directory
+/// entry — the cluster chain and contents are untouched — so directories
+/// with contents can be renamed too. Fails if `new_name` already exists
+/// in the parent directory.
+pub fn rename(path: &str, new_name: &str) -> Result<(), FatError> {
+    let mut guard = MOUNTED.lock();
+    let fat = guard.as_mut().ok_or(FatError::NoDisk)?;
+    fat.rename_impl(path, new_name)
 }
 
 /// Returns whether `path` exists and is a directory. `/` is a directory.

@@ -97,6 +97,7 @@ enum SortKey {
 enum ToolbarAction {
     Up,
     New,
+    NewFile,
     Del,
     Refresh,
     ToggleView,
@@ -106,6 +107,17 @@ enum ToolbarAction {
 struct SidebarEntry {
     label: String,
     target: String, // empty for headers
+}
+
+/// An in-progress inline rename: the selected item's index and the edit
+/// buffer with the cursor position in characters. `select_all` is set
+/// while the whole original name is "selected": typing then replaces it
+/// (like Windows), and any cursor/edit key clears the selection.
+struct RenameState {
+    item: usize,
+    buf: String,
+    cursor: usize,
+    select_all: bool,
 }
 
 #[derive(Clone)]
@@ -132,6 +144,8 @@ pub struct FileExplorer {
     last_click_was_double: bool,
     // Two-step delete confirmation: (selection at press time, tick).
     pending_delete: Option<(usize, u64)>,
+    // Inline rename-in-progress (`F2`); `None` when not renaming.
+    rename: Option<RenameState>,
     status: String,
     free_bytes: u64,
     sidebar: Vec<SidebarEntry>,
@@ -201,6 +215,11 @@ fn parent_path(path: &str) -> String {
     }
 }
 
+/// Byte index of the `char_index`-th character in `s`.
+fn char_index(s: &str, char_index: usize) -> usize {
+    s.char_indices().nth(char_index).map(|(i, _)| i).unwrap_or(s.len())
+}
+
 /// Compares two entries: directories first, then by the active sort key.
 fn entry_less(a: &DirEntry, b: &DirEntry, key: SortKey, asc: bool) -> bool {
     if a.is_dir != b.is_dir {
@@ -253,6 +272,7 @@ impl FileExplorer {
             last_click_ticks: 0,
             last_click_was_double: false,
             pending_delete: None,
+            rename: None,
             status: String::new(),
             free_bytes: 0,
             sidebar: Vec::new(),
@@ -438,6 +458,7 @@ impl FileExplorer {
         self.selection = 0;
         self.scroll = 0;
         self.pending_delete = None;
+        self.rename = None;
         self.status = String::new();
         self.refresh();
     }
@@ -479,7 +500,7 @@ impl FileExplorer {
                     None
                 }
             }
-        } else if entry.size > 0 && is_text(&entry.name) {
+        } else if is_text(&entry.name) {
             match fat::read_file(&path) {
                 Ok(content) => {
                     self.status = format!("opened {} ({} bytes)", entry.name, content.len());
@@ -553,6 +574,153 @@ impl FileExplorer {
         }
     }
 
+    /// Creates an empty text file ("New File.txt", deduplicated like the
+    /// folder naming) and selects it.
+    fn create_file(&mut self) {
+        let mut name = "New File.txt".to_string();
+        let mut i = 2;
+        let taken: Vec<String> = self.entries.iter().map(|e| e.name.to_lowercase()).collect();
+        while taken.contains(&name.to_lowercase()) && i < 100 {
+            name = format!("New File ({}).txt", i);
+            i += 1;
+        }
+        match fat::write_file(&join(&self.path, &name), b"") {
+            Ok(()) => {
+                self.status = format!("created {}", name);
+                self.refresh();
+                if let Some(pos) = self.entries.iter().position(|e| e.name == name) {
+                    self.selection = pos;
+                    self.ensure_selection_visible();
+                    self.render();
+                }
+            }
+            Err(e) => {
+                self.status = format!("create failed: {}", e);
+                self.render();
+            }
+        }
+    }
+
+    /// Enters inline rename mode for the selected item (F2). The whole
+    /// name starts "selected": typing replaces it, arrow keys or
+    /// Backspace keep it for editing.
+    fn start_rename(&mut self) {
+        let Some(entry) = self.entries.get(self.selection).cloned() else {
+            return;
+        };
+        let name = entry.name.clone();
+        self.rename = Some(RenameState {
+            item: self.selection,
+            buf: name.clone(),
+            cursor: name.chars().count(),
+            select_all: true,
+        });
+        self.pending_delete = None;
+        self.status = format!("rename {} — Enter to confirm, Esc to cancel", name);
+        self.render();
+    }
+
+    fn cancel_rename(&mut self) {
+        if self.rename.take().is_some() {
+            self.render();
+        }
+    }
+
+    /// Applies the inline rename: the entry's directory entry is rewritten
+    /// under the new name (its contents never move).
+    fn commit_rename(&mut self) {
+        let Some(state) = self.rename.take() else {
+            return;
+        };
+        let new_name = state.buf.trim().to_string();
+        let Some(old_name) = self.entries.get(state.item).map(|e| e.name.clone()) else {
+            self.render();
+            return;
+        };
+        if new_name.is_empty() || old_name == new_name {
+            self.render();
+            return;
+        }
+        match fat::rename(&join(&self.path, &old_name), &new_name) {
+            Ok(()) => {
+                self.status = format!("renamed {} to {}", old_name, new_name);
+                self.refresh();
+                if let Some(pos) = self.entries.iter().position(|e| e.name == new_name) {
+                    self.selection = pos;
+                    self.ensure_selection_visible();
+                    self.render();
+                }
+            }
+            Err(e) => {
+                self.status = format!("rename failed: {}", e);
+                self.render();
+            }
+        }
+    }
+
+    /// Routes a key event to the rename edit buffer.
+    fn rename_key(&mut self, event: keyboard::Event) {
+        match event {
+            keyboard::Event::Escape => self.cancel_rename(),
+            keyboard::Event::Enter => self.commit_rename(),
+            keyboard::Event::Backspace => {
+                let Some(state) = self.rename.as_mut() else {
+                    return;
+                };
+                if state.select_all {
+                    // Backspace with the name "selected" empties it.
+                    state.select_all = false;
+                    state.buf.clear();
+                    state.cursor = 0;
+                    self.render();
+                } else if state.cursor > 0 {
+                    let idx = char_index(&state.buf, state.cursor - 1);
+                    state.buf.remove(idx);
+                    state.cursor -= 1;
+                    self.render();
+                }
+            }
+            keyboard::Event::Left => {
+                if let Some(state) = self.rename.as_mut() {
+                    state.select_all = false;
+                    state.cursor = state.cursor.saturating_sub(1);
+                    self.render();
+                }
+            }
+            keyboard::Event::Right => {
+                if let Some(state) = self.rename.as_mut() {
+                    state.select_all = false;
+                    if state.cursor < state.buf.chars().count() {
+                        state.cursor += 1;
+                        self.render();
+                    }
+                }
+            }
+            keyboard::Event::Char(c) => {
+                if c == '/' || c == '\\' || c.is_ascii_control() {
+                    return;
+                }
+                let Some(state) = self.rename.as_mut() else {
+                    return;
+                };
+                if state.select_all {
+                    // First character typed replaces the whole name.
+                    state.select_all = false;
+                    state.buf.clear();
+                    state.cursor = 0;
+                }
+                if state.buf.len() >= crate::fat::MAX_NAME {
+                    return;
+                }
+                let idx = char_index(&state.buf, state.cursor);
+                state.buf.insert(idx, c);
+                state.cursor += 1;
+                self.render();
+            }
+            _ => {}
+        }
+    }
+
     fn toggle_view(&mut self) {
         self.view = match self.view {
             View::Details => View::Grid,
@@ -594,6 +762,8 @@ impl FileExplorer {
     // ---- click routing -------------------------------------------------
 
     pub fn handle_click(&mut self, x: i32, y: i32) -> Option<FsAction> {
+        // Any click outside the rename box leaves rename mode.
+        self.rename = None;
         self.last_click_was_double = false;
         if x < 0 || y < 0 {
             return None;
@@ -637,6 +807,7 @@ impl FileExplorer {
         match toolbar_button_at(x) {
             Some(ToolbarAction::Up) => self.navigate(parent_path(&self.path)),
             Some(ToolbarAction::New) => self.create_folder(),
+            Some(ToolbarAction::NewFile) => self.create_file(),
             Some(ToolbarAction::Del) => self.delete_selected(),
             Some(ToolbarAction::Refresh) => {
                 self.status = String::new();
@@ -707,6 +878,11 @@ impl FileExplorer {
     }
 
     pub fn handle_key(&mut self, event: keyboard::Event) -> Option<FsAction> {
+        // While renaming, every key goes to the edit buffer.
+        if self.rename.is_some() {
+            self.rename_key(event);
+            return None;
+        }
         match event {
             keyboard::Event::Up => self.move_selection(-1),
             keyboard::Event::Down => self.move_selection(1),
@@ -728,7 +904,9 @@ impl FileExplorer {
                 self.refresh();
             }
             keyboard::Event::Char('n') => self.create_folder(),
+            keyboard::Event::Char('f') => self.create_file(),
             keyboard::Event::Char('v') => self.toggle_view(),
+            keyboard::Event::F2 => self.start_rename(),
             _ => {}
         }
         None
@@ -747,6 +925,7 @@ impl FileExplorer {
             View::Details => self.render_details(cx, cy),
             View::Grid => self.render_grid(cx, cy),
         }
+        self.render_rename();
         self.render_scrollbar();
         self.render_status();
     }
@@ -788,7 +967,7 @@ impl FileExplorer {
     fn render_toolbar(&mut self, cx: i32, cy: i32) {
         gfx::fill_rect(self, 0, PATH_H, WIDTH, TOOLBAR_H, TOOLBAR_BG);
         gfx::fill_rect(self, 0, PATH_H + TOOLBAR_H - 1, WIDTH, 1, 0x00_1A1A1A);
-        for action in [ToolbarAction::Up, ToolbarAction::New, ToolbarAction::Del, ToolbarAction::Refresh] {
+        for action in [ToolbarAction::Up, ToolbarAction::New, ToolbarAction::NewFile, ToolbarAction::Del, ToolbarAction::Refresh] {
             if let Some((bx, bw)) = toolbar_button_rect(action) {
                 let hovered = cx >= bx as i32 && cx < (bx + bw) as i32 && cy >= PATH_H as i32 + 3 && cy < (PATH_H + TOOLBAR_H - 3) as i32;
                 let (top, bottom) = if hovered {
@@ -955,6 +1134,54 @@ impl FileExplorer {
         }
     }
 
+    /// Overlays the inline rename box on the item being renamed (F2):
+    /// an accent-bordered dark field with the buffer text and a block
+    /// cursor, drawn on top of the list row or grid tile.
+    fn render_rename(&mut self) {
+        let Some(state) = &self.rename else { return };
+        let (item, cursor, buf) = (state.item, state.cursor, state.buf.clone());
+        if item >= self.entries.len() {
+            return;
+        }
+        let gh = font::glyph_h() as u32;
+        let box_h = (gh + 8).max(16);
+        let (bx, by, bw) = match self.view {
+            View::Details => {
+                if item < self.scroll {
+                    return;
+                }
+                let row = item - self.scroll;
+                if row >= self.details_visible_rows() {
+                    return;
+                }
+                let ry = LIST_Y + HEADER_H + row as u32 * ROW_H;
+                (SIDEBAR_W + 4, ry + (ROW_H - box_h) / 2, LIST_W - 8)
+            }
+            View::Grid => {
+                let cols = self.grid_cols();
+                let row = (item - self.scroll) / cols;
+                let col = (item - self.scroll) % cols;
+                if row >= self.grid_visible_rows() {
+                    return;
+                }
+                let tx = SIDEBAR_W + col as u32 * GRID_TILE_W;
+                let ty = LIST_Y + row as u32 * GRID_TILE_H;
+                (tx + 4, ty + 6, GRID_TILE_W - 8)
+            }
+        };
+        gfx::fill_rounded_rect(self, bx, by, bw, box_h, 4, 0x00_101010);
+        gfx::fill_rect(self, bx + 2, by, bw - 4, 1, ACCENT);
+        gfx::fill_rect(self, bx + 2, by + box_h - 1, bw - 4, 1, ACCENT);
+        let text_x = bx + 6;
+        let max_chars = ((bw.saturating_sub(12)) / font::glyph_w() as u32) as usize;
+        let start = cursor.saturating_sub(max_chars.saturating_sub(1));
+        let shown: String = buf.chars().skip(start).take(max_chars).collect();
+        gfx::draw_string(self, text_x, by + (box_h - gh) / 2, &shown, TEXT, None);
+        let cursor_col = buf.chars().skip(start).take(cursor - start).count() as u32;
+        let cx = text_x + cursor_col * font::glyph_w() as u32;
+        gfx::fill_rect(self, cx, by + 1, font::glyph_w() as u32, box_h - 2, 0x00_FFCC66);
+    }
+
     fn render_scrollbar(&mut self) {
         let track_h = HEIGHT - STATUS_H - LIST_Y;
         gfx::fill_rect(self, SIDEBAR_W + LIST_W, LIST_Y, SCROLLBAR_W, track_h, SCROLL_TRACK);
@@ -1047,8 +1274,9 @@ fn toolbar_button_rect(action: ToolbarAction) -> Option<(u32, u32)> {
     match action {
         ToolbarAction::Up => Some((6, 48)),
         ToolbarAction::New => Some((58, 48)),
-        ToolbarAction::Del => Some((110, 48)),
-        ToolbarAction::Refresh => Some((162, 64)),
+        ToolbarAction::NewFile => Some((110, 48)),
+        ToolbarAction::Del => Some((162, 48)),
+        ToolbarAction::Refresh => Some((214, 64)),
         ToolbarAction::ToggleView => Some((WIDTH - 76, 70)),
     }
 }
@@ -1057,6 +1285,7 @@ fn toolbar_button_at(x: u32) -> Option<ToolbarAction> {
     [
         ToolbarAction::Up,
         ToolbarAction::New,
+        ToolbarAction::NewFile,
         ToolbarAction::Del,
         ToolbarAction::Refresh,
         ToolbarAction::ToggleView,
@@ -1165,6 +1394,16 @@ fn draw_toolbar_icon(surface: &mut dyn Surface, action: ToolbarAction, x: u32, y
             gfx::fill_rect(surface, x + 2, y + 8, 12, 5, BG);
             gfx::fill_rect(surface, x + 11, y + 8, 3, 2, color);
             gfx::fill_rect(surface, x + 12, y + 7, 1, 4, color);
+        }
+        ToolbarAction::NewFile => {
+            // Document with a plus sign in the corner.
+            gfx::fill_rect(surface, x + 4, y, 8, 12, color);
+            gfx::fill_rect(surface, x + 5, y + 1, 6, 10, BG);
+            gfx::fill_rect(surface, x + 6, y + 3, 4, 1, color);
+            gfx::fill_rect(surface, x + 6, y + 6, 4, 1, color);
+            gfx::fill_rect(surface, x + 6, y + 9, 4, 1, color);
+            gfx::fill_rect(surface, x + 11, y + 4, 4, 6, color);
+            gfx::fill_rect(surface, x + 12, y + 3, 2, 8, color);
         }
         ToolbarAction::Del => {
             gfx::fill_rect(surface, x + 2, y, 12, 2, color);
