@@ -358,7 +358,14 @@ impl Process {
     /// `&mut self` already via `task::with_current_process_mut`).
     fn translate_local(&self, vaddr: u64, len: u64) -> Option<u64> {
         let end = vaddr.checked_add(len)?;
-        let mapping = self.mappings.iter().find(|m| m.vaddr <= vaddr && end <= m.vaddr + m.len)?;
+        // Newest mapping wins: `map_range_in` overwrites page-table entries,
+        // so later `mmap(MAP_FIXED)` calls shadow earlier ones — and the VMA
+        // list is push-ordered. A first-match search here returns a stale
+        // (shadowed) mapping's phys instead of the one the CPU actually
+        // resolves through (ld.so maps a whole shared object span first,
+        // then remaps each PT_LOAD on top — first-match broke every
+        // kernel-side relocation write to libc's .dynamic/.got).
+        let mapping = self.mappings.iter().rev().find(|m| m.vaddr <= vaddr && end <= m.vaddr + m.len)?;
         Some(mapping.phys + (vaddr - mapping.vaddr))
     }
 
@@ -875,7 +882,20 @@ fn build_address_space(process: &mut Process) -> Result<u64, &'static str> {
                     continue;
                 }
                 if pde & (1 << 7) != 0 {
-                    *pd_ptr.add(j) = pde; // 2 MiB page: copy verbatim
+                    // 2 MiB page: copy verbatim — but strip the USER bit.
+                    // The kernel's identity map covers the whole 4 GiB,
+                    // including the kernel's own page-table frames at
+                    // ~3 MiB and the kernel heap at 64 MiB; leaving USER
+                    // set lets ring-3 code write over the kernel's page
+                    // tables (that is exactly how the Phase 6 GOT.plt
+                    // fault happened: user code clobbered the kernel PD
+                    // entry for 0x401d3000, and the corrupted copy was
+                    // then inherited by every spawned process). User
+                    // mappings replace these 2 MiB entries with their
+                    // own 4 KiB page tables (map_range_in splits them,
+                    // re-adding USER), so stripping it here costs
+                    // nothing.
+                    *pd_ptr.add(j) = pde & !paging::PAGE_USER;
                 } else {
                     // 4 KiB page table: deep copy it.
                     let pt = alloc_frame(process)?;
@@ -1398,7 +1418,9 @@ pub fn read_result(pid: usize) -> Option<u64> {
 pub fn translate(pid: usize, vaddr: u64, len: u64) -> Option<u64> {
     let end = vaddr.checked_add(len)?;
     let mappings = task::process_mappings(pid)?;
-    let mapping = mappings.iter().find(|m| m.vaddr <= vaddr && end <= m.vaddr + m.len)?;
+    // Newest mapping wins — see `translate_local`; first-match would
+    // resolve shadowed (pre-MAP_FIXED) VMAs to the wrong physical frames.
+    let mapping = mappings.iter().rev().find(|m| m.vaddr <= vaddr && end <= m.vaddr + m.len)?;
     Some(mapping.phys + (vaddr - mapping.vaddr))
 }
 
