@@ -109,7 +109,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "netinfo", "netudp", "nettcp", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
+    "tasks", "netinfo", "netudp", "nettcp", "wget", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
 ];
 
 pub fn run() -> ! {
@@ -311,6 +311,7 @@ pub fn execute(line: &str) {
         "netinfo" => cmd_netinfo(),
         "netudp" => cmd_netudp(&args),
         "nettcp" => cmd_nettcp(&args),
+        "wget" => cmd_wget(&args),
         "ls" => cmd_ls(&args),
         "cat" => cmd_cat(&args),
         "fatinfo" => cmd_fatinfo(),
@@ -622,12 +623,61 @@ fn cmd_nettcp(args: &[&str]) {
         "hello from MachaOS".to_string()
     };
     let mut reply = [0u8; 2048];
-    match crate::net::tcp_request(crate::net::GATEWAY_IP, port, msg.as_bytes(), &mut reply, 300) {
+    match crate::net::tcp_request(crate::net::GATEWAY_IP, port, msg.as_bytes(), &mut reply, 300, true) {
         Ok(n) => {
             let text = core::str::from_utf8(&reply[..n]).unwrap_or("<binary>");
             println!("tcp echo ({} bytes): {}", n, text);
         }
         Err(e) => println!("tcp echo failed: {}", e),
+    }
+}
+
+/// Downloads `http://host[:port]/path` and saves it under the user's
+/// Downloads folder: `wget <url>`. Host may be an IP or a DNS name.
+fn cmd_wget(args: &[&str]) {
+    let Some(url) = args.first() else {
+        println!("usage: wget <http://host[:port]/path>");
+        return;
+    };
+    let rest = url.strip_prefix("http://").unwrap_or(url);
+    let (host_port, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match host_port.find(':') {
+        Some(i) => (&host_port[..i], host_port[i + 1..].parse::<u16>().unwrap_or(80)),
+        None => (host_port, 80),
+    };
+    let ip = if let Some(ip) = crate::net::parse_ip(host) {
+        ip
+    } else {
+        match crate::net::dns_lookup(host, 300) {
+            Some(ip) => {
+                println!("resolved {} -> {}.{}.{}.{}", host, ip[0], ip[1], ip[2], ip[3]);
+                ip
+            }
+            None => {
+                println!("cannot resolve {}", host);
+                return;
+            }
+        }
+    };
+    let mut buffer = vec![0u8; 64 * 1024];
+    match crate::net::http_get(ip, port, path, &mut buffer, 300) {
+        Ok(n) => {
+            let body = crate::net::http_body(&buffer[..n]);
+            if body.is_empty() {
+                println!("empty response from {}{}", host_port, path);
+                return;
+            }
+            let name = path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("index.html");
+            let dest = format!("/users/macha/Downloads/{}", name);
+            match fat::write_file(&dest, body) {
+                Ok(()) => println!("saved {} ({} bytes) to {}", name, body.len(), dest),
+                Err(e) => println!("save failed: {}", e),
+            }
+        }
+        Err(e) => println!("wget failed: {}", e),
     }
 }
 
@@ -1658,6 +1708,7 @@ pub fn selftest() -> ! {
                 b"tcp ping from MachaOS",
                 &mut treply,
                 300,
+                true,
             ) {
                 Ok(n) => {
                     let text = core::str::from_utf8(&treply[..n]).unwrap_or("<binary>");
@@ -1668,6 +1719,33 @@ pub fn selftest() -> ! {
                     }
                 }
                 Err(e) => selftest_fail(&format!("TCP echo failed: {}", e)),
+            }
+            // DNS via the user-net forwarder (10.0.2.3): the host
+            // resolver answers "localhost" with 127.0.0.1.
+            match crate::net::dns_lookup("localhost", 300) {
+                Some(ip) if ip == [127, 0, 0, 1] => {
+                    println!("[OK] DNS resolved localhost -> 127.0.0.1");
+                }
+                Some(ip) => selftest_fail(&format!(
+                    "DNS resolved localhost to {}.{}.{}.{}",
+                    ip[0], ip[1], ip[2], ip[3]
+                )),
+                None => selftest_fail("DNS query for localhost timed out"),
+            }
+            // HTTP GET from the host's test server (tools/echo_server.py
+            // serves target/ on port 8000; the fixture is written by
+            // `make test`).
+            let mut http_buf = [0u8; 4096];
+            match crate::net::http_get([10, 0, 2, 2], 8000, "/http-fixture.txt", &mut http_buf, 300) {
+                Ok(n) => {
+                    let body = crate::net::http_body(&http_buf[..n]);
+                    if body == b"MachaOS http fixture 1234567890\n" {
+                        println!("[OK] HTTP GET round trip ({} bytes)", body.len());
+                    } else {
+                        selftest_fail("HTTP GET returned wrong body");
+                    }
+                }
+                Err(e) => selftest_fail(&format!("HTTP GET failed: {}", e)),
             }
         }
         Err(e) => selftest_fail(&format!("e1000 init failed: {}", e)),

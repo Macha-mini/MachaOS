@@ -117,7 +117,8 @@ test: GRUB_CFG=boot/grub/grub-selftest.cfg
 test: iso disk
 	@rm -f $(TEST_LOG) $(TEST_LOG).pid
 	@echo "== running MachaOS selftest in QEMU =="
-	@python3 tools/echo_server.py >/dev/null 2>&1 & echo $$! > $(TEST_LOG).pid
+	@printf 'MachaOS http fixture 1234567890\n' > target/http-fixture.txt
+	@python3 tools/echo_server.py target >/dev/null 2>&1 & echo $$! > $(TEST_LOG).pid
 	@$(QEMU) -m 4G -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
 		$(NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 &
 	@for i in $$(seq 1 60); do \

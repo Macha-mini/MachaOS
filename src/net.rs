@@ -269,12 +269,18 @@ fn parse_tcp(payload: &[u8]) -> Option<TcpSegment> {
 /// send `request`, read the response into `reply`, and close. Returns
 /// the number of reply bytes received. No retransmission, no window
 /// scaling — fine for a local slirp link.
+///
+/// When `fin_when_echoed` is true, the client sends its FIN as soon as
+/// it has received `request.len()` bytes (echo-server semantics — the
+/// server only closes after seeing EOF). When false, it waits for the
+/// server to close the connection (HTTP/1.0 semantics).
 pub fn tcp_request(
     ip: [u8; 4],
     port: u16,
     request: &[u8],
     reply: &mut [u8],
     timeout_ticks: u64,
+    fin_when_echoed: bool,
 ) -> Result<usize, &'static str> {
     const SRC_PORT: u16 = 7777;
     let dst_mac = resolve(ip, ARP_TIMEOUT_TICKS).ok_or("ARP failed")?;
@@ -363,7 +369,7 @@ pub fn tcp_request(
                     // Response complete (echo semantics: the reply is as
                     // long as the request): close our side; the server
                     // sees EOF, closes, and FINs back.
-                    if got >= request.len() && !we_finned {
+                    if fin_when_echoed && got >= request.len() && !we_finned {
                         we_finned = true;
                         seg = build_tcp(
                             SRC_PORT,
@@ -443,6 +449,154 @@ fn send_tcp(dst_mac: &[u8; 6], dst_ip: [u8; 4], seg: &[u8]) -> Result<(), &'stat
     ip[10..12].copy_from_slice(&csum.to_be_bytes());
     frame[34..].copy_from_slice(seg);
     crate::e1000::send(&frame)
+}
+
+// ---------------------------------------------------------------------
+// DNS
+// ---------------------------------------------------------------------
+
+/// QEMU user-net's built-in DNS forwarder.
+pub const DNS_IP: [u8; 4] = [10, 0, 2, 3];
+
+/// Resolves `name` to an IPv4 address via the user-net DNS forwarder.
+pub fn dns_lookup(name: &str, timeout_ticks: u64) -> Option<[u8; 4]> {
+    const SRC_PORT: u16 = 5353;
+    let mut query = Vec::with_capacity(64);
+    query.extend_from_slice(&0xBEEFu16.to_be_bytes()); // transaction id
+    query.extend_from_slice(&0x0100u16.to_be_bytes()); // flags: RD
+    query.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    query.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    query.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    query.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    for label in name.split('.') {
+        if label.len() > 63 {
+            return None;
+        }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&1u16.to_be_bytes()); // QTYPE: A
+    query.extend_from_slice(&1u16.to_be_bytes()); // QCLASS: IN
+    send_udp(DNS_IP, 53, SRC_PORT, &query).ok()?;
+
+    let deadline = crate::interrupts::ticks() + timeout_ticks;
+    loop {
+        if let Some(pkt) = poll_udp(SRC_PORT) {
+            if pkt.src_port == 53 {
+                return parse_dns_a(&pkt.payload);
+            }
+        }
+        if crate::interrupts::ticks() >= deadline {
+            return None;
+        }
+        crate::interrupts::halt();
+    }
+}
+
+/// Extracts the first A record from a DNS reply.
+fn parse_dns_a(reply: &[u8]) -> Option<[u8; 4]> {
+    if reply.len() < 12 {
+        return None;
+    }
+    let ancount = u16::from_be_bytes([reply[6], reply[7]]);
+    if ancount == 0 {
+        return None;
+    }
+    let mut pos = 12usize;
+    // Skip the question section (name + qtype + qclass).
+    loop {
+        let len = *reply.get(pos)?;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            pos += 1; // compression pointer
+            break;
+        }
+        pos += len as usize;
+    }
+    pos += 4;
+    // Walk answers looking for an A record.
+    for _ in 0..ancount {
+        loop {
+            let len = *reply.get(pos)?;
+            pos += 1;
+            if len == 0 {
+                break;
+            }
+            if len & 0xC0 == 0xC0 {
+                pos += 1;
+                break;
+            }
+            pos += len as usize;
+        }
+        if pos + 10 > reply.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([reply[pos], reply[pos + 1]]);
+        pos += 2; // type
+        pos += 2; // class
+        pos += 4; // ttl
+        let rdlen = u16::from_be_bytes([reply[pos], reply[pos + 1]]) as usize;
+        pos += 2;
+        if rtype == 1 && rdlen == 4 && pos + 4 <= reply.len() {
+            return Some([reply[pos], reply[pos + 1], reply[pos + 2], reply[pos + 3]]);
+        }
+        pos += rdlen;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------
+
+/// Sends an HTTP/1.0 GET for `path` to `ip:port` and returns the raw
+/// response (headers + body) in `reply`.
+pub fn http_get(
+    ip: [u8; 4],
+    port: u16,
+    path: &str,
+    reply: &mut [u8],
+    timeout_ticks: u64,
+) -> Result<usize, &'static str> {
+    let mut request = Vec::with_capacity(128);
+    request.extend_from_slice(b"GET ");
+    request.extend_from_slice(path.as_bytes());
+    request.extend_from_slice(b" HTTP/1.0\r\nHost: ");
+    let mut ipbuf = [0u8; 16];
+    request.extend_from_slice(crate::io::sprint(
+        &mut ipbuf,
+        format_args!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+    ).as_bytes());
+    request.extend_from_slice(b"\r\n\r\n");
+    // HTTP/1.0: the server closes the connection after the response.
+    tcp_request(ip, port, &request, reply, timeout_ticks, false)
+}
+
+/// Splits an HTTP response into its body (everything after the header
+/// terminator).
+pub fn http_body(response: &[u8]) -> &[u8] {
+    response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| &response[i + 4..])
+        .unwrap_or(response)
+}
+
+/// Parses a dotted-quad string into an IPv4 address.
+pub fn parse_ip(s: &str) -> Option<[u8; 4]> {
+    let mut parts = s.split('.');
+    let mut out = [0u8; 4];
+    for byte in out.iter_mut() {
+        *byte = parts.next()?.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------
