@@ -1483,19 +1483,29 @@ impl WindowManager {
             for (i, window) in self.windows.iter_mut().enumerate() {
                 if window.open && !window.minimized {
                     // The file explorer re-renders on cursor moves so
-                    // its hover highlights follow the mouse.
+                    // its hover highlights follow the mouse. The cursor
+                    // position is clamped to a sentinel when it's
+                    // outside the window's content area, so moving the
+                    // mouse elsewhere on the desktop doesn't re-render
+                    // the whole 700x440 buffer on every event.
                     if let AppKind::FileExplorer(app) = &mut window.kind {
-                        app.render_hover(
+                        let (lx, ly) = content_cursor(
                             self.cursor_x - window.x,
                             self.cursor_y - window.y - TITLE_BAR_HEIGHT as i32,
+                            app.width(),
+                            app.height(),
                         );
+                        app.render_hover(lx, ly);
                     }
                     // Settings app also re-renders on cursor moves for hover.
                     if let AppKind::Settings(app) = &mut window.kind {
-                        app.render_hover(
+                        let (lx, ly) = content_cursor(
                             self.cursor_x - window.x,
                             self.cursor_y - window.y - TITLE_BAR_HEIGHT as i32,
+                            app.width(),
+                            app.height(),
                         );
+                        app.render_hover(lx, ly);
                     }
                     // Paint app re-renders on mouse moves for drawing.
                     if let AppKind::Paint(app) = &mut window.kind {
@@ -1651,6 +1661,17 @@ impl WindowManager {
             gfx::draw_string(surface, bg_x, y + (TASKBAR_HEIGHT - font::glyph_h() as u32) / 2, &bg, 0x00_86C77B, None);
             gfx::fill_rect(surface, bg_x - 9, y + 6, 1, TASKBAR_HEIGHT - 12, TB_DIVIDER);
         }
+    }
+}
+
+/// Content-local cursor coordinates for hover-rendering apps, clamped
+/// to a sentinel outside the app's buffer so a window whose cursor is
+/// elsewhere doesn't re-render its whole buffer on every mouse event.
+fn content_cursor(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
+    if x >= 0 && y >= 0 && (x as u32) < w && (y as u32) < h {
+        (x, y)
+    } else {
+        (i32::MAX, i32::MAX)
     }
 }
 
