@@ -162,6 +162,15 @@ pub struct FileExplorer {
     pending_delete: Option<(usize, u64)>,
     // Inline rename-in-progress (`F2`); `None` when not renaming.
     rename: Option<RenameState>,
+    // Extra selected indices beyond `selection` (the primary), and the
+    // anchor for Shift+click range selection.
+    multi: Vec<usize>,
+    anchor: usize,
+    // Incremental name search (Ctrl+F): while on, typed characters
+    // build `search` and the first entry whose name starts with it is
+    // selected.
+    search_mode: bool,
+    search: String,
     status: String,
     free_bytes: u64,
     sidebar: Vec<SidebarEntry>,
@@ -289,6 +298,10 @@ impl FileExplorer {
             last_click_was_double: false,
             pending_delete: None,
             rename: None,
+            multi: Vec::new(),
+            anchor: 0,
+            search_mode: false,
+            search: String::new(),
             status: String::new(),
             free_bytes: 0,
             sidebar: Vec::new(),
@@ -461,6 +474,7 @@ impl FileExplorer {
         if self.selection >= self.entries.len() {
             self.selection = 0;
         }
+        self.multi.retain(|&i| i < self.entries.len());
         self.scroll = self.scroll.min(self.entries.len().saturating_sub(self.visible_items()));
         self.free_bytes = fat::info()
             .map(|info| info.free_clusters as u64 * info.sectors_per_cluster as u64 * 512)
@@ -475,6 +489,10 @@ impl FileExplorer {
         self.scroll = 0;
         self.pending_delete = None;
         self.rename = None;
+        self.multi.clear();
+        self.anchor = 0;
+        self.search_mode = false;
+        self.search.clear();
         self.status = String::new();
         self.refresh();
     }
@@ -489,8 +507,25 @@ impl FileExplorer {
             self.selection.saturating_add(delta as usize).min(self.entries.len() - 1)
         };
         self.selection = new;
+        self.multi.clear();
+        self.anchor = new;
         self.ensure_selection_visible();
         self.render();
+    }
+
+    /// Whether `index` is part of the current selection (primary or
+    /// multi-selected).
+    fn is_selected(&self, index: usize) -> bool {
+        index == self.selection || self.multi.contains(&index)
+    }
+
+    /// All selected indices: the primary plus the multi extras, sorted.
+    fn selected_indices(&self) -> Vec<usize> {
+        let mut v = vec![self.selection];
+        v.extend(self.multi.iter().copied());
+        v.sort_unstable();
+        v.dedup();
+        v
     }
 
     fn open_selected(&mut self) -> Option<FsAction> {
@@ -541,41 +576,47 @@ impl FileExplorer {
     /// area) rather than physically erasing it; the trash can restore
     /// it later. Inside the trash itself, Delete physically erases.
     fn delete_selected(&mut self) {
-        let Some(entry) = self.entries.get(self.selection).cloned() else {
+        let names: Vec<String> = self
+            .selected_indices()
+            .iter()
+            .filter_map(|&i| self.entries.get(i).map(|e| e.name.clone()))
+            .collect();
+        if names.is_empty() {
             return;
-        };
+        }
         let now = interrupts::ticks();
         if let Some((arm_sel, arm_tick)) = self.pending_delete {
             if arm_sel == self.selection && now.saturating_sub(arm_tick) <= DELETE_ARM_TICKS {
-                let path = join(&self.path, &entry.name);
                 self.pending_delete = None;
-                let result: Result<(), &'static str> = if self.in_trash() {
-                    fat::remove(&path).map_err(|_| "remove failed")
-                } else {
-                    crate::trash::trash_file(&path).map(|_| ())
-                };
-                match result {
-                    Ok(()) => {
-                        self.status = if self.in_trash() {
-                            format!("permanently deleted {}", entry.name)
-                        } else {
-                            format!("moved {} to trash", entry.name)
-                        };
-                        self.refresh();
-                    }
-                    Err(e) => {
-                        self.status = format!("delete failed: {}", e);
-                        self.render();
+                let mut failed = false;
+                for name in &names {
+                    let path = join(&self.path, name);
+                    let result: Result<(), &'static str> = if self.in_trash() {
+                        fat::remove(&path).map_err(|_| "remove failed")
+                    } else {
+                        crate::trash::trash_file(&path).map(|_| ())
+                    };
+                    if result.is_err() {
+                        failed = true;
                     }
                 }
+                self.status = if failed {
+                    "delete failed (some entries)".to_string()
+                } else if self.in_trash() {
+                    format!("permanently deleted {} items", names.len())
+                } else {
+                    format!("moved {} items to trash", names.len())
+                };
+                self.multi.clear();
+                self.refresh();
                 return;
             }
         }
         self.pending_delete = Some((self.selection, now));
         let prompt = if self.in_trash() {
-            format!("permanently delete {}? press Del again to confirm", entry.name)
+            format!("permanently delete {} items? press Del again to confirm", names.len())
         } else {
-            format!("move {} to trash? press Del again to confirm", entry.name)
+            format!("move {} items to trash? press Del again to confirm", names.len())
         };
         self.status = prompt;
         self.render();
@@ -904,13 +945,44 @@ impl FileExplorer {
             self.pending_delete = None;
             return None;
         }
-        let is_double = self.last_click_item == item && now.saturating_sub(self.last_click_ticks) <= DOUBLE_CLICK_TICKS;
+        let ctrl = keyboard::ctrl_down();
+        let shift = keyboard::shift_down();
+        if ctrl {
+            // Toggle this item in the multi-selection; the primary
+            // stays put as the action anchor.
+            if item == self.selection {
+                // Ctrl+click on the primary keeps it selected.
+            } else if let Some(pos) = self.multi.iter().position(|&i| i == item) {
+                self.multi.remove(pos);
+            } else {
+                self.multi.push(item);
+            }
+        } else if shift {
+            // Range from the anchor to this item.
+            let (lo, hi) = if self.anchor <= item {
+                (self.anchor, item)
+            } else {
+                (item, self.anchor)
+            };
+            self.multi.clear();
+            self.multi.extend(lo..=hi);
+            self.multi.retain(|&i| i != item);
+            self.selection = item;
+        } else {
+            self.multi.clear();
+            self.selection = item;
+            self.anchor = item;
+        }
+        self.ensure_selection_visible();
+        self.pending_delete = None;
+        // Modifier clicks never double-open.
+        let is_double = !ctrl
+            && !shift
+            && self.last_click_item == item
+            && now.saturating_sub(self.last_click_ticks) <= DOUBLE_CLICK_TICKS;
         self.last_click_was_double = is_double;
         self.last_click_item = item;
         self.last_click_ticks = now;
-        self.selection = item;
-        self.ensure_selection_visible();
-        self.pending_delete = None;
         if is_double {
             self.open_selected()
         } else {
@@ -958,6 +1030,29 @@ impl FileExplorer {
             self.rename_key(event);
             return None;
         }
+        // While searching, every key feeds the search string.
+        if self.search_mode {
+            match event {
+                keyboard::Event::Char(c) => {
+                    if self.search.len() < 64 {
+                        self.search.push(c);
+                    }
+                    self.jump_to_match();
+                }
+                keyboard::Event::Backspace => {
+                    self.search.pop();
+                    self.jump_to_match();
+                }
+                keyboard::Event::Enter => self.jump_to_match(),
+                keyboard::Event::Escape => {
+                    self.search_mode = false;
+                    self.status = String::new();
+                }
+                _ => {}
+            }
+            self.render();
+            return None;
+        }
         match event {
             keyboard::Event::Up => self.move_selection(-1),
             keyboard::Event::Down => self.move_selection(1),
@@ -981,10 +1076,45 @@ impl FileExplorer {
             keyboard::Event::Char('n') => self.create_folder(),
             keyboard::Event::Char('f') => self.create_file(),
             keyboard::Event::Char('v') => self.toggle_view(),
+            keyboard::Event::Ctrl('f') => {
+                self.search_mode = true;
+                self.status = "検索モード: 名前の一部を入力 / Esc で終了".to_string();
+            }
+            keyboard::Event::Escape => {
+                self.search_mode = false;
+                self.search.clear();
+                self.status = String::new();
+            }
             keyboard::Event::F2 => self.start_rename(),
             _ => {}
         }
         None
+    }
+
+    /// Selects the first entry whose name starts with `search`
+    /// (case-insensitive), searching forward from the current selection
+    /// with wrap-around.
+    fn jump_to_match(&mut self) {
+        let needle = self.search.to_lowercase();
+        let n = self.entries.len();
+        if needle.is_empty() || n == 0 {
+            return;
+        }
+        let start = self.selection.min(n - 1);
+        for offset in 0..n {
+            let index = (start + offset) % n;
+            let matched = self.entries[index].name.to_lowercase().starts_with(&needle);
+            if matched {
+                let name = self.entries[index].name.clone();
+                self.selection = index;
+                self.multi.clear();
+                self.anchor = index;
+                self.ensure_selection_visible();
+                self.status = format!("検索: {} — {}", self.search, name);
+                return;
+            }
+        }
+        self.status = format!("見つかりません: {}", self.search);
     }
 
     /// Selects the entry under a content-local point, used by the
@@ -993,6 +1123,8 @@ impl FileExplorer {
     pub fn select_at(&mut self, x: i32, y: i32) {
         if let Some(item) = self.item_at(x, y) {
             self.selection = item;
+            self.multi.clear();
+            self.anchor = item;
             self.ensure_selection_visible();
             self.render();
         }
@@ -1171,7 +1303,7 @@ impl FileExplorer {
             };
             let (name, is_dir, size) = (entry.name.clone(), entry.is_dir, entry.size);
             let ry = LIST_Y + HEADER_H + r as u32 * ROW_H;
-            let selected = index == self.selection;
+            let selected = self.is_selected(index);
             let hovered = cy >= ry as i32 && cy < (ry + ROW_H) as i32 && cx >= SIDEBAR_W as i32;
             if selected {
                 gfx::fill_rounded_rect_gradient_v(self, SIDEBAR_W + 2, ry + 1, LIST_W - 4, ROW_H - 2, 4, SELECTED_TOP, SELECTED_BOTTOM);
@@ -1221,7 +1353,7 @@ impl FileExplorer {
                 let (name, is_dir) = (entry.name.clone(), entry.is_dir);
                 let tx = SIDEBAR_W + c as u32 * GRID_TILE_W;
                 let ty = LIST_Y + r as u32 * GRID_TILE_H;
-                let selected = index == self.selection;
+                let selected = self.is_selected(index);
                 let hovered = cx >= tx as i32 && cx < (tx + GRID_TILE_W) as i32 && cy >= ty as i32 && cy < (ty + GRID_TILE_H) as i32;
                 if selected {
                     gfx::fill_rounded_rect(self, tx + 4, ty + 3, GRID_TILE_W - 8, GRID_TILE_H - 8, 6, 0x00_24467A);
@@ -1323,7 +1455,9 @@ impl FileExplorer {
     fn render_status(&mut self) {
         gfx::fill_rect(self, 0, HEIGHT - STATUS_H, WIDTH, STATUS_H, STATUS_BG);
         gfx::fill_rect(self, 0, HEIGHT - STATUS_H - 1, WIDTH, 1, 0x00_0E141B);
-        let status = if self.status.is_empty() {
+        let status = if self.search_mode {
+            format!("検索: {}|", self.search)
+        } else if self.status.is_empty() {
             format!("{} items", self.entries.len())
         } else {
             self.status.clone()

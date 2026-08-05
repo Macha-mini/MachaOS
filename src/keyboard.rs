@@ -187,6 +187,16 @@ pub fn next_event() -> Option<Event> {
     QUEUE.lock().pop()
 }
 
+/// Whether a Ctrl key is currently held (multi-select gestures).
+pub fn ctrl_down() -> bool {
+    CTRL_DOWN.load(Ordering::Relaxed)
+}
+
+/// Whether a Shift key is currently held (range selection).
+pub fn shift_down() -> bool {
+    SHIFT_DOWN.load(Ordering::Relaxed)
+}
+
 pub fn drain_buffer() {
     unsafe {
         while port::inb(0x64) & 1 != 0 {
