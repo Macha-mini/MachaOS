@@ -1118,7 +1118,7 @@ impl FileExplorer {
             View::Details => "Icons",
             View::Grid => "List",
         };
-        let lx = bx + (bw - (label.len() as u32 * font::glyph_w() as u32)) / 2;
+        let lx = bx + (bw - gfx::text_width(label)) / 2;
         gfx::draw_string(self, lx, PATH_H + 9, label, TEXT, None);
     }
 
@@ -1195,11 +1195,11 @@ impl FileExplorer {
             gfx::draw_string(self, SIDEBAR_W + 26, ry + 5, &name, name_color, None);
             if !is_dir {
                 let size = fmt_size(size as u64);
-                let sw = (size.len() * font::glyph_w()) as u32;
+                let sw = gfx::text_width(&size);
                 gfx::draw_string(self, sx.1 - sw - 10, ry + 5, &size, size_color, None);
             }
             let kind = if is_dir { "Folder" } else { file_type(&name) };
-            let kw = (kind.len() * font::glyph_w()) as u32;
+            let kw = gfx::text_width(kind);
             let kx = tx.0 + 8;
             if kx + kw <= tx.1 {
                 gfx::draw_string(self, kx, ry + 5, kind, if selected { 0x00_C9DAE8 } else { TEXT_DIM }, None);
@@ -1234,7 +1234,9 @@ impl FileExplorer {
                 }
                 draw_big_icon(self, tx + (GRID_TILE_W - 36) / 2, ty + 6, &name, is_dir);
                 // Label, centered and truncated to the tile width.
-                let max_chars = ((GRID_TILE_W - 10) / font::glyph_w() as u32) as usize;
+                // Truncate against the widest possible glyph (Japanese)
+                // so tiles never overflow.
+                let max_chars = ((GRID_TILE_W - 10) / font::char_width('あ')) as usize;
                 let label = if name.chars().count() > max_chars {
                     let mut s: String = name.chars().take(max_chars - 2).collect();
                     s.push_str("..");
@@ -1242,7 +1244,7 @@ impl FileExplorer {
                 } else {
                     name
                 };
-                let lw = (label.len() * font::glyph_w()) as u32;
+                let lw = gfx::text_width(&label);
                 let lx = tx + (GRID_TILE_W - lw) / 2;
                 let color = if selected {
                     0x00_FFFFFF

@@ -18,6 +18,13 @@ pub struct Console {
     fg: u32,
     bg: u32,
     buffer: Vec<u32>,
+    // UTF-8 sequence being accumulated by `write_byte` (multi-byte
+    // Japanese chars arrive as separate byte writes from the shell).
+    pending: [u8; 3],
+    pending_len: u8,
+    // Cells (1 or 2) occupied by the most recently written char; the
+    // backspace handler needs it to know how far to step back.
+    last_width: u8,
 }
 
 impl Console {
@@ -32,6 +39,9 @@ impl Console {
             fg,
             bg,
             buffer: vec![bg; width * height],
+            pending: [0u8; 3],
+            pending_len: 0,
+            last_width: 1,
         }
     }
 
@@ -76,46 +86,99 @@ impl Console {
         self.buffer = vec![self.bg; width * height];
     }
 
-    pub fn write_byte(&mut self, byte: u8) {
-        match byte {
-            b'\n' => {
+    /// Writes one character (ASCII or Japanese) at the current cursor,
+    /// handling newline/CR/backspace/tab, cell wrapping for wide glyphs,
+    /// and scrolling. The console is a text-cell grid: an 8x8 ASCII
+    /// glyph fills one cell, a 16x16 Japanese glyph fills two.
+    pub fn write_char(&mut self, c: char) {
+        match c {
+            '\n' => {
                 self.row += 1;
                 self.col = 0;
                 if self.row >= self.rows {
                     self.scroll();
                 }
             }
-            b'\r' => self.col = 0,
-            0x08 => {
-                if self.col > 0 {
-                    self.col -= 1;
+            '\r' => self.col = 0,
+            '\u{8}' => {
+                let w = self.last_width as usize;
+                if self.col >= w {
+                    self.col -= w;
                 } else if self.row > 0 {
                     // Undo the line wrap: back up onto the end of the
                     // previous row rather than getting stuck at col 0.
                     self.row -= 1;
-                    self.col = self.cols - 1;
+                    self.col = self.cols.saturating_sub(w);
                 } else {
                     return;
                 }
-                self.draw_cell(self.col, self.row, b' ');
-            }
-            b'\t' => {
-                let n = 4 - (self.col % 4);
-                for _ in 0..n {
-                    self.write_byte(b' ');
+                for i in 0..w {
+                    self.draw_cell(self.col + i, self.row, b' ');
                 }
             }
-            byte => {
-                if self.col >= self.cols {
+            '\t' => {
+                let n = 4 - (self.col % 4);
+                for _ in 0..n {
+                    self.write_char(' ');
+                }
+            }
+            c => {
+                let cells = if c.is_ascii() { 1 } else { 2 };
+                if self.col + cells > self.cols {
                     self.row += 1;
                     self.col = 0;
                     if self.row >= self.rows {
                         self.scroll();
                     }
                 }
-                self.draw_cell(self.col, self.row, byte);
-                self.col += 1;
+                if c.is_ascii() {
+                    self.draw_cell(self.col, self.row, c as u8);
+                } else {
+                    let x = (self.col * font::glyph_w()) as u32;
+                    let y = (self.row * font::glyph_h()) as u32;
+                    let fg = self.fg;
+                    let bg = self.bg;
+                    gfx::draw_cp(self, x, y, c, fg, Some(bg));
+                }
+                self.col += cells;
+                self.last_width = cells as u8;
             }
+        }
+    }
+
+    /// Writes one byte, transparently reassembling multi-byte UTF-8
+    /// sequences (the shell feeds `print!` output one byte at a time
+    /// through this path).
+    pub fn write_byte(&mut self, byte: u8) {
+        if byte < 0x80 {
+            self.write_char(byte as char);
+            return;
+        }
+        if byte & 0xC0 == 0x80 && self.pending_len > 0 {
+            // Continuation byte of an in-progress sequence.
+            self.pending[self.pending_len as usize] = byte;
+            self.pending_len += 1;
+            let total = utf8_len(self.pending[0]);
+            if self.pending_len as usize == total {
+                let cp = decode_utf8(&self.pending, total);
+                self.write_char(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                self.pending_len = 0;
+            }
+        } else if byte & 0xC0 != 0x80 {
+            // Lead byte. 4-byte (astral) sequences aren't in the
+            // embedded font, so render a placeholder instead.
+            self.pending_len = 0;
+            let total = utf8_len(byte);
+            if total == 2 || total == 3 {
+                self.pending[0] = byte;
+                self.pending_len = 1;
+            } else {
+                self.write_char('\u{FFFD}');
+            }
+        } else {
+            // Stray continuation byte.
+            self.pending_len = 0;
+            self.write_char('\u{FFFD}');
         }
     }
 
@@ -184,9 +247,34 @@ impl Surface for Console {
 
 impl fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            self.write_byte(byte);
+        for c in s.chars() {
+            self.write_char(c);
         }
         Ok(())
+    }
+}
+
+/// Byte length of the UTF-8 sequence a lead byte announces.
+fn utf8_len(lead: u8) -> usize {
+    if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Decodes a 2- or 3-byte UTF-8 sequence (BMP only — that's all the
+/// embedded font covers).
+fn decode_utf8(b: &[u8], len: usize) -> u32 {
+    match len {
+        2 => (((b[0] & 0x1F) as u32) << 6) | ((b[1] & 0x3F) as u32),
+        3 => {
+            (((b[0] & 0x0F) as u32) << 12)
+                | (((b[1] & 0x3F) as u32) << 6)
+                | ((b[2] & 0x3F) as u32)
+        }
+        _ => 0xFFFD,
     }
 }

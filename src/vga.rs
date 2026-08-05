@@ -123,7 +123,9 @@ impl Writer {
                 }
                 let idx = self.row * WIDTH + self.col;
                 self.buffer()[idx] = ScreenChar {
-                    ch: byte,
+                    // VGA text mode has no Japanese glyphs; show a
+                    // placeholder so multi-byte text doesn't smear.
+                    ch: if byte < 0x80 { byte } else { b'?' },
                     color: self.current_color,
                 };
                 self.col += 1;

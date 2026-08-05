@@ -2163,13 +2163,15 @@ fn editor_render(
     gfx::fill_rect(console, 0, sy, cw, font::glyph_h() as u32, EDITOR_STATUS_BG);
     gfx::draw_string(console, sx, sy, status, EDITOR_STATUS_FG, None);
     let visible = (cursor_row.saturating_sub(*scroll_offset)).min(doc_rows.saturating_sub(1));
-    let cx = (cursor_col * font::glyph_w()) as u32;
+    // Pixel x of the cursor: sum the advance of every char before it
+    // (Japanese glyphs are double-width).
+    let cx: u32 = lines[cursor_row].chars().take(cursor_col).map(font::char_width).sum();
     let cy = (visible * font::glyph_h()) as u32;
     gfx::fill_rect(console, cx, cy, font::glyph_w() as u32, font::glyph_h() as u32, EDITOR_CURSOR_COLOR);
 }
 
 fn taskbar_label_width(title: &str) -> i32 {
-    (icon_size(16) + 6 + title.len() as u32 * font::glyph_w() as u32 + 20) as i32
+    (icon_size(16) + 6 + gfx::text_width(title) + 20) as i32
 }
 
 /// An app-tile size that grows a little with the font scale.

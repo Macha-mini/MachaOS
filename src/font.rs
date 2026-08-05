@@ -176,3 +176,60 @@ pub fn glyph(byte: u8) -> &'static [u8; 8] {
         &FONT8X8_BASIC[0]
     }
 }
+
+/// Horizontal advance in pixels for `c` at the current font scale: one
+/// 8x8 cell for ASCII, two cells (16x16) for Japanese glyphs, one cell
+/// as a fallback for anything not in the embedded Japanese subset.
+pub fn char_width(c: char) -> u32 {
+    if c.is_ascii() {
+        glyph_w() as u32
+    } else if crate::jp_font::glyph(c as u32).is_some() {
+        16 * scale() as u32
+    } else {
+        glyph_w() as u32
+    }
+}
+
+/// Draws `c` at (`x`, `y`) and returns its pixel advance. ASCII uses the
+/// 8x8 font scaled by `scale()`; Japanese/wide codepoints use the 16x16
+/// Japanese font (also scaled). Unknown codepoints render as a hollow
+/// box so missing glyphs are visible rather than silently blank.
+pub fn draw_cp(
+    surface: &mut dyn crate::gfx::Surface,
+    x: u32,
+    y: u32,
+    c: char,
+    fg: u32,
+    bg: Option<u32>,
+) -> u32 {
+    let s = scale() as u32;
+    if c.is_ascii() {
+        crate::gfx::draw_char(surface, x, y, c as u8, fg, bg);
+        return glyph_w() as u32;
+    }
+    let Some(g) = crate::jp_font::glyph(c as u32) else {
+        let w = 16 * s;
+        crate::gfx::fill_rect(surface, x, y, w, w, fg);
+        return w;
+    };
+    for row in 0..16u32 {
+        let bits = ((g[(row * 2) as usize] as u16) << 8) | g[(row * 2 + 1) as usize] as u16;
+        for col in 0..16u32 {
+            let set = bits & (1 << (15 - col)) != 0;
+            if set {
+                if s == 1 {
+                    surface.put_pixel(x + col, y + row, fg);
+                } else {
+                    crate::gfx::fill_rect(surface, x + col * s, y + row * s, s, s, fg);
+                }
+            } else if let Some(bg) = bg {
+                if s == 1 {
+                    surface.put_pixel(x + col, y + row, bg);
+                } else {
+                    crate::gfx::fill_rect(surface, x + col * s, y + row * s, s, s, bg);
+                }
+            }
+        }
+    }
+    16 * s
+}

@@ -359,12 +359,23 @@ pub fn draw_char(surface: &mut dyn Surface, x: u32, y: u32, ch: u8, fg: u32, bg:
     }
 }
 
+/// Draws `c` (ASCII or Japanese) at (`x`, `y`); returns the pixel
+/// advance. See `font::draw_cp`.
+pub fn draw_cp(surface: &mut dyn Surface, x: u32, y: u32, c: char, fg: u32, bg: Option<u32>) -> u32 {
+    font::draw_cp(surface, x, y, c, fg, bg)
+}
+
 pub fn draw_string(surface: &mut dyn Surface, x: u32, y: u32, s: &str, fg: u32, bg: Option<u32>) {
     let mut cursor_x = x;
-    for byte in s.bytes() {
-        draw_char(surface, cursor_x, y, byte, fg, bg);
-        cursor_x += font::glyph_w() as u32;
+    for c in s.chars() {
+        cursor_x += font::draw_cp(surface, cursor_x, y, c, fg, bg);
     }
+}
+
+/// Pixel width of `s` at the current font scale. Char-aware: Japanese
+/// glyphs count double-width, so label sizing matches `draw_string`.
+pub fn text_width(s: &str) -> u32 {
+    s.chars().map(font::char_width).sum()
 }
 
 /// Copies a `src_w`x`src_h` pixel buffer onto `surface` at (`dst_x`, `dst_y`).

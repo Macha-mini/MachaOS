@@ -24,6 +24,7 @@ mod interrupts;
 #[macro_use]
 mod io;
 mod isr_table;
+mod jp_font;
 mod keyboard;
 mod linux_abi;
 mod mouse;

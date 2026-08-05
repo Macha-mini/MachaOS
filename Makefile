@@ -27,6 +27,7 @@ all: build
 
 gen:
 	python3 tools/gen_isr.py
+	python3 tools/gen_jp_font.py
 
 # Builds the freestanding user-program ELFs (user/) and copies them to
 # target/ where the kernel embeds them at compile time.

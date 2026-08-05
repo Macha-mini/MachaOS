@@ -755,7 +755,10 @@ fn assemble_lfn(parts: &[Vec<u16>]) -> String {
             if c == 0x0000 || c == 0xFFFF {
                 break 'outer;
             }
-            name.push(if c < 0x80 { c as u8 as char } else { '?' });
+            // LFN stores UTF-16 code units; BMP chars (kana, kanji,
+            // fullwidth forms) map straight to chars. Surrogates
+            // (astral chars) aren't in the embedded font anyway.
+            name.push(char::from_u32(c as u32).unwrap_or('?'));
         }
     }
     name
