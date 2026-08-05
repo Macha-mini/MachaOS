@@ -64,8 +64,8 @@ wallpaper: $(WALLPAPER)
 
 disk: wallpaper
 	@test -n "$$(command -v mkfs.fat)" || (echo "dosfstools (mkfs.fat) is required: brew install dosfstools"; exit 1)
-	dd if=/dev/zero of=$(DISK) bs=1m count=64 2>/dev/null
-	mkfs.fat -F 32 $(DISK)
+	dd if=/dev/zero of=$(DISK) bs=1m count=256 2>/dev/null
+	mkfs.fat -F 32 -s 8 $(DISK)
 	printf 'hello from the host\n' > target/fixture.txt
 	printf 'welcome to MachaOS\n' > target/fixture2.txt
 	mmd -i $(DISK) ::/bin
