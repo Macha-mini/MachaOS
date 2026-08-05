@@ -53,6 +53,32 @@ pub enum SeekFrom {
 pub struct Stat {
     pub size: u64,
     pub is_dir: bool,
+    /// Synthetic inode number — this filesystem has no real inode
+    /// concept, but a real `ld.so` needs *some* stable, distinct
+    /// per-path value here: it dedups a shared library it's about to
+    /// load against every already-loaded map by comparing `(st_dev,
+    /// st_ino)`, and every file reporting the same (previously always
+    /// zero) pair made every open file look like the same one —
+    /// `libc.so.6` collided with the main executable's own already-
+    /// loaded map, so `ld.so` reused *that* instead of ever mapping
+    /// `libc.so.6`'s real segments. A path hash is enough: it only needs
+    /// to be stable and distinct per path within one boot, not globally
+    /// unique or persistent, since nothing here ever compares it against
+    /// a previous session's value.
+    pub ino: u64,
+}
+
+/// FNV-1a over the normalized path — see `Stat::ino`'s doc comment for
+/// why this exists. Never returns 0 (a few real-world callers, and this
+/// kernel's own `st_ino == 0` bug this replaces, treat that as "no
+/// inode"/invalid).
+fn path_hash(path: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in path.bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+    }
+    if hash == 0 { 1 } else { hash }
 }
 
 pub const O_WRONLY: u32 = 1 << 0;
@@ -158,6 +184,7 @@ impl FileHandle {
         Stat {
             size: self.data.len() as u64,
             is_dir: self.is_dir,
+            ino: path_hash(&self.path),
         }
     }
 

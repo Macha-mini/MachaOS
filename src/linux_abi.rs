@@ -88,54 +88,74 @@
 //! - A real dynamically-linked glibc binary (tested against GNU Hello,
 //!   real coreutils `true`/`cat`, and a real `ld.so`/`libc.so.6` pair —
 //!   see `shell.rs`'s selftest hook) still doesn't run to completion, but
-//!   Phase 6's register-preservation fix (above) got much further than
-//!   before: the crash during `ld.so`'s TLS/rseq setup is gone, and
-//!   `ld.so` now genuinely reaches real symbol resolution against
-//!   `libc.so.6` — confirmed by disassembling `ld.so` around the old
-//!   fault site (`llvm-objdump`) and cross-checking against a real
-//!   Debian bookworm libc6 (2.36) package, whose `libc.so.6` was
-//!   verified (via `strings`) to actually contain a `GLIBC_2.34` version
-//!   definition. What's left is a *different*, earlier bug: `ld.so`
-//!   still never calls `mmap` on the fd it opens for `libc.so.6` (traced
-//!   directly — every `mmap` call during the whole run is anonymous,
-//!   `fd == -1`) despite successfully `openat`/`pread64`/`fstat`-ing it,
-//!   and ultimately reports `"hello: hello: no version information
-//!   available (required by hello)"` and `"undefined symbol:
-//!   __libc_start_main, version GLIBC_2.34"` — with the *program's own
-//!   name* in every position of that error, including where `libc.so.6`
-//!   itself should appear. That specific detail, cross-checked against
-//!   real glibc source (`elf/dl-version.c`'s `match_symbol` /
-//!   `_dl_check_map_versions`, `glibc-2.36` tag: the second `%s` there
-//!   is `DSO_FILENAME(map->l_name)` where `map` is `needed->l_real` —
-//!   `libc.so.6`'s own resolved `link_map`), means `libc.so.6`'s
-//!   `link_map` in `ld.so`'s own bookkeeping has `l_name` aliasing the
-//!   main executable's, and a null `DT_VERDEF` `l_info` entry — an
-//!   internal `ld.so` object-identity bug, not a straightforwardly-
-//!   missing syscall. `Process::brk`'s own implementation (the obvious
-//!   first suspect) looks sound on inspection. The more promising lead:
-//!   `ld.so`'s early bootstrap allocates small structures like
-//!   `struct link_map` through its own `__minimal_malloc`
-//!   (`elf/dl-minimal-malloc.c`), which bump-allocates out of *leftover
-//!   space in the last page of `ld.so`'s own data segment* (`&_end`
-//!   rounded up to a page) before ever falling back to a real
-//!   `mmap(MAP_ANONYMOUS)` — consistent with the trace showing no early
-//!   anonymous mmaps either. If that leftover-space computation or the
-//!   zero-fill of `ld.so`'s own BSS tail is subtly off, two of these
-//!   small allocations could alias without either side's `mmap` ever
-//!   being wrong. Worth checking directly next: dump the addresses
-//!   `__minimal_malloc` actually hands back (or, from this side,
-//!   whether `process::load_segments` zero-fills exactly the declared
-//!   `memsz` of `ld.so`'s own last segment, no more and no less) before
-//!   assuming the bug is elsewhere. Reproduced identically across three
-//!   independent real binaries (GNU Hello, coreutils `true`/`cat`),
-//!   ruling out a version-mismatched test fixture. Testing against real
-//!   binaries is exactly what found and fixed the AT_PHDR/`pread64`/
-//!   `AT_EMPTY_PATH`/stack-buffer/`access`(21)/register-preservation
-//!   bugs the rest of this file's history documents; this is the next
-//!   one, left for follow-up — consistent with the plan's own framing
-//!   of Phase 4/6 dynamic-linking
-//!   work as roadmap-level rigor rather than Phase 1/2's full-completion
-//!   bar.
+//!   two real bugs found and fixed this phase got it *substantially*
+//!   further than before:
+//!   1. The register-preservation fix above removed a crash during
+//!      `ld.so`'s TLS/rseq setup.
+//!   2. `st_dev`/`st_ino` were always `0` for every file (`fstat`/
+//!      `newfstatat` zeroed the whole `struct stat` and only ever filled
+//!      in `st_mode`/`st_size`/etc.) — `ld.so` dedups a shared library
+//!      it's about to load against every already-loaded map by comparing
+//!      `(st_dev, st_ino)`, and with every file reporting the same
+//!      (zero) pair, `libc.so.6` looked like the *same file* as the main
+//!      executable already sitting in `ld.so`'s loaded-map list — so
+//!      `ld.so` silently reused hello's own `link_map` instead of ever
+//!      mapping `libc.so.6`'s real segments (explaining, in hindsight,
+//!      the `"hello: hello: no version information available (required
+//!      by hello)"` output an earlier round of this investigation found:
+//!      the *library* name in that message really was hello's own).
+//!      Fixed by giving every open file a synthetic but stable, distinct
+//!      `st_ino` (a path hash — see `vfs::Stat::ino`'s doc comment) and a
+//!      fixed nonzero `st_dev` (there's only one filesystem here).
+//!
+//!   With both fixed, `ld.so` now does what it never did in any prior
+//!   session: it genuinely `mmap`s all four of `libc.so.6`'s real
+//!   `PT_LOAD` segments at the correct addresses with the correct
+//!   permissions (traced directly — reservation `mmap` picks a base via
+//!   this kernel's own bump allocator, then each segment lands at
+//!   `base + file-declared-offset` via `MAP_FIXED`, matching
+//!   `libc.so.6`'s real program headers exactly) and walks into real
+//!   `GNU_HASH`-based symbol table lookup for `hello`'s first undefined
+//!   symbol, `__libc_start_main` — further than this project has ever
+//!   gotten a real glibc binary.
+//!
+//!   It still doesn't complete: it now faults *inside* that symbol
+//!   lookup (disassembled — `llvm-objdump` — down to the exact
+//!   instruction, and cross-checked against real glibc source,
+//!   `elf/dl-lookup.c`'s `do_lookup_x`/`check_match`, `glibc-2.36` tag).
+//!   The faulting pointer is provably `libc.so.6`'s own real dynamic
+//!   symbol table base (`0x8a50`, confirmed against this exact
+//!   `libc.so.6`'s `.dynsym` section address) plus a plausible symbol
+//!   index times `sizeof(Elf64_Sym)` — i.e. `do_lookup_x`'s
+//!   `D_PTR(map, l_info[DT_SYMTAB])` computation, which real glibc
+//!   defines as `map->l_addr + <link-time symtab address>`, but *without
+//!   `l_addr` (`libc.so.6`'s real load bias, `0x40000000` — confirmed
+//!   correct at `mmap` time, from the segment addresses above) added* —
+//!   as if `map->l_addr` reads back `0` at the exact moment this
+//!   specific lookup runs, despite the same map's `GNU_HASH` bucket/
+//!   chain walk (which *did* need a correctly-biased pointer to find a
+//!   plausible symbol index at all) apparently working. A scan of
+//!   `ld.so`'s own data/BSS region turned up no stored copy of
+//!   `0x40000000` anywhere, arguing against "read from the wrong
+//!   struct" and toward "the assignment never ran for whatever
+//!   `link_map` this particular access reads." This is real glibc's own
+//!   (unmodified, stripped — no symbol table to set a named breakpoint
+//!   on) machine code, so further progress here most likely needs
+//!   interactive debugging (QEMU's own `-s`/gdbstub plus a GDB-remote-
+//!   capable debugger, e.g. `lldb`) to actually watch `do_lookup_x`'s
+//!   `map` argument rather than continuing to infer it from disassembly
+//!   and raw memory scans — a bigger investment than this round's
+//!   static-analysis approach, left as the concrete next step. Every
+//!   fault reproduces identically (same faulting instruction, same
+//!   unbiased pointer, same symbol) across three independent real
+//!   binaries (GNU Hello, coreutils `true`/`cat`), ruling out anything
+//!   fixture-specific. Testing against real binaries is exactly what
+//!   found and fixed the AT_PHDR/`pread64`/`AT_EMPTY_PATH`/stack-buffer/
+//!   `access`(21)/register-preservation/`st_dev`+`st_ino` bugs the rest
+//!   of this file's history documents; this is the next one, left for
+//!   follow-up — consistent with the plan's own framing of Phase 4/6
+//!   dynamic-linking work as roadmap-level rigor rather than Phase 1/2's
+//!   full-completion bar.
 //! - `socket`/`sendmsg`/`recvmsg` only support `AF_UNIX`/`SOCK_STREAM`,
 //!   don't expose `bind`/`listen`/`accept` at all (only `socket.rs`'s
 //!   Rust API does — `wayland.rs`'s compositor task is the only thing
@@ -501,17 +521,26 @@ const S_IFDIR: u32 = 0o040000;
 const S_IFCHR: u32 = 0o020000;
 const STAT_SIZE: u64 = 144; // sizeof(struct stat), x86_64 Linux
 
+/// Every file this kernel serves lives on the one FAT32 volume — real
+/// Linux uses `st_dev` to tell *which filesystem* an inode number is
+/// relative to, and since there's only ever one here, any fixed nonzero
+/// value is a faithful enough answer.
+const ST_DEV: u64 = 1;
+
 /// Writes a (mostly zeroed, minimally plausible) Linux `struct stat` to
-/// `buf_ptr`: only the fields a typical startup path or `ls`-like
-/// listing actually inspects (`st_mode`, `st_size`, `st_blksize`,
-/// `st_blocks`) are filled in; timestamps and ownership stay zero.
-fn write_stat(buf_ptr: u64, mode: u32, size: u64) -> u64 {
+/// `buf_ptr`: `st_dev`/`st_ino` (see their doc comments — `ld.so` uses
+/// these to dedup a shared library it's about to load against every
+/// already-loaded map), `st_mode`, `st_size`, `st_blksize`, `st_blocks`
+/// are filled in; timestamps and ownership stay zero.
+fn write_stat(buf_ptr: u64, mode: u32, size: u64, ino: u64) -> u64 {
     let Some(phys) = resolve(buf_ptr, STAT_SIZE) else {
         return err(EFAULT);
     };
     unsafe {
         let p = phys as *mut u8;
         core::ptr::write_bytes(p, 0, STAT_SIZE as usize);
+        core::ptr::write_unaligned(p as *mut u64, ST_DEV); // st_dev
+        core::ptr::write_unaligned(p.add(8) as *mut u64, ino); // st_ino
         core::ptr::write_unaligned(p.add(16) as *mut u64, 1); // st_nlink
         core::ptr::write_unaligned(p.add(24) as *mut u32, mode); // st_mode
         core::ptr::write_unaligned(p.add(48) as *mut u64, size); // st_size
@@ -525,20 +554,20 @@ const S_IFSOCK: u32 = 0o140000;
 
 fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     if fd < 3 {
-        return write_stat(statbuf, S_IFCHR | 0o666, 0);
+        return write_stat(statbuf, S_IFCHR | 0o666, 0, 0);
     }
     let result = with_process(|p| match p.fd_mut(fd as usize) {
         Some(FdEntry::File(h)) => {
             let st = h.stat();
             let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
-            Some((mode, st.size))
+            Some((mode, st.size, st.ino))
         }
-        Some(FdEntry::Shm(id, _)) => Some((S_IFREG | 0o600, shm::size_of(*id).unwrap_or(0) as u64)),
-        Some(FdEntry::Socket(_)) => Some((S_IFSOCK | 0o777, 0)),
+        Some(FdEntry::Shm(id, _)) => Some((S_IFREG | 0o600, shm::size_of(*id).unwrap_or(0) as u64, *id as u64 + 1)),
+        Some(FdEntry::Socket(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
         None => None,
     });
     match result {
-        Some(Some((mode, size))) => write_stat(statbuf, mode, size),
+        Some(Some((mode, size, ino))) => write_stat(statbuf, mode, size, ino),
         _ => err(EBADF),
     }
 }
@@ -564,7 +593,7 @@ fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> u64 {
         Ok(h) => {
             let st = h.stat();
             let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
-            write_stat(statbuf, mode, st.size)
+            write_stat(statbuf, mode, st.size, st.ino)
         }
         Err(e) => vfs_err(e),
     }

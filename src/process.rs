@@ -1319,12 +1319,12 @@ pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
     let rip = frame.rip;
     redirect_to_exit(frame);
 
-    let mut buf = [0u8; 160];
+    let mut buf = [0u8; 200];
     let message = io::sprint(
         &mut buf,
         format_args!(
-            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x}, r8={:#x})\n",
-            cr2, frame.error_code, rip, frame.r8
+            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x}, r8={:#x}, r9={:#x}, rdi={:#x}, rsi={:#x})\n",
+            cr2, frame.error_code, rip, frame.r8, frame.r9, frame.rdi, frame.rsi
         ),
     );
     io::exception_print(message);
