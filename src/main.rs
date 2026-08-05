@@ -34,6 +34,7 @@ mod pic;
 mod pit;
 mod pmm;
 mod port;
+mod power;
 mod process;
 mod rtc;
 mod serial;

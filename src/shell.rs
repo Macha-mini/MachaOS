@@ -705,13 +705,11 @@ fn cmd_mousetest() {
 }
 
 fn reboot() -> ! {
-    unsafe { port::outb(0x64, 0xFE) } // 8042 reset
-    interrupts::halt_forever()
+    crate::power::reboot(&crate::settings::Settings::load())
 }
 
 fn power_off() -> ! {
-    unsafe { port::outb(0xF4, 0) } // QEMU isa-debug-exit
-    interrupts::halt_forever()
+    crate::power::shutdown(&crate::settings::Settings::load())
 }
 
 fn crash() -> ! {

@@ -342,6 +342,10 @@ enum ContextAction {
     Launch(LauncherAction),
     /// Reload settings from disk (desktop "Refresh").
     ReloadSettings,
+    /// Persist the desktop session and settings, then power off.
+    Shutdown,
+    /// Persist the desktop session and settings, then reboot.
+    Restart,
 }
 
 pub struct WindowManager {
@@ -1352,6 +1356,8 @@ impl WindowManager {
                 ContextItem { label: "Calculator", action: ContextAction::Launch(LauncherAction::Calculator) },
                 ContextItem { label: "Settings", action: ContextAction::Launch(LauncherAction::Settings) },
                 ContextItem { label: "Refresh", action: ContextAction::ReloadSettings },
+                ContextItem { label: "Shutdown", action: ContextAction::Shutdown },
+                ContextItem { label: "Restart", action: ContextAction::Restart },
             ],
         };
 
@@ -1423,6 +1429,16 @@ impl WindowManager {
             }
             ContextAction::ReloadSettings => {
                 self.settings = Settings::load();
+            }
+            ContextAction::Shutdown => {
+                // Persist the desktop session and settings, then hand
+                // the machine to the power-off path (never returns).
+                self.persist_session();
+                crate::power::shutdown(&self.settings)
+            }
+            ContextAction::Restart => {
+                self.persist_session();
+                crate::power::reboot(&self.settings)
             }
         }
     }
