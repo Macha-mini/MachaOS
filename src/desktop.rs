@@ -36,7 +36,14 @@ pub fn run() -> ! {
             dirty = true;
         }
         if dirty || manager.clock_tick_due() {
-            manager.composite();
+            if manager.dragging_window() {
+                // While a window is being dragged only its region
+                // changes, so composite just that instead of the whole
+                // desktop (the drag frame rate is the bottleneck).
+                manager.composite_drag();
+            } else {
+                manager.composite();
+            }
         } else if cursor_only {
             manager.composite_cursor_only();
         }

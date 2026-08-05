@@ -297,7 +297,25 @@ struct DragState {
     window_index: usize,
     offset_x: i32,
     offset_y: i32,
+    // Window position as of the last drag composite, so the partial
+    // composite knows where to erase before drawing the new position.
+    last_x: i32,
+    last_y: i32,
 }
+
+/// Pixels of the desktop (with the dragged window absent) captured at
+/// the drag's start, covering the window's rect plus its shadow. Each
+/// drag frame restores this over the window's previous position.
+struct DragBg {
+    w: u32,
+    h: u32,
+    pixels: Vec<u32>,
+}
+
+/// How far the window drop shadow extends past the window rect (the
+/// shadow routine reaches x+w+9 / y+h+9); used to size the drag
+/// snapshot and present regions.
+const SHADOW_MARGIN: i32 = 12;
 
 struct ResizeState {
     window_index: usize,
@@ -386,6 +404,9 @@ pub struct WindowManager {
     // cursor-only frame can erase the old cursor by restoring this
     // region and draw the cursor at its new position.
     cursor_save: Option<(i32, i32, Vec<u32>)>,
+    // Desktop-without-the-dragged-window snapshot for the partial
+    // composite path; `Some` only while `dragging` is active.
+    drag_bg: Option<DragBg>,
     // Right-click context menu popup, `None` when closed.
     context_menu: Option<ContextMenu>,
     // Previous right-button state, for press/release edge detection.
@@ -420,6 +441,7 @@ impl WindowManager {
             settings: Settings::load(),
             clock_cache: (u64::MAX, String::new()),
             cursor_save: None,
+            drag_bg: None,
             context_menu: None,
             right_was_down: false,
         };
@@ -1667,7 +1689,12 @@ impl WindowManager {
                     window_index: focused_index,
                     offset_x: self.cursor_x - wx2,
                     offset_y: self.cursor_y - wy2,
+                    last_x: wx2,
+                    last_y: wy2,
                 });
+                // Snapshot the desktop under the window so drag frames
+                // can erase its previous position cheaply.
+                self.begin_window_drag();
                 return;
             }
             let in_content = self.cursor_x >= wx
@@ -1732,23 +1759,13 @@ impl WindowManager {
         }
     }
 
-    pub fn composite(&mut self) {
-        // Refresh the taskbar clock cache when the displayed second
-        // changes. CMOS RTC reads are slow port I/O, so this runs at
-        // most once per second, not on every composite (mouse moves
-        // trigger composites constantly).
-        let secs = interrupts::ticks() / 100;
-        if secs != self.clock_cache.0 {
-            self.clock_cache.0 = secs;
-            let now = crate::rtc::now();
-            self.clock_cache.1 = format!(
-                "{:02}:{:02}  up {:02}:{:02}",
-                now.hour,
-                now.minute,
-                secs / 60,
-                secs % 60
-            );
-        }
+    /// Redraws the whole desktop into the virtual back buffer: wallpaper
+    /// or gradient, every open (non-minimized) window — except `skip`,
+    /// used while dragging so the region under the dragged window can be
+    /// snapshotted as a clean background — then the taskbar, launcher,
+    /// context menu, and file-drag tag. Does not draw the cursor or
+    /// push anything to the physical framebuffer.
+    fn redraw_desktop(&mut self, skip: Option<usize>) {
         fb::with_surface(|surface| {
             // Use wallpaper only if settings enable it and it's available.
             if self.settings.wallpaper {
@@ -1761,6 +1778,9 @@ impl WindowManager {
                 gfx::fill_rect_gradient_v(surface, 0, 0, self.screen_w, self.screen_h, DESKTOP_BG_TOP, DESKTOP_BG_BOTTOM);
             }
             for (i, window) in self.windows.iter_mut().enumerate() {
+                if Some(i) == skip {
+                    continue;
+                }
                 if window.open && !window.minimized {
                     // The file explorer re-renders on cursor moves so
                     // its hover highlights follow the mouse. The cursor
@@ -1809,6 +1829,26 @@ impl WindowManager {
                 draw_file_drag_tag(surface, self.cursor_x, self.cursor_y, &drag.path, drag.is_dir);
             }
         });
+    }
+
+    pub fn composite(&mut self) {
+        // Refresh the taskbar clock cache when the displayed second
+        // changes. CMOS RTC reads are slow port I/O, so this runs at
+        // most once per second, not on every composite (mouse moves
+        // trigger composites constantly).
+        let secs = interrupts::ticks() / 100;
+        if secs != self.clock_cache.0 {
+            self.clock_cache.0 = secs;
+            let now = crate::rtc::now();
+            self.clock_cache.1 = format!(
+                "{:02}:{:02}  up {:02}:{:02}",
+                now.hour,
+                now.minute,
+                secs / 60,
+                secs % 60
+            );
+        }
+        self.redraw_desktop(None);
         // Snapshot the region under the cursor *before* drawing it, so a
         // later cursor-only frame can erase it by restoring this region.
         self.cursor_save = Some((self.cursor_x, self.cursor_y, fb::snapshot_region(
@@ -1821,6 +1861,85 @@ impl WindowManager {
             draw_cursor(surface, self.cursor_x, self.cursor_y);
         });
         fb::present();
+    }
+
+    /// Whether a window drag is in progress (the desktop loop switches
+    /// to `composite_drag` for the duration).
+    pub fn dragging_window(&self) -> bool {
+        self.dragging.is_some()
+    }
+
+    /// Called when a window drag begins: redraws the desktop without
+    /// the dragged window and snapshots its region, so every drag frame
+    /// can erase the window's previous position by restoring this
+    /// background.
+    fn begin_window_drag(&mut self) {
+        let Some(idx) = self.dragging.as_ref().map(|d| d.window_index) else {
+            return;
+        };
+        self.redraw_desktop(Some(idx));
+        let (cw, ch) = self.windows[idx].content_size();
+        let total_h = TITLE_BAR_HEIGHT + ch;
+        let m = SHADOW_MARGIN as u32;
+        let sx = (self.windows[idx].x - SHADOW_MARGIN).max(0) as u32;
+        let sy = (self.windows[idx].y - SHADOW_MARGIN).max(0) as u32;
+        let sw = cw + 2 * m;
+        let sh = total_h + 2 * m;
+        let pixels = fb::snapshot_region(sx, sy, sw, sh);
+        self.drag_bg = Some(DragBg { w: sw, h: sh, pixels });
+        fb::with_surface(|surface| {
+            draw_window(surface, &self.windows[idx], idx == self.focused, self.cursor_x, self.cursor_y);
+            draw_cursor(surface, self.cursor_x, self.cursor_y);
+        });
+        fb::present();
+    }
+
+    /// Partial composite while a window is being dragged: erase the
+    /// window's previous position from the back buffer (restoring the
+    /// desktop-without-it snapshot), draw it at its new position, and
+    /// push only the union of the old and new regions — instead of
+    /// recompositing the whole desktop on every mouse move.
+    pub fn composite_drag(&mut self) {
+        let Some((idx, last_x, last_y)) = self
+            .dragging
+            .as_ref()
+            .map(|d| (d.window_index, d.last_x, d.last_y))
+        else {
+            return self.composite();
+        };
+        let Some(bg) = self.drag_bg.as_ref() else {
+            return self.composite();
+        };
+        let (wx, wy) = (self.windows[idx].x, self.windows[idx].y);
+        let m = SHADOW_MARGIN;
+        if (wx, wy) != (last_x, last_y) {
+            fb::restore_region(
+                (last_x - m).max(0) as u32,
+                (last_y - m).max(0) as u32,
+                bg.w,
+                bg.h,
+                &bg.pixels,
+            );
+        }
+        fb::with_surface(|surface| {
+            draw_window(surface, &self.windows[idx], idx == self.focused, self.cursor_x, self.cursor_y);
+            draw_cursor(surface, self.cursor_x, self.cursor_y);
+        });
+        // Union of the old and new window areas (plus shadow margin),
+        // clamped to the screen.
+        let min_x = ((last_x - m).min(wx - m)).max(0) as u32;
+        let min_y = ((last_y - m).min(wy - m)).max(0) as u32;
+        let max_x = ((last_x + bg.w as i32 - m)
+            .max(wx + bg.w as i32 - m))
+            .min(self.screen_w as i32) as u32;
+        let max_y = ((last_y + bg.h as i32 - m)
+            .max(wy + bg.h as i32 - m))
+            .min(self.screen_h as i32) as u32;
+        if let Some(d) = self.dragging.as_mut() {
+            d.last_x = wx;
+            d.last_y = wy;
+        }
+        fb::present_region(min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y));
     }
 
     /// Cheap path for a pure cursor move: erase the old cursor by
