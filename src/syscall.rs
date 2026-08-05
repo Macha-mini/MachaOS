@@ -81,6 +81,15 @@ static mut SYSCALL_STACK: [u8; SYSCALL_STACK_SIZE] = [0; SYSCALL_STACK_SIZE];
 static mut SYSCALL_KERNEL_RSP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut SAVED_USER_RSP: u64 = 0;
+/// Set by `.Lsyscall_exit` when the exiting syscall was `exit_group`
+/// (231) rather than plain `exit` (60) — the thread exit stub uses it to
+/// decide whether to take the whole process down too.
+#[unsafe(no_mangle)]
+static mut EXIT_GROUP_FLAG: u64 = 0;
+
+pub fn exit_group_flag() -> bool {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(EXIT_GROUP_FLAG)) != 0 }
+}
 
 unsafe extern "C" {
     fn syscall_entry();
@@ -116,6 +125,55 @@ extern "C" fn is_exit_syscall(num: u64) -> u64 {
     exit as u64
 }
 
+/// Asm bridge: is `num` fork(57), vfork(58) or clone(56)? Those need the
+/// child to resume with the parent's full register state, so the asm
+/// routes them to `sys_forkish` instead of the generic dispatch.
+#[unsafe(no_mangle)]
+extern "C" fn is_forkish_syscall(num: u64) -> u64 {
+    match num {
+        crate::linux_abi::SYS_CLONE | crate::linux_abi::SYS_FORK | crate::linux_abi::SYS_VFORK => num,
+        _ => 0,
+    }
+}
+
+/// Programs the asm's scratch syscall-stack pointer for the incoming
+/// task (see `task::switch_to_next`): syscalls run on the task's own
+/// kernel stack so a blocking syscall's saved context is per-task.
+pub(crate) fn set_syscall_kernel_rsp(rsp: u64) {
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(SYSCALL_KERNEL_RSP), rsp);
+    }
+}
+
+/// Handles fork/vfork/clone from the asm special path. `block` points at
+/// 15 saved qwords. The asm's `sub rsp, 48` region holds the callee-saved
+/// registers: [0..6] = r15 r14 r13 r12 rbp rbx. The 9 qwords pushed at
+/// syscall entry sit above it, **in memory order** (the stack grows down,
+/// so the last-pushed value is at the lowest address):
+/// [6]=r9, [7]=r8, [8]=r10, [9]=rdx, [10]=rsi, [11]=rdi, [12]=num,
+/// [13]=r11 (user rflags), [14]=rcx (user rip). The user rsp is read from
+/// `SAVED_USER_RSP`. Creates the child task and returns its pid.
+#[unsafe(no_mangle)]
+extern "C" fn sys_forkish(num: u64, block: *const u64) -> u64 {
+    let read = |i: usize| unsafe { core::ptr::read(block.add(i)) };
+    // Reorder the stored [r15 r14 r13 r12 rbp rbx] into the frame order
+    // context_switch pops: [rbx rbp r12 r13 r14 r15].
+    let callee_saved = [read(5), read(4), read(3), read(2), read(1), read(0)];
+    let user_rip = read(14);
+    let user_rflags = read(13);
+    let a1 = read(11);
+    let a2 = read(10);
+    let a3 = read(9);
+    let a4 = read(8);
+    let a5 = read(7);
+    let a6 = read(6);
+    let user_rsp = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SAVED_USER_RSP)) };
+    crate::process::handle_forkish(
+        num, user_rip, user_rflags, user_rsp, a1, a2, a3, a4, a5, a6, callee_saved,
+    )
+    .unwrap_or(u64::MAX)
+}
+
 global_asm!(
     r#"
 .section .text
@@ -128,6 +186,38 @@ syscall_entry:
     mov rsp, [rip + SYSCALL_KERNEL_RSP]
     push rcx
     push r11
+    # Whether `rax` (the syscall number) means "exit" depends on the
+    # calling process's ABI (`is_exit_syscall` — native SYS_EXIT is 1;
+    # Linux's is 60/231, since Linux syscall 1 is `write`), so this can't
+    # be a bare immediate compare the way it used to be. Preserve every
+    # argument register across the call (an ordinary C function, free to
+    # clobber all of them) since we still need them after, whichever way
+    # it decides.
+    push rax
+    push rdi
+    push rsi
+    push rdx
+    push r10
+    push r8
+    push r9
+    # Phase 7: fork/clone/vfork need the child to resume with the *full*
+    # user register state, so take them out of the generic dispatch path
+    # before anything clobbers the values on the stack. (is_forkish is a
+    # C call — it clobbers the caller-saved regs, but every user value we
+    # need is saved on the stack: [rsp+0]=rcx, [rsp+8]=r11, [rsp+16]=rax,
+    # [rsp+24..64]=rdi rsi rdx r10 r8 r9. rbx/rbp/r12-r15 survive as
+    # callee-saved and still hold the user's originals.)
+    mov rdi, rax
+    call is_forkish_syscall
+    test rax, rax
+    jnz .Lsyscall_forkish
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
     # Whether `rax` (the syscall number) means "exit" depends on the
     # calling process's ABI (`is_exit_syscall` — native SYS_EXIT is 1;
     # Linux's is 60/231, since Linux syscall 1 is `write`), so this can't
@@ -218,6 +308,13 @@ syscall_entry:
     sysretq
 .Lsyscall_exit:
     sti
+    # rax still holds the syscall number here; remember whether it was
+    # exit_group (231) — the exit stub (thread_exit_self) needs to know
+    # whether to take the whole process down with the thread.
+    cmp rax, 231
+    sete al
+    movzx eax, al
+    mov [rip + EXIT_GROUP_FLAG], eax
     call ring3_load_return_rsp
     mov rsp, rax
     pop r15
@@ -227,6 +324,67 @@ syscall_entry:
     pop rbp
     pop rbx
     ret
+
+# Phase 7: fork/clone/vfork special path. Entry: rax = syscall number,
+# rsp = kernel stack; the 9 user qwords saved at syscall entry sit at
+# [rsp+0]=rcx (rip), [rsp+8]=r11 (rflags), [rsp+16]=num, [rsp+24..64]=
+# rdi rsi rdx r10 r8 r9. rbx/rbp/r12-r15 still hold the user's originals
+# (callee-saved through the C call). sys_forkish creates the child task
+# and returns the child's pid; the parent restores its user state and
+# sysretq's with the pid in rax. The child never returns here — it
+# resumes via `child_resume` on its own fabricated frame.
+.Lsyscall_forkish:
+    # Make room *below* the 9-qword block (the stack grows down) and
+    # store the callee-saved registers there — `push` would overwrite
+    # the user block above.
+    sub rsp, 48
+    mov [rsp + 0], r15
+    mov [rsp + 8], r14
+    mov [rsp + 16], r13
+    mov [rsp + 24], r12
+    mov [rsp + 32], rbp
+    mov [rsp + 40], rbx
+    mov rdi, rax            # syscall number
+    mov rsi, rsp            # pointer to the saved state block
+    call sys_forkish
+    # Parent path: rax = child pid. Restore user rcx/r11/rdi..r9 from the
+    # block (rax is deliberately not reloaded — it carries the pid).
+    # Block layout: [rsp+0..48]=r15 r14 r13 r12 rbp rbx, then the 9
+    # syscall-entry qwords in memory order: [rsp+48]=r9, [rsp+56]=r8,
+    # [rsp+64]=r10, [rsp+72]=rdx, [rsp+80]=rsi, [rsp+88]=rdi,
+    # [rsp+96]=num, [rsp+104]=r11, [rsp+112]=rcx.
+    mov rcx, [rsp + 112]
+    mov r11, [rsp + 104]
+    mov rdi, [rsp + 88]
+    mov rsi, [rsp + 80]
+    mov rdx, [rsp + 72]
+    mov r10, [rsp + 64]
+    mov r8,  [rsp + 56]
+    mov r9,  [rsp + 48]
+    add rsp, 120
+    mov rsp, [rip + SAVED_USER_RSP]
+    sysretq
+
+# Resume point for a fork/clone child. The child task's fabricated
+# kernel-stack frame (see task.rs spawn_child) is laid out so that after
+# context_switch pops the 6 callee-saved slots and `ret`s here, the
+# remaining qwords are: r9, r8, r10, rdx, rsi, rdi, rax, rcx (user rip),
+# r11 (user rflags), then the user rsp. sysretq then drops into ring 3
+# exactly where the parent's syscall returned, with rax = 0 (child).
+.global child_resume
+.type child_resume, @function
+child_resume:
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
+    pop rax
+    pop rcx
+    pop r11
+    pop rsp
+    sysretq
 
 .global enter_usermode
 .type enter_usermode, @function

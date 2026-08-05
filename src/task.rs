@@ -113,13 +113,38 @@ struct Task {
     // `Some` exactly for processes; carries the ELF entry, the frames
     // and mappings the process owns, and its exit state.
     process: Option<Process>,
+    // `Some(owner pid)` for a CLONE_VM thread: the task shares the
+    // owner's Process (address space + fd table) instead of owning one.
+    // Per-thread ring-3 state (user_rsp/fs_base/exited) lives in the
+    // fields below; everything else resolves through the owner.
+    thread_of: Option<usize>,
+    // Per-thread ring-3 stack pointer (the `stack` argument of clone(2)).
+    thread_user_rsp: u64,
+    // Per-thread TLS base (CLONE_SETTLS). See `scheduler_tick`'s
+    // save/restore of FS_BASE below.
+    fs_base: u64,
+    // CLONE_CHILD_CLEARTID target: on thread exit the kernel writes 0
+    // here and wakes the futex (what pthread_join waits on).
+    child_tid: Option<u64>,
+    // Set once a CLONE_VM thread has exited (its `process: None`, so
+    // `Task::is_exited` can't rely on the Process's state alone).
+    thread_exited: bool,
+    // `Some(futex address)` while the task is blocked in FUTEX_WAIT;
+    // the scheduler skips blocked tasks and `futex_wake` clears it.
+    block_key: Option<u64>,
 }
 
 impl Task {
     fn is_exited(&self) -> bool {
-        self.process
-            .as_ref()
-            .is_some_and(|process| process.is_exited())
+        self.thread_exited
+            || self
+                .process
+                .as_ref()
+                .is_some_and(|process| process.is_exited())
+    }
+
+    fn is_blocked(&self) -> bool {
+        self.block_key.is_some()
     }
 }
 
@@ -187,6 +212,12 @@ pub fn init() {
         kernel_stack_top: crate::gdt::boot_stack_top(),
         ring3_kernel_rsp: 0,
         process: None,
+        thread_of: None,
+        thread_user_rsp: 0,
+        fs_base: 0,
+        child_tid: None,
+        thread_exited: false,
+        block_key: None,
     });
     spawn(counter_task_0, "bg-0");
     spawn(counter_task_1, "bg-1");
@@ -246,6 +277,12 @@ fn push_task(entry: usize, name: &'static str, cr3: u64, process: Option<Process
         kernel_stack_top: stack_top as u64,
         ring3_kernel_rsp: 0,
         process,
+        thread_of: None,
+        thread_user_rsp: 0,
+        fs_base: 0,
+        child_tid: None,
+        thread_exited: false,
+        block_key: None,
     });
     let pid = tasks().len() - 1;
     interrupts::enable_interrupts();
@@ -262,47 +299,176 @@ pub fn scheduler_tick() {
     if interrupts::ticks() % QUANTUM_TICKS != 0 {
         return;
     }
+    switch_to_next()
+}
+
+/// Finds the next runnable task after `current` and switches to it,
+/// saving the outgoing task's context. Shared by `scheduler_tick`
+/// (quantum expiry, from the timer ISR) and `yield_blocked` (a blocking
+/// syscall — FUTEX_WAIT — switching away immediately with IF already
+/// cleared by SFMASK). Skips exited *and* blocked tasks.
+fn switch_to_next() {
     let tasks = tasks_mut();
     let count = tasks.len();
     if count < 2 {
         return;
     }
     let current = CURRENT.load(Ordering::Relaxed);
-    // Round-robin over the runnable tasks, skipping exited processes.
+    // Round-robin over the runnable tasks, skipping exited/blocked ones.
     let mut next = None;
     for step in 1..count {
         let candidate = (current + step) % count;
-        if !tasks[candidate].is_exited() {
+        if !tasks[candidate].is_exited() && !tasks[candidate].is_blocked() {
             next = Some(candidate);
             break;
         }
     }
     let Some(next) = next else { return }; // kernel tasks are always runnable
 
-    // FS_BASE (the Linux ABI's TLS base — see `process::Process::fs_base`'s
-    // doc comment) is a single CPU-global MSR, not part of what
+    // FS_BASE (the Linux ABI's TLS base — set via arch_prctl /
+    // CLONE_SETTLS) is a single CPU-global MSR, not part of what
     // `context_switch` itself saves/restores in callee-saved registers.
-    // Save the outgoing process's (a no-op — reads back whatever was last
-    // written — for one that never called arch_prctl) and restore the
-    // incoming one's before switching, or a second Linux process's TLS
-    // would silently clobber the first's the moment they're interleaved.
-    if let Some(process) = tasks[current].process.as_mut() {
-        process.fs_base = unsafe { crate::syscall::rdmsr(MSR_FS_BASE) };
-    }
+    // Save the outgoing task's and restore the incoming one's before
+    // switching, or a second task's TLS would silently clobber the
+    // first's the moment they're interleaved.
+    tasks[current].fs_base = unsafe { crate::syscall::rdmsr(MSR_FS_BASE) };
     CURRENT.store(next, Ordering::Relaxed);
-    if let Some(process) = tasks[next].process.as_ref() {
-        unsafe { crate::syscall::wrmsr(MSR_FS_BASE, process.fs_base) };
-    }
+    unsafe { crate::syscall::wrmsr(MSR_FS_BASE, tasks[next].fs_base) };
 
     if paging::read_cr3() != tasks[next].cr3 {
         paging::write_cr3(tasks[next].cr3);
     }
     crate::gdt::set_kernel_stack(tasks[next].kernel_stack_top - RING3_PARK_RESERVE);
+    // Syscalls run on the *task's own* kernel stack (below the parked
+    // ring-3 return chain — see RING3_PARK_RESERVE) instead of a shared
+    // global stack, so a blocking syscall's saved context points at this
+    // task's stack, not a scratch area another task's syscall would
+    // clobber. Program the asm's scratch global for the incoming task.
+    unsafe {
+        crate::syscall::set_syscall_kernel_rsp(tasks[next].kernel_stack_top - RING3_PARK_RESERVE);
+    }
     let new_rsp = tasks[next].context.rsp;
     let old_rsp_ptr = &mut tasks[current].context.rsp as *mut usize;
     unsafe {
         context_switch(old_rsp_ptr, new_rsp);
     }
+}
+
+/// Blocks the current task on `key` and switches away immediately; when
+/// `wake_all(key)` later marks it runnable, this returns and the caller
+/// (a FUTEX_WAIT handler) completes its syscall normally. Must be called
+/// with interrupts disabled (the whole syscall runs with IF cleared by
+/// SFMASK), from a syscall running on the task's own kernel stack.
+pub fn yield_blocked(key: u64) {
+    let tasks = tasks_mut();
+    let current = CURRENT.load(Ordering::Relaxed);
+    tasks[current].block_key = Some(key);
+    drop(tasks);
+    // Switch away without advancing the round-robin position beyond the
+    // next runnable task; when woken, resume here and return.
+    switch_to_next();
+    // Woken: clear the block marker and let the futex handler re-check.
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)].block_key = None;
+}
+
+/// Marks every task blocked on `key` runnable again (FUTEX_WAKE). Wakes
+/// up to `max` of them; returns how many were woken.
+pub fn wake_all(key: u64, max: usize) -> usize {
+    let tasks = tasks_mut();
+    let mut woken = 0;
+    for task in tasks.iter_mut() {
+        if woken >= max {
+            break;
+        }
+        if task.block_key == Some(key) {
+            task.block_key = None;
+            woken += 1;
+        }
+    }
+    woken
+}
+
+unsafe extern "C" {
+    fn child_resume();
+}
+
+/// Creates a child task that resumes in ring 3 at the parent's
+/// fork/clone syscall return point: `user_rip`/`user_rflags`/`user_rsp`
+/// plus the full register set captured at syscall entry, with `rax = 0`
+/// (the "I am the child" signal). The fabricated kernel-stack frame
+/// matches what `child_resume` (syscall.rs) pops: 6 callee-saved slots
+/// consumed by `context_switch` itself, then r9..rdi, rax, rcx, r11, rsp
+/// — see the frame layout below. A second fabricated chain below the
+/// frame is what the child's own `exit` syscall unwinds to (the same
+/// shape `enter_usermode` parks for a normally-spawned process):
+/// `exit_stub` is `process::exit_self` for a fork child or
+/// `process::thread_exit_self` for a CLONE_VM thread.
+pub fn spawn_child(
+    name: &'static str,
+    cr3: u64,
+    thread_of: Option<usize>,
+    process: Option<Process>,
+    user_rip: u64,
+    user_rflags: u64,
+    user_rsp: u64,
+    user_args: [u64; 6], // rdi rsi rdx r10 r8 r9
+    callee_saved: [u64; 6], // rbx rbp r12 r13 r14 r15
+    fs_base: u64,
+    child_tid: Option<u64>,
+    exit_stub: usize,
+) -> usize {
+    let mut stack = alloc::vec![0u8; STACK_SIZE];
+    let stack_top = stack.as_mut_ptr() as usize + STACK_SIZE;
+    // Exit chain (below the resume frame, higher addresses): 6 slots
+    // `.Lsyscall_exit` pops into r15..rbx, then the stub it `ret`s to.
+    let chain = stack_top - 56 - 8;
+    unsafe {
+        let chain_p = chain as *mut usize;
+        for i in 0..6 {
+            *chain_p.add(i) = 0;
+        }
+        *chain_p.add(6) = exit_stub;
+    }
+    // Resume frame: [rbx rbp r12 r13 r14 r15] [child_resume] [r9 r8 r10
+    // rdx rsi rdi] [0] [rcx=rip] [r11=rflags] [rsp].
+    let frame = chain - 136;
+    unsafe {
+        let f = frame as *mut usize;
+        for (i, &v) in callee_saved.iter().enumerate() {
+            *f.add(i) = v as usize;
+        }
+        *f.add(6) = child_resume as usize;
+        *f.add(7) = user_args[5] as usize; // r9
+        *f.add(8) = user_args[4] as usize; // r8
+        *f.add(9) = user_args[3] as usize; // r10
+        *f.add(10) = user_args[2] as usize; // rdx
+        *f.add(11) = user_args[1] as usize; // rsi
+        *f.add(12) = user_args[0] as usize; // rdi
+        *f.add(13) = 0; // rax = 0 (child)
+        *f.add(14) = user_rip as usize; // rcx
+        *f.add(15) = user_rflags as usize; // r11
+        *f.add(16) = user_rsp as usize; // rsp
+    }
+    let kernel_stack_top = stack_top as u64;
+    interrupts::disable_interrupts();
+    tasks_mut().push(Task {
+        context: Context { rsp: frame },
+        _stack: Some(stack),
+        name,
+        cr3,
+        kernel_stack_top,
+        ring3_kernel_rsp: chain as u64,
+        process,
+        thread_of,
+        thread_user_rsp: user_rsp,
+        fs_base,
+        child_tid,
+        thread_exited: false,
+        block_key: None,
+    });
+    let pid = tasks().len() - 1;
+    interrupts::enable_interrupts();
+    pid
 }
 
 pub fn task_count() -> usize {
@@ -342,43 +508,82 @@ pub fn current_process_entry() -> usize {
 }
 
 /// Initial ring-3 stack pointer of the current task (only valid for
-/// processes).
+/// processes / CLONE_VM threads).
 pub fn current_process_user_rsp() -> u64 {
-    tasks()[CURRENT.load(Ordering::Relaxed)]
-        .process
-        .as_ref()
-        .expect("current task is not a process")
-        .user_rsp
+    let task = &tasks()[CURRENT.load(Ordering::Relaxed)];
+    if let Some(process) = &task.process {
+        process.user_rsp
+    } else {
+        task.thread_user_rsp
+    }
+}
+
+/// The current task's FS_BASE (TLS base) as stored at the last task
+/// switch. `arch_prctl(ARCH_SET_FS)` and `clone(CLONE_SETTLS)` write it
+/// via `set_current_fs_base`; `scheduler_tick` keeps it current.
+pub fn current_fs_base() -> u64 {
+    tasks()[CURRENT.load(Ordering::Relaxed)].fs_base
+}
+
+pub fn set_current_fs_base(base: u64) {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)].fs_base = base;
+}
+
+/// The current task's `CLONE_CHILD_CLEARTID` target, if it set one.
+pub fn current_child_tid() -> Option<u64> {
+    tasks()[CURRENT.load(Ordering::Relaxed)].child_tid
+}
+
+pub fn set_current_child_tid(addr: Option<u64>) {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)].child_tid = addr;
 }
 
 /// Which syscall table the current task's process should dispatch
 /// through (`None` for a kernel task, which never issues a syscall in
 /// the first place). Used by `syscall::syscall_dispatch` to route
-/// between the native and Linux (`linux_abi.rs`) tables.
+/// between the native and Linux (`linux_abi.rs`) tables. For a CLONE_VM
+/// thread this resolves through its owner process — the thread shares
+/// the owner's ABI, and its `exit(60)` must take the same exit path.
 pub fn current_process_abi() -> Option<crate::process::Abi> {
-    tasks()[CURRENT.load(Ordering::Relaxed)].process.as_ref().map(|p| p.abi)
+    let tasks = tasks();
+    let current = CURRENT.load(Ordering::Relaxed);
+    let owner = if tasks[current].process.is_some() {
+        current
+    } else {
+        tasks[current].thread_of?
+    };
+    tasks.get(owner)?.process.as_ref().map(|p| p.abi)
 }
 
-/// The current task's CR3 (its own PML4), if it is a process — `None` for
-/// a kernel task. Used by `process::handle_fault` to map a new page into
-/// the *faulting* process's address space regardless of which task's
-/// stack the #PF handler happens to be running on.
+/// The current task's CR3 (its own PML4), if it is a process or a
+/// CLONE_VM thread — `None` for a kernel task. Used by
+/// `process::handle_fault` to map a new page into the *faulting*
+/// process's address space regardless of which task's stack the #PF
+/// handler happens to be running on.
 pub fn current_process_cr3() -> Option<u64> {
     let task = &tasks()[CURRENT.load(Ordering::Relaxed)];
-    task.process.as_ref().map(|_| task.cr3)
+    if task.process.is_some() || task.thread_of.is_some() {
+        Some(task.cr3)
+    } else {
+        None
+    }
 }
 
-/// Runs `f` on the current task's process, if it is one. Used by
-/// `process::handle_fault` to grow the ring-3 stack from inside the #PF
-/// handler, where the fault could interrupt any point in the process's
-/// execution — the same non-reentrancy argument `deliver_message`'s doc
-/// comment makes applies here (interrupts are already disabled for the
-/// whole handler).
+/// Runs `f` on the current task's process — its own, or the CLONE_VM
+/// owner's for a thread task. Used by `process::handle_fault` to grow the
+/// ring-3 stack from inside the #PF handler, where the fault could
+/// interrupt any point in the process's execution — the same
+/// non-reentrancy argument `deliver_message`'s doc comment makes applies
+/// here (interrupts are already disabled for the whole handler).
 pub fn with_current_process_mut<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
-    tasks_mut()[CURRENT.load(Ordering::Relaxed)]
-        .process
-        .as_mut()
-        .map(f)
+    let tasks = tasks_mut();
+    let current = CURRENT.load(Ordering::Relaxed);
+    let owner = if tasks[current].process.is_some() {
+        current
+    } else {
+        tasks[current].thread_of?
+    };
+    tasks.get_mut(owner)?.process.as_mut().map(f)
 }
 
 /// Saves the current task's kernel-side resume point for when its process
@@ -421,9 +626,19 @@ pub fn process_exit_status(pid: usize) -> Option<ExitInfo> {
 /// The process's segment mappings, used by `process::read_result` to
 /// translate a virtual address to a physical frame.
 pub fn process_mappings(pid: usize) -> Option<&'static [crate::process::Mapping]> {
-    tasks()
-        .get(pid)
-        .and_then(|task| task.process.as_ref().map(|p| p.mappings.as_slice()))
+    let tasks = tasks();
+    let task = tasks.get(pid)?;
+    // A CLONE_VM thread maps through its owner's address space.
+    let owner = if task.process.is_some() {
+        pid
+    } else {
+        task.thread_of?
+    };
+    tasks
+        .get(owner)?
+        .process
+        .as_ref()
+        .map(|p| p.mappings.as_slice())
 }
 
 /// Delivers `bytes` to `pid`'s single-message inbox (a mailbox, not a
@@ -454,21 +669,62 @@ pub fn take_current_message() -> Option<alloc::vec::Vec<u8>> {
         .and_then(|process| process.inbox.take())
 }
 
-/// Marks the current task's process as exited. Keeps the first exit info
-/// recorded (a page-fault kill must not be overwritten by the exit stub
-/// that follows it).
+/// Marks the current task as exited. For a CLONE_VM thread this only
+/// flags the thread itself; for a process task it marks the whole
+/// process *and* every thread sharing it (a dead owner's address space
+/// is reaped soon; sibling threads must not keep referencing it). Keeps
+/// the first exit info recorded (a page-fault kill must not be
+/// overwritten by the exit stub that follows it).
 pub fn mark_current_exited(info: ExitInfo) {
-    if let Some(process) = tasks_mut()[CURRENT.load(Ordering::Relaxed)]
-        .process
-        .as_mut()
-    {
+    let tasks = tasks_mut();
+    let current = CURRENT.load(Ordering::Relaxed);
+    if tasks[current].process.is_some() {
+        for task in tasks.iter_mut() {
+            if task.thread_of == Some(current) {
+                task.thread_exited = true;
+            }
+        }
+        if let Some(process) = tasks[current].process.as_mut() {
+            process.mark_exited(info);
+        }
+    } else {
+        tasks[current].thread_exited = true;
+    }
+}
+
+/// `exit_group`: marks the whole process — the owner task, every
+/// CLONE_VM thread sharing it, and the Process itself — exited, no
+/// matter which task of the group called it.
+pub fn mark_current_exited_group(info: ExitInfo) {
+    let tasks = tasks_mut();
+    let current = CURRENT.load(Ordering::Relaxed);
+    let owner = if tasks[current].process.is_some() {
+        current
+    } else {
+        tasks[current].thread_of.unwrap_or(current)
+    };
+    for task in tasks.iter_mut() {
+        if task.thread_of == Some(owner) {
+            task.thread_exited = true;
+        }
+    }
+    if let Some(process) = tasks.get_mut(owner).and_then(|t| t.process.as_mut()) {
         process.mark_exited(info);
     }
 }
 
-/// Detaches a process from the scheduler, returning it so the caller can
-/// free its frames. Refuses to remove the running task. Call with
-/// interrupts disabled (the caller owns the freed frames afterwards).
+/// True if the current task is a CLONE_VM thread (shares another task's
+/// Process).
+pub fn current_is_thread() -> bool {
+    tasks()[CURRENT.load(Ordering::Relaxed)].process.is_none()
+}
+
+/// Detaches a task from the scheduler, returning its Process (if it owns
+/// one) so the caller can free its frames. Refuses to remove the running
+/// task. Uses ordered removal (`Vec::remove`), not `swap_remove`, so task
+/// indices ("pids") stay stable — waitpid/child tracking and CLONE_VM
+/// `thread_of` references rely on that. Call with interrupts disabled
+/// (the caller owns the freed frames afterwards).
 pub fn remove_process(pid: usize) -> Option<Process> {
     let tasks = tasks_mut();
     if pid >= tasks.len() {
@@ -478,11 +734,8 @@ pub fn remove_process(pid: usize) -> Option<Process> {
     if current == pid {
         return None;
     }
-    let task = tasks.swap_remove(pid);
-    if current == tasks.len() {
-        // The current task was the last entry and got swapped into `pid`.
-        CURRENT.store(pid, Ordering::Relaxed);
-    } else if pid < current {
+    let task = tasks.remove(pid);
+    if pid < current {
         CURRENT.store(current - 1, Ordering::Relaxed);
     }
     task.process

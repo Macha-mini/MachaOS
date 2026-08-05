@@ -245,6 +245,20 @@ const SYS_SENDMSG: u64 = 46;
 const SYS_RECVMSG: u64 = 47;
 const SYS_FTRUNCATE: u64 = 77;
 const SYS_MEMFD_CREATE: u64 = 319;
+// Phase 7: clone/fork/vfork are intercepted by the asm special path (see
+// syscall.rs is_forkish_syscall / sys_forkish) before syscall_dispatch;
+// the numbers are still declared here for the dispatch table and the
+// asm's checks.
+pub const SYS_CLONE: u64 = 56;
+pub const SYS_FORK: u64 = 57;
+pub const SYS_VFORK: u64 = 58;
+const SYS_EXECVE: u64 = 59;
+const SYS_WAIT4: u64 = 61;
+const SYS_DUP: u64 = 32;
+const SYS_DUP2: u64 = 33;
+const SYS_GETTID: u64 = 186;
+const SYS_DUP3: u64 = 292;
+const SYS_PIPE2: u64 = 293;
 
 // ---- helpers ------------------------------------------------------------
 
@@ -1004,7 +1018,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             unsafe {
                 crate::syscall::wrmsr(MSR_FS_BASE, addr);
             }
-            with_process(|p| p.fs_base = addr);
+            crate::task::set_current_fs_base(addr);
             0
         }
         _ => err(EINVAL),
@@ -1066,33 +1080,31 @@ const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
 const FUTEX_CMD_MASK: u64 = !128; // clears FUTEX_PRIVATE_FLAG
 
-/// This kernel has no threading (`clone` isn't implemented) and is
-/// single-CPU, so nothing else could ever be running concurrently to
-/// either contend for or wake a futex — glibc's malloc arena lock and
-/// similar internal locks still take this path once at startup even
-/// single-threaded, just always uncontended. `FUTEX_WAIT` therefore
-/// either finds the lock already free (the value at `uaddr` no longer
-/// matches `val`, meaning whoever held it already released it — return
-/// success immediately rather than actually blocking, since there's
-/// nothing that could ever wake a real block) or matches (genuinely
-/// uncontended acquisition; real futex would still block waiting for a
-/// wake that, again, can never come here — return success as if a
-/// spurious wake happened, which is always a legal futex outcome).
-/// `FUTEX_WAKE` has no real waiters to wake and just reports zero.
+/// Real blocking futex: `FUTEX_WAIT` blocks the calling task on
+/// `(cr3, uaddr)` when the word at `uaddr` still equals `val` (the
+/// single-CPU syscall path — IF cleared for the whole syscall — makes
+/// the check-and-register sequence atomic, so no wake can be lost
+/// between them), and `FUTEX_WAKE` marks up to `val` blocked tasks
+/// runnable again. This is what pthread mutexes and pthread_join are
+/// built on.
 fn sys_futex(uaddr: u64, futex_op: u64, val: u64, _val2_or_timeout: u64) -> u64 {
+    let cr3 = crate::task::current_process_cr3().unwrap_or(0);
     match futex_op & FUTEX_CMD_MASK {
         FUTEX_WAIT => {
             let Some(phys) = resolve(uaddr, 4) else {
                 return err(EFAULT);
             };
             let current = unsafe { core::ptr::read(phys as *const u32) };
-            if current as u64 == (val & 0xFFFF_FFFF) {
-                0
-            } else {
-                err(EAGAIN)
+            if current as u64 != (val & 0xFFFF_FFFF) {
+                return err(EAGAIN);
             }
+            // Value still matches: block until FUTEX_WAKE on this word.
+            // `yield_blocked` switches away; when woken, the caller
+            // re-reads the word (pthread loops on the futex value).
+            crate::task::yield_blocked(cr3 ^ uaddr);
+            0
         }
-        FUTEX_WAKE => 0,
+        FUTEX_WAKE => crate::task::wake_all(cr3 ^ uaddr, val as usize) as u64,
         _ => err(ENOSYS),
     }
 }
@@ -1178,6 +1190,7 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_IOCTL => err(ENOTTY), // every fd reports "not a tty"
         SYS_WRITEV => sys_writev(arg1, arg2, arg3),
         SYS_GETPID => crate::task::current_pid() as u64,
+        SYS_GETTID => crate::task::current_pid() as u64,
         SYS_UNAME => sys_uname(arg1),
         SYS_ARCH_PRCTL => sys_arch_prctl(arg1, arg2),
         SYS_SET_TID_ADDRESS => crate::task::current_pid() as u64,

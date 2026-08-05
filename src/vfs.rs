@@ -140,6 +140,21 @@ impl FileHandle {
         self.is_dir
     }
 
+    /// Deep copy for `fork`: same file, same position, independent
+    /// handle (a real fork shares the open-file description, but the
+    /// VFS layer keeps the whole file in memory so a copy is equivalent
+    /// for every caller this kernel runs).
+    pub fn dup(&self) -> FileHandle {
+        FileHandle {
+            path: self.path.clone(),
+            data: self.data.clone(),
+            cursor: self.cursor,
+            dirty: self.dirty,
+            writable: self.writable,
+            is_dir: self.is_dir,
+        }
+    }
+
     /// Copies up to `buf.len()` bytes starting at the cursor, advancing it.
     /// Returns 0 at EOF or for a directory handle.
     pub fn read(&mut self, buf: &mut [u8]) -> usize {

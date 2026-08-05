@@ -38,8 +38,13 @@ pub extern "C" fn _start() {
     // than actually blocking (nothing could ever wake it here).
     let addr = LOCK_WORD.load(Ordering::Relaxed) as u64;
     let _ = addr;
-    let r = unsafe { common::syscall(SYS_FUTEX, &LOCK_WORD as *const _ as u64, FUTEX_WAIT, 0, 0) };
-    if r == 0 {
+    // FUTEX_WAIT with a *stale* expected value (LOCK_WORD is 0, expecting
+    // 1): the word doesn't match, so it must fail EAGAIN immediately
+    // without blocking. (FUTEX_WAIT with a *matching* value now really
+    // blocks — Phase 7 — so that case is exercised by the clone/thread
+    // test, not here where nothing would ever wake it.)
+    let r = unsafe { common::syscall(SYS_FUTEX, &LOCK_WORD as *const _ as u64, FUTEX_WAIT, 1, 0) };
+    if r == (-EAGAIN) as u64 {
         ok |= 1 << 0;
     }
 

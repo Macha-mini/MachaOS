@@ -139,6 +139,25 @@ impl Drop for FdEntry {
     }
 }
 
+impl FdEntry {
+    /// Copy for `fork`. `File` deep-copies (`vfs::FileHandle::dup`);
+    /// `Shm` shares the object (refcount bumped — `Drop` in the child
+    /// then only drops the child's reference); `Socket` endpoints are
+    /// single-owner in `socket.rs`, so they're not duplicated (the child
+    /// gets no such fd — a documented limitation, and nothing the
+    /// current test binaries exercise across a fork).
+    pub fn dup(&self) -> Option<FdEntry> {
+        match self {
+            FdEntry::File(h) => Some(FdEntry::File(h.dup())),
+            FdEntry::Shm(id, cursor) => {
+                shm::dup(*id);
+                Some(FdEntry::Shm(*id, *cursor))
+            }
+            FdEntry::Socket(_) => None,
+        }
+    }
+}
+
 /// Why a process stopped running.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ExitInfo {
@@ -223,14 +242,6 @@ pub struct Process {
     /// Next address `Process::mmap_anon` hands out for a non-`MAP_FIXED`
     /// request.
     mmap_next: u64,
-    /// This process's `FS_BASE` MSR value (TLS base, set via
-    /// `arch_prctl(ARCH_SET_FS, ...)` — see `linux_abi.rs`), saved and
-    /// restored by `task::scheduler_tick` around a task switch. `FS_BASE`
-    /// is a single CPU-global MSR, not part of the register set
-    /// `context_switch` already saves/restores, so without this a second
-    /// process also using TLS would silently stomp the first's base the
-    /// moment the scheduler interleaves them.
-    pub(crate) fs_base: u64,
 }
 
 impl Process {
@@ -671,7 +682,6 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         heap_start: 0,
         heap_end: 0,
         mmap_next: MMAP_BASE,
-        fs_base: 0,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -729,7 +739,6 @@ pub fn spawn_linux(elf_bytes: &[u8], name: &'static str, argv: &[&str], envp: &[
         heap_start,
         heap_end: heap_start,
         mmap_next: MMAP_BASE,
-        fs_base: 0,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -1312,6 +1321,222 @@ extern "C" fn exit_self() -> ! {
     task::mark_current_exited(ExitInfo::Normal);
     loop {
         interrupts::halt();
+    }
+}
+
+/// Exit stub for a CLONE_VM thread (see `task::spawn_child`): clears the
+/// `CLONE_CHILD_CLEARTID` word and wakes the join futex (what
+/// `pthread_join` blocks on), then marks just this task exited — the
+/// shared address space stays alive for the owner and its other threads.
+extern "C" fn thread_exit_self() -> ! {
+    if let Some(addr) = task::current_child_tid() {
+        if let Some(phys) = translate(task::current_pid(), addr, 8) {
+            unsafe {
+                core::ptr::write(phys as *mut u64, 0);
+            }
+            // Same futex key the joiner blocked on (sys_futex keys by
+            // cr3 ^ uaddr — CLONE_VM threads share the cr3).
+            let cr3 = crate::task::current_process_cr3().unwrap_or(0);
+            task::wake_all(cr3 ^ addr, usize::MAX);
+        }
+    }
+    if crate::syscall::exit_group_flag() {
+        task::mark_current_exited_group(ExitInfo::Normal);
+    } else {
+        task::mark_current_exited(ExitInfo::Normal);
+    }
+    loop {
+        interrupts::halt();
+    }
+}
+
+/// The low 12 bits (flags) of the PTE mapping `vaddr` in the address
+/// space rooted at `cr3`; 0 if unmapped. Used by `fork_copy` so the
+/// child's pages get the same R/W/X attributes the parent's have
+/// (`Mapping` doesn't record them).
+fn read_pte_flags(cr3: u64, vaddr: u64) -> u64 {
+    let lvl = |e: u64| e & 0x000f_ffff_ffff_f000;
+    unsafe {
+        let pml4e = core::ptr::read((cr3 as *const u64).add(((vaddr >> 39) & 0x1ff) as usize));
+        if pml4e & 1 == 0 {
+            return 0;
+        }
+        let pdpte = core::ptr::read((lvl(pml4e) as *const u64).add(((vaddr >> 30) & 0x1ff) as usize));
+        if pdpte & 1 == 0 {
+            return 0;
+        }
+        let pde = core::ptr::read((lvl(pdpte) as *const u64).add(((vaddr >> 21) & 0x1ff) as usize));
+        if pde & 1 == 0 {
+            return 0;
+        }
+        if pde & (1 << 7) != 0 {
+            return 0; // 2 MiB page: never used for process mappings
+        }
+        let pte = core::ptr::read((lvl(pde) as *const u64).add(((vaddr >> 12) & 0x1ff) as usize));
+        pte & 0xfff
+    }
+}
+
+/// Deep copy of a process for `fork`: a fresh address space with every
+/// mapping's contents copied into new frames (same virtual addresses,
+/// same page attributes), and a duplicated fd table. `MAP_SHARED`
+/// (`shm_id: Some`) mappings map the *same* frames in the child, as real
+/// `fork` semantics require. The child's `user_rsp` is meaningless (a
+/// fork child resumes at the parent's syscall return via
+/// `task::spawn_child`), so it starts at 0. Returns `(process, cr3)`.
+fn fork_copy(parent: &Process) -> Result<(Process, u64), &'static str> {
+    let mut child = Process {
+        entry: parent.entry,
+        user_rsp: 0,
+        frames: Vec::new(),
+        mappings: Vec::new(),
+        state: ProcessState::Running,
+        exit_info: None,
+        inbox: None,
+        fds: parent
+            .fds
+            .iter()
+            .map(|f| f.as_ref().and_then(FdEntry::dup))
+            .collect(),
+        stack_low: parent.stack_low,
+        stack_phys_base: 0, // set from the copied stack mapping below
+        abi: parent.abi,
+        heap_start: parent.heap_start,
+        heap_end: parent.heap_end,
+        mmap_next: parent.mmap_next,
+    };
+    let pml4 = build_address_space(&mut child)?;
+    let parent_cr3 = paging::read_cr3();
+    for m in &parent.mappings {
+        if let Some(shm_id) = m.shm_id {
+            let flags = read_pte_flags(parent_cr3, m.vaddr) | paging::PAGE_PRESENT;
+            if !paging::map_range_in(pml4, m.vaddr, m.phys, m.len, flags, &mut child.frames) {
+                return Err("fork: shared mapping failed");
+            }
+            child.mappings.push(*m);
+            continue;
+        }
+        let pages = (m.len / paging::PAGE_SIZE) as usize;
+        let Some(phys) = pmm::alloc_contiguous(pages) else {
+            return Err("fork: out of memory");
+        };
+        for i in 0..pages {
+            child.frames.push(phys + i * pmm::FRAME_SIZE);
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(m.phys as *const u8, phys as *mut u8, m.len as usize);
+        }
+        let flags = read_pte_flags(parent_cr3, m.vaddr) | paging::PAGE_PRESENT;
+        if !paging::map_range_in(pml4, m.vaddr, phys as u64, m.len, flags, &mut child.frames) {
+            return Err("fork: mapping copy failed");
+        }
+        child.mappings.push(Mapping {
+            vaddr: m.vaddr,
+            phys: phys as u64,
+            len: m.len,
+            shm_id: None,
+        });
+        if m.vaddr == USER_STACK_LOW_LIMIT {
+            child.stack_phys_base = phys as u64;
+        }
+    }
+    Ok((child, pml4))
+}
+
+/// Writes `value` to the 8 bytes at user address `addr` of the current
+/// process (used for `CLONE_PARENT_SETTID` / `CLONE_CHILD_SETTID`).
+fn write_user_u64(addr: u64, value: u64) {
+    if let Some(phys) = translate(task::current_pid(), addr, 8) {
+        unsafe {
+            core::ptr::write(phys as *mut u64, value);
+        }
+    }
+}
+
+/// Entry point for the asm's fork/clone/vfork special path (see
+/// `syscall::sys_forkish`): creates the child task — a deep-copied
+/// process for `fork`/`vfork`, a `CLONE_VM` thread sharing the parent's
+/// address space for `clone` — and returns its pid for the parent. The
+/// child resumes in ring 3 at the parent's syscall return point with
+/// `rax = 0`, via the fabricated frame in `task::spawn_child`.
+pub fn handle_forkish(
+    num: u64,
+    user_rip: u64,
+    user_rflags: u64,
+    user_rsp: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+    a4: u64,
+    a5: u64,
+    a6: u64,
+    callee_saved: [u64; 6],
+) -> Result<u64, &'static str> {
+    let parent_pid = task::current_pid();
+    let parent_cr3 = task::current_process_cr3().ok_or("not a process")?;
+    let parent_fs = task::current_fs_base();
+    match num {
+        crate::linux_abi::SYS_CLONE => {
+            const CLONE_VM: u64 = 0x100;
+            const CLONE_SETTLS: u64 = 0x80000;
+            const CLONE_PARENT_SETTID: u64 = 0x100000;
+            const CLONE_CHILD_SETTID: u64 = 0x1000000;
+            const CLONE_CHILD_CLEARTID: u64 = 0x200000;
+            let flags = a1;
+            let stack = a2;
+            let parent_tid = a3;
+            let child_tid = a4;
+            let tls = a5;
+            if flags & CLONE_VM == 0 {
+                return Err("clone without CLONE_VM unsupported");
+            }
+            let child_fs = if flags & CLONE_SETTLS != 0 { tls } else { parent_fs };
+            let pid = task::spawn_child(
+                "thread",
+                parent_cr3,
+                Some(parent_pid),
+                None,
+                user_rip,
+                user_rflags,
+                stack,
+                [a1, a2, a3, a4, a5, a6],
+                callee_saved,
+                child_fs,
+                if flags & CLONE_CHILD_CLEARTID != 0 {
+                    Some(child_tid)
+                } else {
+                    None
+                },
+                thread_exit_self as extern "C" fn() -> ! as usize,
+            ) as u64;
+            if flags & CLONE_PARENT_SETTID != 0 {
+                write_user_u64(parent_tid, pid);
+            }
+            if flags & CLONE_CHILD_SETTID != 0 {
+                write_user_u64(child_tid, pid);
+            }
+            Ok(pid)
+        }
+        crate::linux_abi::SYS_FORK | crate::linux_abi::SYS_VFORK => {
+            let (child_process, child_cr3) =
+                task::with_current_process_mut(|p| fork_copy(p)).ok_or("not a process")??;
+            let child_pid = task::spawn_child(
+                "fork-child",
+                child_cr3,
+                None,
+                Some(child_process),
+                user_rip,
+                user_rflags,
+                user_rsp,
+                [a1, a2, a3, a4, a5, a6],
+                callee_saved,
+                parent_fs,
+                None,
+                exit_self as extern "C" fn() -> ! as usize,
+            ) as u64;
+            Ok(child_pid)
+        }
+        _ => Err("not a forkish syscall"),
     }
 }
 

@@ -1485,6 +1485,23 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2f: Phase 7 threads — clone (CLONE_VM)
+    // + real blocking futex. Spawns a thread that bumps a shared
+    // counter, joins it pthread_join-style (futex_wait on the
+    // CLONE_CHILD_CLEARTID word), and verifies the counter; 3 checks,
+    // one bit each.
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_THREADS, "linux-threads", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 400) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux threads process exited normally"),
+        other => selftest_fail(&format!("linux-threads process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0x7) => println!("[OK] Linux threads: clone/CLONE_VM join/futex all correct"),
+        other => selftest_fail(&format!("linux-threads process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.
