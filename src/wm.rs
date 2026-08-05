@@ -1056,12 +1056,22 @@ impl WindowManager {
     }
 
     pub fn handle_key(&mut self, event: keyboard::Event) {
-        // Esc closes a right-click context menu before anything else
-        // sees the key.
+        // Esc dismisses transient popups (context menu, launcher)
+        // before anything else sees the key.
         if let keyboard::Event::Escape = event {
             if self.context_menu.take().is_some() {
                 return;
             }
+            if self.launcher_open {
+                self.launcher_open = false;
+                return;
+            }
+        }
+        // Alt+Tab cycles the focus to the next open, non-minimized
+        // window (system-standard window switcher).
+        if let keyboard::Event::AltTab = event {
+            self.cycle_focus();
+            return;
         }
         if self.windows.is_empty() {
             return;
@@ -1480,6 +1490,26 @@ impl WindowManager {
             self.focused =
                 self.windows.iter().rposition(|w| w.open && !w.minimized).unwrap_or(0);
         }
+    }
+
+    /// Alt+Tab: brings the next open (non-minimized) window after the
+    /// focused one to the front. Wraps around; a single open window
+    /// just stays focused.
+    fn cycle_focus(&mut self) {
+        let open: Vec<usize> = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.open && !w.minimized)
+            .map(|(i, _)| i)
+            .collect();
+        if open.len() < 2 {
+            return;
+        }
+        let current = open.iter().position(|&i| i == self.focused).unwrap_or(open.len() - 1);
+        let next = open[(current + 1) % open.len()];
+        self.raise(next);
+        self.persist_session();
     }
 
     fn handle_click(&mut self) {
@@ -2067,7 +2097,7 @@ fn editor_handle_key(
                 *cursor_col = (*cursor_col).min(lines[*cursor_row].chars().count());
             }
         }
-        keyboard::Event::Escape | keyboard::Event::F2 => {}
+        keyboard::Event::Escape | keyboard::Event::F2 | keyboard::Event::AltTab => {}
     }
     editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
 }

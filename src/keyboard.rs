@@ -9,6 +9,9 @@ pub enum Event {
     /// Ctrl+letter combos carry the (lowercase) letter, e.g. Ctrl+S gives
     /// `Event::Ctrl('s')` regardless of Shift state.
     Ctrl(char),
+    /// Alt+Tab (window switcher) — generated when Tab is pressed while
+    /// either Alt key is held.
+    AltTab,
     Backspace,
     Enter,
     Tab,
@@ -60,6 +63,9 @@ static QUEUE: SpinLock<EventQueue> = SpinLock::new(EventQueue::new());
 static SHIFT_DOWN: AtomicBool = AtomicBool::new(false);
 static CAPS_LOCK: AtomicBool = AtomicBool::new(false);
 static CTRL_DOWN: AtomicBool = AtomicBool::new(false);
+// True while either Alt key is held (left Alt 0x38 / right Alt 0xE0 0x38
+// down, cleared on the matching release). Used to synthesize Alt+Tab.
+static ALT_DOWN: AtomicBool = AtomicBool::new(false);
 // Set to true when a 0xE0 extended-scancode prefix byte is seen; consumed
 // (swapped back to false) by the very next byte, whatever it is.
 static EXTENDED: AtomicBool = AtomicBool::new(false);
@@ -115,13 +121,29 @@ fn decode(scancode: u8, extended: bool) -> Option<Event> {
             CTRL_DOWN.store(false, Ordering::Relaxed);
             None
         }
+        // Left Alt (0x38) and right Alt (0xE0 0x38) share the same
+        // scancode; both set/clear the Alt flag.
+        0x38 => {
+            ALT_DOWN.store(true, Ordering::Relaxed);
+            None
+        }
+        0xB8 => {
+            ALT_DOWN.store(false, Ordering::Relaxed);
+            None
+        }
         0x3A => {
             CAPS_LOCK.fetch_xor(true, Ordering::Relaxed);
             None
         }
         0x0E => Some(Event::Backspace),
         0x1C => Some(Event::Enter),
-        0x0F => Some(Event::Tab),
+        0x0F => {
+            if ALT_DOWN.load(Ordering::Relaxed) {
+                Some(Event::AltTab)
+            } else {
+                Some(Event::Tab)
+            }
+        }
         0x39 => Some(Event::Char(' ')),
         0x01 => Some(Event::Escape),
         0x3C => Some(Event::F2),
