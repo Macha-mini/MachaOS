@@ -342,6 +342,11 @@ pub struct WindowManager {
     // actually changes — never on every composite (mouse moves trigger
     // composites constantly).
     clock_cache: (u64, String),
+    // Snapshot of the pixels under the cursor, taken right before the
+    // cursor was drawn (plus the position it was taken at), so a
+    // cursor-only frame can erase the old cursor by restoring this
+    // region and draw the cursor at its new position.
+    cursor_save: Option<(i32, i32, Vec<u32>)>,
 }
 
 impl WindowManager {
@@ -371,6 +376,7 @@ impl WindowManager {
             wallpaper: load_wallpaper(screen_w, screen_h),
             settings: Settings::load(),
             clock_cache: (u64::MAX, String::new()),
+            cursor_save: None,
         };
         manager.restore_session();
         manager
@@ -1054,9 +1060,18 @@ impl WindowManager {
         }
     }
 
-    pub fn handle_mouse(&mut self, event: MouseEvent) {
+    /// Handles one mouse event. Returns `true` when the event changed
+    /// something that requires a full recomposite (a click, a drag, a
+    /// resize, hovering over chrome with hover states, ...), and
+    /// `false` for a pure cursor move over inert surfaces — in which
+    /// case the desktop loop can use the cheap cursor-only composite
+    /// path instead of redrawing the whole desktop.
+    pub fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+        let old_x = self.cursor_x;
+        let old_y = self.cursor_y;
         self.cursor_x = (self.cursor_x + event.dx).clamp(0, self.screen_w as i32 - 1);
         self.cursor_y = (self.cursor_y + event.dy).clamp(0, self.screen_h as i32 - 1);
+        let moved = old_x != self.cursor_x || old_y != self.cursor_y;
 
         let just_pressed = event.left && !self.left_was_down;
         let just_released = !event.left && self.left_was_down;
@@ -1080,7 +1095,7 @@ impl WindowManager {
                 self.resizing = None;
                 self.persist_session();
             }
-            return;
+            return true;
         }
 
         // A file drag owns the mouse until release; it must not be
@@ -1089,7 +1104,7 @@ impl WindowManager {
             if just_released {
                 self.finish_file_drag();
             }
-            return;
+            return true;
         }
 
         // A normal list click becomes a file drag only after the cursor
@@ -1100,7 +1115,7 @@ impl WindowManager {
             {
                 self.begin_file_drag();
                 if self.file_drag.is_some() {
-                    return;
+                    return true;
                 }
             }
         }
@@ -1122,7 +1137,64 @@ impl WindowManager {
         }
         if just_pressed {
             self.handle_click();
+            return true;
         }
+
+        // A pure cursor move over inert surfaces (no button, no drag,
+        // no hover-rendering chrome under the cursor) only needs the
+        // cursor redrawn, not the whole desktop. The *old* cursor
+        // position counts too: when the cursor just left a hoverable
+        // area, one more full composite is needed to erase the stale
+        // hover highlight it left behind.
+        if moved && !event.left && self.dragging.is_none() && self.resizing.is_none() {
+            !(self.cursor_over_hoverable_at(self.cursor_x, self.cursor_y)
+                || self.cursor_over_hoverable_at(old_x, old_y))
+        } else {
+            true
+        }
+    }
+
+    /// Whether the cursor sits over anything whose hover state must be
+    /// re-rendered when the cursor moves: window title bars
+    /// (min/max/close buttons), File Explorer and Settings content
+    /// (hover-highlighted rows), the taskbar, and the launcher.
+    /// When the cursor is over plain desktop/window content instead, a
+    /// cursor-only redraw is sufficient.
+    fn cursor_over_hoverable_at(&self, cx: i32, cy: i32) -> bool {
+        // Taskbar row (buttons + start button light up on hover).
+        if cy >= (self.screen_h - TASKBAR_HEIGHT) as i32 {
+            return true;
+        }
+        // Launcher tiles.
+        if self.launcher_open {
+            let (lx, ly, lw, lh) = self.launcher_popup_rect();
+            if cx >= lx && cx < lx + lw as i32 && cy >= ly && cy < ly + lh as i32 {
+                return true;
+            }
+        }
+        for window in &self.windows {
+            if !window.open || window.minimized {
+                continue;
+            }
+            let (cw, ch) = window.content_size();
+            let in_title = cy >= window.y && cy < window.y + TITLE_BAR_HEIGHT as i32;
+            let in_content = cy >= window.y + TITLE_BAR_HEIGHT as i32
+                && cy < window.y + TITLE_BAR_HEIGHT as i32 + ch as i32;
+            let in_x = cx >= window.x && cx < window.x + cw as i32;
+            if in_x && (in_title || in_content) {
+                // Title bars always have hover states; among the apps,
+                // only File Explorer and Settings re-render on cursor
+                // moves (hover highlights). Terminals, Calculator,
+                // Paint, and the Image Viewer don't.
+                if in_title {
+                    return true;
+                }
+                if matches!(window.kind, AppKind::FileExplorer(_) | AppKind::Settings(_)) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn set_explorer_drag(&mut self, drag: Option<DragInfo>) {
@@ -1443,9 +1515,63 @@ impl WindowManager {
             if let Some(drag) = &self.file_drag {
                 draw_file_drag_tag(surface, self.cursor_x, self.cursor_y, &drag.path, drag.is_dir);
             }
+        });
+        // Snapshot the region under the cursor *before* drawing it, so a
+        // later cursor-only frame can erase it by restoring this region.
+        self.cursor_save = Some((self.cursor_x, self.cursor_y, fb::snapshot_region(
+            (self.cursor_x - CURSOR_SAVE_MARGIN).max(0) as u32,
+            (self.cursor_y - CURSOR_SAVE_MARGIN).max(0) as u32,
+            CURSOR_SAVE_W,
+            CURSOR_SAVE_H,
+        )));
+        fb::with_surface(|surface| {
             draw_cursor(surface, self.cursor_x, self.cursor_y);
         });
         fb::present();
+    }
+
+    /// Cheap path for a pure cursor move: erase the old cursor by
+    /// restoring the pixels saved under it during the last composite,
+    /// draw the cursor at its new position, and push only the affected
+    /// region to the framebuffer — instead of recompositing the whole
+    /// desktop. Only valid when nothing but the cursor moved; the
+    /// desktop loop guarantees that (see `handle_mouse`'s return value).
+    pub fn composite_cursor_only(&mut self) {
+        let (old_x, old_y, saved) = match self.cursor_save.take() {
+            Some(saved) => saved,
+            // No prior snapshot (e.g. first frame); just do a full
+            // composite instead.
+            None => return self.composite(),
+        };
+        // Erase the old cursor.
+        fb::restore_region(
+            (old_x - CURSOR_SAVE_MARGIN).max(0) as u32,
+            (old_y - CURSOR_SAVE_MARGIN).max(0) as u32,
+            CURSOR_SAVE_W,
+            CURSOR_SAVE_H,
+            &saved,
+        );
+        // The old and new cursor positions may both need updating on
+        // screen: restore_region changed the old one, and the cursor
+        // will be drawn at the new one.
+        let min_x = (old_x.min(self.cursor_x) - CURSOR_SAVE_MARGIN).max(0) as u32;
+        let min_y = (old_y.min(self.cursor_y) - CURSOR_SAVE_MARGIN).max(0) as u32;
+        let max_x = (old_x.max(self.cursor_x) + CURSOR_SAVE_W as i32 - CURSOR_SAVE_MARGIN) as u32;
+        let max_y = (old_y.max(self.cursor_y) + CURSOR_SAVE_H as i32 - CURSOR_SAVE_MARGIN) as u32;
+        let region_w = max_x.saturating_sub(min_x).min(self.screen_w - min_x.min(self.screen_w));
+        let region_h = max_y.saturating_sub(min_y).min(self.screen_h - min_y.min(self.screen_h));
+
+        // Snapshot under the new cursor position, then draw it.
+        self.cursor_save = Some((self.cursor_x, self.cursor_y, fb::snapshot_region(
+            (self.cursor_x - CURSOR_SAVE_MARGIN).max(0) as u32,
+            (self.cursor_y - CURSOR_SAVE_MARGIN).max(0) as u32,
+            CURSOR_SAVE_W,
+            CURSOR_SAVE_H,
+        )));
+        fb::with_surface(|surface| {
+            draw_cursor(surface, self.cursor_x, self.cursor_y);
+        });
+        fb::present_region(min_x, min_y, region_w, region_h);
     }
 
     /// Win11-style taskbar: a translucent acrylic bar with a centered
@@ -1924,6 +2050,13 @@ fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool, cursor
         draw_diagonal(surface, grip_x + 10, grip_y + 11, grip_x + 11, grip_y + 10, RESIZE_GRIP_COLOR);
     }
 }
+
+// The cursor is a 10x16 bitmap drawn with a 1px black outline around
+// it; `composite_cursor_only` snapshots a slightly larger region around
+// it so restoring that region cleanly erases the whole cursor.
+const CURSOR_SAVE_W: u32 = 14;
+const CURSOR_SAVE_H: u32 = 20;
+const CURSOR_SAVE_MARGIN: i32 = 2;
 
 const CURSOR_W: u32 = 10;
 const CURSOR_BITS: [u16; 16] = [

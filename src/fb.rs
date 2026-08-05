@@ -225,6 +225,103 @@ pub fn get_pixel(x: u32, y: u32) -> Option<u32> {
     Some(state.back_buffer[(y * state.width + x) as usize])
 }
 
+/// Copies the virtual back buffer's region [x, x+w) x [y, y+h) out, for
+/// the window manager's cursor-restore trick: before drawing the cursor
+/// the compositor snapshots the (small) rectangle under it, so a later
+/// cursor-only frame can restore that rectangle and draw the cursor at
+/// its new position without recompositing the whole desktop.
+/// Out-of-bounds parts are clamped; the returned buffer is always
+/// `w`x`h` (zero-filled where the source is out of range).
+pub fn snapshot_region(x: u32, y: u32, w: u32, h: u32) -> alloc::vec::Vec<u32> {
+    let mut out = alloc::vec![0u32; (w * h) as usize];
+    let guard = STATE.lock();
+    let Some(state) = guard.as_ref() else {
+        return out;
+    };
+    if w == 0 || h == 0 {
+        return out;
+    }
+    let x = x.min(state.vwidth);
+    let y = y.min(state.vheight);
+    let x_end = (x + w).min(state.vwidth);
+    for yy in 0..h {
+        let sy = y + yy;
+        if sy >= state.vheight {
+            break;
+        }
+        let n = (x_end - x) as usize;
+        let src = &state.vback_buffer[(sy * state.vwidth + x) as usize..(sy * state.vwidth + x_end) as usize];
+        out[(yy as usize * w as usize)..(yy as usize * w as usize + n)].copy_from_slice(src);
+    }
+    out
+}
+
+/// Writes a region saved by `snapshot_region` back into the virtual
+/// back buffer (clamped to bounds).
+pub fn restore_region(x: u32, y: u32, w: u32, h: u32, pixels: &[u32]) {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    if w == 0 || h == 0 {
+        return;
+    }
+    let x = x.min(state.vwidth);
+    let y = y.min(state.vheight);
+    let x_end = (x + w).min(state.vwidth);
+    for yy in 0..h {
+        let sy = y + yy;
+        if sy >= state.vheight {
+            break;
+        }
+        let n = (x_end - x) as usize;
+        let dst = &mut state.vback_buffer[(sy * state.vwidth + x) as usize..(sy * state.vwidth + x_end) as usize];
+        dst.copy_from_slice(&pixels[(yy as usize * w as usize)..(yy as usize * w as usize + n)]);
+    }
+}
+
+/// Pushes only the given region of the virtual back buffer to the real
+/// framebuffer (used by the cursor-only fast path; a full `present()`
+/// is still issued when the virtual and physical resolutions differ,
+/// since a scale is active then).
+pub fn present_region(x: u32, y: u32, w: u32, h: u32) {
+    let mut guard = STATE.lock();
+    let Some(state) = guard.as_mut() else {
+        return;
+    };
+    if state.vwidth != state.width || state.vheight != state.height {
+        drop(guard);
+        return present();
+    }
+    if w == 0 || h == 0 {
+        return;
+    }
+    let x = x.min(state.width);
+    let y = y.min(state.height);
+    let x_end = (x + w).min(state.width);
+    let y_end = (y + h).min(state.height);
+    if x_end <= x || y_end <= y {
+        return;
+    }
+    // Mirror the region into the physical back buffer too, so
+    // `get_pixel` (the wayland selftest hook) stays accurate.
+    for yy in y..y_end {
+        let n = (x_end - x) as usize;
+        let src = &state.vback_buffer[(yy * state.vwidth + x) as usize..(yy * state.vwidth + x_end) as usize];
+        let dst = &mut state.back_buffer[(yy * state.width + x) as usize..(yy * state.width + x_end) as usize];
+        dst.copy_from_slice(src);
+    }
+    let dst = state.addr as *mut u32;
+    for yy in y..y_end {
+        let n = (x_end - x) as usize;
+        let src_row = &state.back_buffer[(yy * state.width + x) as usize..(yy * state.width + x_end) as usize];
+        unsafe {
+            let dst_row = dst.byte_add(yy as usize * state.pitch as usize).add(x as usize);
+            core::ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, n);
+        }
+    }
+}
+
 /// Scales the virtual back buffer to the physical one and copies it to
 /// the real MMIO framebuffer.
 pub fn present() {

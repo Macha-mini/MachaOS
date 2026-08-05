@@ -20,9 +20,16 @@ pub fn run() -> ! {
 
     loop {
         let mut dirty = false;
+        let mut cursor_only = false;
         while let Some(event) = mouse::next_event() {
-            manager.handle_mouse(event);
-            dirty = true;
+            // `handle_mouse` reports whether the event actually changed
+            // something on screen; a pure cursor move returns false and
+            // lets us skip the full recomposite.
+            if manager.handle_mouse(event) {
+                dirty = true;
+            } else {
+                cursor_only = true;
+            }
         }
         while let Some(event) = keyboard::next_event() {
             manager.handle_key(event);
@@ -30,6 +37,8 @@ pub fn run() -> ! {
         }
         if dirty || manager.clock_tick_due() {
             manager.composite();
+        } else if cursor_only {
+            manager.composite_cursor_only();
         }
         interrupts::halt();
     }
