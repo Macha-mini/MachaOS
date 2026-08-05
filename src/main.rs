@@ -36,6 +36,7 @@ mod port;
 mod process;
 mod rtc;
 mod serial;
+mod session;
 mod settings;
 mod shell;
 mod shm;

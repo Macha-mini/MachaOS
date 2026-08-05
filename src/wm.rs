@@ -146,6 +146,65 @@ enum AppId {
 
 const APP_ID_COUNT: usize = 8;
 
+impl AppId {
+    /// The stable name this app is written as in the desktop session
+    /// file (see `session`). Renaming an entry here is a format change.
+    fn name(&self) -> &'static str {
+        match self {
+            AppId::Terminal => "terminal",
+            AppId::Calculator => "calculator",
+            AppId::Notepad => "notepad",
+            AppId::SysInfo => "sysinfo",
+            AppId::Files => "files",
+            AppId::Settings => "settings",
+            AppId::Paint => "paint",
+            AppId::ImageViewer => "imageviewer",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<AppId> {
+        match name {
+            "terminal" => Some(AppId::Terminal),
+            "calculator" => Some(AppId::Calculator),
+            "notepad" => Some(AppId::Notepad),
+            "sysinfo" => Some(AppId::SysInfo),
+            "files" => Some(AppId::Files),
+            "settings" => Some(AppId::Settings),
+            "paint" => Some(AppId::Paint),
+            "imageviewer" => Some(AppId::ImageViewer),
+            _ => None,
+        }
+    }
+
+    fn from_index(index: usize) -> Option<AppId> {
+        match index {
+            0 => Some(AppId::Terminal),
+            1 => Some(AppId::Calculator),
+            2 => Some(AppId::Notepad),
+            3 => Some(AppId::SysInfo),
+            4 => Some(AppId::Files),
+            5 => Some(AppId::Settings),
+            6 => Some(AppId::Paint),
+            7 => Some(AppId::ImageViewer),
+            _ => None,
+        }
+    }
+}
+
+/// The launcher action that opens a built-in app, one per `AppId`.
+fn builtin_action(id: AppId) -> LauncherAction {
+    match id {
+        AppId::Terminal => LauncherAction::Terminal,
+        AppId::Calculator => LauncherAction::Calculator,
+        AppId::Notepad => LauncherAction::Notepad,
+        AppId::SysInfo => LauncherAction::SysInfo,
+        AppId::Files => LauncherAction::Files,
+        AppId::Settings => LauncherAction::Settings,
+        AppId::Paint => LauncherAction::Paint,
+        AppId::ImageViewer => LauncherAction::ImageViewer,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RememberedWindow {
     x: i32,
@@ -282,9 +341,11 @@ pub struct WindowManager {
 impl WindowManager {
     /// Starts with an empty desktop: no apps are launched at boot — the
     /// start menu opens whatever the user picks, and window geometry is
-    /// remembered per app across font-size changes.
+    /// remembered per app across font-size changes. If a desktop session
+    /// was persisted on disk (see `session`), the apps that were open
+    /// are restored to where the user left them.
     pub fn new(screen_w: u32, screen_h: u32) -> Self {
-        Self {
+        let mut manager = Self {
             windows: Vec::new(),
             focused: 0,
             cursor_x: (screen_w / 2) as i32,
@@ -303,7 +364,108 @@ impl WindowManager {
             remembered: [None; APP_ID_COUNT],
             wallpaper: load_wallpaper(screen_w, screen_h),
             settings: Settings::load(),
+        };
+        manager.restore_session();
+        manager
+    }
+
+    /// Restores the persisted desktop session (see `session`): reopens
+    /// the apps that were open when the last session was saved, at their
+    /// saved positions/sizes, and repopulates the remembered-geometry
+    /// table so closed apps reopen where they were left too. Runs once
+    /// at boot, after settings are applied; on any failure (no volume,
+    /// no file, unknown app names) the desktop just stays empty.
+    fn restore_session(&mut self) {
+        let data = crate::session::load_from_disk();
+        if data.windows.is_empty() && data.remembered.is_empty() {
+            return;
         }
+        for entry in &data.remembered {
+            let Some(id) = AppId::from_name(&entry.app) else {
+                continue;
+            };
+            self.remembered[id as usize] = Some(RememberedWindow {
+                x: entry.x,
+                y: entry.y,
+                cols: entry.cols,
+                rows: entry.rows,
+                maximized: entry.maximized,
+            });
+        }
+        let max_x = (self.screen_w as i32 - 40).max(0);
+        let max_y = (self.screen_h as i32 - TASKBAR_HEIGHT as i32 - TITLE_BAR_HEIGHT as i32).max(0);
+        for entry in &data.windows {
+            let Some(id) = AppId::from_name(&entry.app) else {
+                continue;
+            };
+            if self.windows.iter().any(|w| w.open && w.app_id == Some(id)) {
+                continue;
+            }
+            self.run_launcher_action(builtin_action(id));
+            let idx = self.focused;
+            self.windows[idx].x = entry.x.clamp(0, max_x);
+            self.windows[idx].y = entry.y.clamp(0, max_y);
+            if !entry.maximized && entry.cols > 0 {
+                let cols = entry.cols.max(MIN_COLS);
+                let rows = entry.rows.max(MIN_ROWS);
+                resize_window(&mut self.windows[idx], cols, rows);
+            }
+            if entry.maximized {
+                self.maximize_window(idx);
+            }
+            self.windows[idx].minimized = entry.minimized;
+        }
+        // Rewrite the file so a stale session (apps that no longer exist)
+        // doesn't come back on the next boot.
+        self.persist_session();
+    }
+
+    /// Persists the current desktop state (open windows and remembered
+    /// geometry) to `/system/desktop.session`, so the next boot can
+    /// restore it. Called after any window opens, closes, moves, resizes,
+    /// or changes minimized/maximized state; a failed disk write is
+    /// silently ignored (the in-memory session stays authoritative).
+    fn persist_session(&self) {
+        let mut data = crate::session::SessionData::default();
+        for window in &self.windows {
+            if !window.open {
+                continue;
+            }
+            let Some(id) = window.app_id else {
+                continue;
+            };
+            let (cols, rows) = window.cols_rows();
+            data.windows.push(crate::session::SessionWindow {
+                app: id.name().to_string(),
+                x: window.x,
+                y: window.y,
+                cols,
+                rows,
+                minimized: window.minimized,
+                maximized: window.maximized,
+            });
+        }
+        for (index, remembered) in self.remembered.iter().enumerate() {
+            let Some(remembered) = remembered else {
+                continue;
+            };
+            let Some(id) = AppId::from_index(index) else {
+                continue;
+            };
+            if data.windows.iter().any(|w| w.app == id.name()) {
+                continue;
+            }
+            data.remembered.push(crate::session::SessionWindow {
+                app: id.name().to_string(),
+                x: remembered.x,
+                y: remembered.y,
+                cols: remembered.cols,
+                rows: remembered.rows,
+                minimized: false,
+                maximized: remembered.maximized,
+            });
+        }
+        crate::session::save_to_disk(&data);
     }
 
     pub fn clock_tick_due(&mut self) -> bool {
@@ -489,6 +651,7 @@ impl WindowManager {
             }
         }
         self.settings = Settings::load();
+        self.persist_session();
     }
 
     /// Reflows the desktop to a new font scale in place, keeping every
@@ -527,6 +690,7 @@ impl WindowManager {
             // even when its cell count didn't change.
             resize_window(window, target_cols, target_rows);
         }
+        self.persist_session();
     }
 
     /// Records a window's current geometry as "where this app was last
@@ -902,6 +1066,7 @@ impl WindowManager {
             }
             if just_released {
                 self.resizing = None;
+                self.persist_session();
             }
             return;
         }
@@ -937,6 +1102,9 @@ impl WindowManager {
             }
         }
         if just_released {
+            if self.dragging.is_some() {
+                self.persist_session();
+            }
             self.dragging = None;
             self.press_state = None;
         }
@@ -1030,6 +1198,7 @@ impl WindowManager {
                 let action = self.launcher_items[idx].1.clone();
                 self.launcher_open = false;
                 self.run_launcher_action(action);
+                self.persist_session();
             } else {
                 // Clicking the Start button again, or anywhere else,
                 // dismisses the popup (a second Start click shouldn't
@@ -1051,6 +1220,7 @@ impl WindowManager {
                 if self.cursor_x >= x && self.cursor_x < x + w {
                     self.windows[i].minimized = false;
                     self.raise(i);
+                    self.persist_session();
                     return;
                 }
             }
@@ -1096,6 +1266,7 @@ impl WindowManager {
                     self.remember_geometry(i);
                     self.windows[i].open = false;
                     self.refocus_after_hide(i);
+                    self.persist_session();
                     return;
                 }
                 if let Some(max_x) = maximize_x {
@@ -1107,12 +1278,14 @@ impl WindowManager {
                         } else {
                             self.maximize_window(focused_index);
                         }
+                        self.persist_session();
                         return;
                     }
                 }
                 if in_button_row && self.cursor_x >= minimize_x && self.cursor_x < minimize_x + TITLE_BTN_W as i32 {
                     self.windows[i].minimized = true;
                     self.refocus_after_hide(i);
+                    self.persist_session();
                     return;
                 }
 

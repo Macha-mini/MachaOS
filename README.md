@@ -85,7 +85,15 @@ the physical mode — the desktop scales to fill the real framebuffer) and
 the **font size** (100% / 200% — the whole UI relayouts and the desktop
 rebuilds at the new scale), *Personalization* has the accent color,
 wallpaper and background-task toggles, and *About* shows system info.
-Settings persist to `/system/settings.conf` and are applied at boot.
+Settings persist to `/system/settings.conf` and are applied at boot, and
+the desktop **session** persists too: the set of open windows (app,
+position, size, minimized/maximized state) is written to
+`/system/desktop.session` whenever a window opens, closes, moves, resizes
+or changes state, and the desktop restores it at the next boot — so the
+OS comes back the way you left it. (Remembered geometry of closed apps
+survives a reboot as well, so reopening an app from the start menu puts
+it back where it was.) The session file is plain text and is ignored
+entirely if it is missing or malformed.
 
 The Notepad is a text editor with arrow-key cursor movement and
 Enter/Backspace line editing. Press **Ctrl+S** to save the document to

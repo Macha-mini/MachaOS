@@ -1,6 +1,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -834,6 +835,116 @@ pub fn selftest() -> ! {
             info.free_clusters
         );
     }
+
+    // Desktop session persistence: serialize a representative set of
+    // open windows and remembered geometries, save it to the disk,
+    // load it back and check every field survives the round trip.
+    // Also proves the parser is lenient (garbage lines are skipped).
+    use crate::session::{self, SessionData, SessionWindow};
+    let original = SessionData {
+        windows: vec![
+            SessionWindow {
+                app: "terminal".into(),
+                x: 100,
+                y: 80,
+                cols: 80,
+                rows: 24,
+                minimized: false,
+                maximized: false,
+            },
+            SessionWindow {
+                app: "notepad".into(),
+                x: 300,
+                y: 200,
+                cols: 60,
+                rows: 12,
+                minimized: true,
+                maximized: false,
+            },
+            SessionWindow {
+                app: "settings".into(),
+                x: 20,
+                y: 40,
+                cols: 0,
+                rows: 0,
+                minimized: false,
+                maximized: true,
+            },
+            SessionWindow {
+                app: "sysinfo".into(),
+                x: -5,
+                y: 700,
+                cols: 38,
+                rows: 16,
+                minimized: false,
+                maximized: false,
+            },
+        ],
+        remembered: vec![
+            SessionWindow {
+                app: "calculator".into(),
+                x: 140,
+                y: 100,
+                cols: 0,
+                rows: 0,
+                minimized: false,
+                maximized: false,
+            },
+            SessionWindow {
+                app: "paint".into(),
+                x: 512,
+                y: 384,
+                cols: 0,
+                rows: 0,
+                minimized: false,
+                maximized: true,
+            },
+        ],
+    };
+    let text = session::serialize(&original);
+    let reparsed = session::parse(&text);
+    if reparsed != original {
+        selftest_fail("desktop session serialize/parse round trip mismatch");
+    }
+    println!(
+        "[OK] desktop session serialize/parse round trip ({} bytes)",
+        text.len()
+    );
+
+    // Disk round trip through the real persistence path: save_to_disk
+    // writes /system/desktop.session, load_from_disk reads it back —
+    // exactly what happens across a reboot.
+    if !session::save_to_disk(&original) {
+        selftest_fail("desktop session disk write failed");
+    }
+    let loaded = session::load_from_disk();
+    if loaded != original {
+        selftest_fail("desktop session save/load round trip mismatch");
+    }
+    println!("[OK] desktop session survives save/load round trip via /system/desktop.session");
+    if fat::remove("/system/desktop.session").is_err() {
+        selftest_fail("desktop session test cleanup failed");
+    }
+
+    // Missing file: loading yields an empty session, never an error.
+    let missing = session::load_from_disk();
+    if !missing.windows.is_empty() || !missing.remembered.is_empty() {
+        selftest_fail("desktop session missing-file load is not empty");
+    }
+    println!("[OK] desktop session missing file restores an empty session");
+
+    // Lenient parsing: unknown/malformed lines are skipped, the rest
+    // still loads.
+    let junk = "# comment\nwindow bogus notanumber 2 3 4 0 0\nnot a session\nremembered\nwindow terminal 50 60 40 10 0 1\n";
+    let parsed = session::parse(junk);
+    if parsed.windows.len() != 1
+        || parsed.windows[0].app != "terminal"
+        || parsed.windows[0].x != 50
+        || !parsed.windows[0].maximized
+    {
+        selftest_fail("desktop session lenient parsing failed");
+    }
+    println!("[OK] desktop session parsing skips malformed lines");
 
     // Shell path handling: cd/pwd, `..`, home expansion, and relative access.
     execute("cd /users/macha/Documents");
