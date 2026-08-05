@@ -32,6 +32,7 @@ const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_SFMASK: u32 = 0xC000_0084;
 const EFER_SCE: u64 = 1 << 0;
+const EFER_NXE: u64 = 1 << 11;
 
 pub(crate) const SYS_WRITE: u64 = 0;
 pub(crate) const SYS_EXIT: u64 = 1;
@@ -410,8 +411,13 @@ pub fn init() {
         let top = core::ptr::addr_of_mut!(SYSCALL_STACK) as usize + SYSCALL_STACK_SIZE;
         SYSCALL_KERNEL_RSP = (top & !0xF) as u64;
 
+        // NXE (Phase 6): without it the CPU silently ignores the PTE's NX
+        // bit and treats every present page as executable regardless —
+        // `paging.rs` sets NX per-segment (R/W but not X) once this is on,
+        // but the bit is meaningless dead weight in the page tables until
+        // the CPU is told to actually enforce it.
         let efer = rdmsr(MSR_EFER);
-        wrmsr(MSR_EFER, efer | EFER_SCE);
+        wrmsr(MSR_EFER, efer | EFER_SCE | EFER_NXE);
 
         // STAR[47:32] = SYSCALL's CS (SS = CS+8); STAR[63:48] = SYSRET's
         // base (see gdt.rs::SYSRET_BASE for why the GDT is laid out the

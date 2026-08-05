@@ -61,6 +61,14 @@
 //! logged permanently in `process::kill_current`) sent the fallback
 //! write to a wild address. Fixing this removed the crash entirely.
 //!
+//! Phase 6 also turns on real NX enforcement: `EFER.NXE` (`syscall::init`)
+//! plus `paging::PAGE_NX` on every mapped page this module doesn't mark
+//! executable (`mmap`'s `PROT_EXEC`, `mprotect`'s `PROT_EXEC`, and
+//! `process::load_segments` reading each ELF segment's real `PF_X` —
+//! previously every present page was silently executable regardless of
+//! what was asked for, since the bit was never set and the CPU was never
+//! told to check it either).
+//!
 //! KNOWN GAPS left beyond Phase 4:
 //! - No signal delivery: `rt_sigaction`/`rt_sigprocmask` just record
 //!   nothing and return success.
@@ -72,8 +80,7 @@
 //!   needs this for. `MAP_SHARED` isn't distinguished from
 //!   `MAP_PRIVATE` at all.
 //! - `munmap` only reclaims a mapping it fully contains (see
-//!   `process::Process::munmap`); `mprotect` only ever grants/revokes
-//!   write access (no NX enforcement — `paging.rs` has none yet).
+//!   `process::Process::munmap`).
 //! - `futex` never actually blocks or wakes anything (see `sys_futex`'s
 //!   doc comment) — fine for the single-threaded, uncontended-lock case
 //!   glibc's own startup hits, but `clone`/real threading aren't
@@ -578,6 +585,7 @@ const MAP_SHARED: u64 = 0x01;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
 const PROT_WRITE: u64 = 2;
+const PROT_EXEC: u64 = 4;
 
 enum MmapFdKind {
     File,
@@ -604,9 +612,10 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
     };
     let at = if flags & MAP_FIXED != 0 { Some(addr) } else { None };
     let writable = prot & PROT_WRITE != 0;
+    let executable = prot & PROT_EXEC != 0;
 
     if flags & MAP_ANONYMOUS != 0 || (fd as i64) < 0 {
-        return with_process(|p| p.mmap_anon(pml4, at, len, writable)).flatten().unwrap_or(err(ENOMEM));
+        return with_process(|p| p.mmap_anon(pml4, at, len, writable, executable)).flatten().unwrap_or(err(ENOMEM));
     }
 
     let kind = with_process(|p| match p.fd_mut(fd as usize) {
@@ -618,7 +627,7 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
 
     match kind {
         Some(MmapFdKind::Shm(shm_id)) if flags & MAP_SHARED != 0 => {
-            with_process(|p| p.mmap_shared(pml4, at, shm_id, writable)).flatten().unwrap_or(err(ENOMEM))
+            with_process(|p| p.mmap_shared(pml4, at, shm_id, writable, executable)).flatten().unwrap_or(err(ENOMEM))
         }
         Some(MmapFdKind::Shm(_)) => err(EINVAL),
         Some(MmapFdKind::File) => {
@@ -633,7 +642,7 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
                 Some(buf)
             });
             match content {
-                Some(Some(bytes)) => with_process(|p| p.mmap_file(pml4, at, len, writable, &bytes)).flatten().unwrap_or(err(ENOMEM)),
+                Some(Some(bytes)) => with_process(|p| p.mmap_file(pml4, at, len, writable, executable, &bytes)).flatten().unwrap_or(err(ENOMEM)),
                 _ => err(EBADF),
             }
         }
@@ -657,7 +666,8 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
         return err(EINVAL);
     };
     let writable = prot & PROT_WRITE != 0;
-    if with_process(|p| p.mprotect(pml4, addr, len, writable)).unwrap_or(false) {
+    let executable = prot & PROT_EXEC != 0;
+    if with_process(|p| p.mprotect(pml4, addr, len, writable, executable)).unwrap_or(false) {
         0
     } else {
         err(EINVAL)

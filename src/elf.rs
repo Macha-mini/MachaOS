@@ -43,10 +43,9 @@ pub struct Segment {
     pub filesz: u64,
     pub memsz: u64,
     pub writable: bool,
-    /// From `PF_X`. Not yet enforced (mapping the segment doesn't set the
-    /// NX bit on non-executable pages — `paging.rs` has no NX support
-    /// yet), but recorded so that piece can be added later without
-    /// touching the ELF parser again.
+    /// From `PF_X` — `process::load_segments` sets the NX bit
+    /// (`paging::PAGE_NX`) on every mapped page not covered by a segment
+    /// with this set.
     pub executable: bool,
 }
 

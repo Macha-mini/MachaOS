@@ -342,7 +342,7 @@ impl Process {
             new_low,
             phys,
             grow_len,
-            paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+            paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER | paging::PAGE_NX,
             &mut self.frames,
         ) {
             return false;
@@ -395,7 +395,7 @@ impl Process {
                 map_at,
                 phys as u64,
                 grow_len,
-                paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+                paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER | paging::PAGE_NX,
                 &mut self.frames,
             ) {
                 return self.heap_end;
@@ -413,8 +413,8 @@ impl Process {
 
     /// Linux anonymous `mmap`: freshly zeroed frames, no initial content.
     /// See `mmap_with_content` for the shared implementation.
-    pub fn mmap_anon(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool) -> Option<u64> {
-        self.mmap_with_content(pml4, at, len, writable, None)
+    pub fn mmap_anon(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool, executable: bool) -> Option<u64> {
+        self.mmap_with_content(pml4, at, len, writable, executable, None)
     }
 
     /// Linux file-backed `mmap`: same as `mmap_anon`, except the mapped
@@ -431,8 +431,8 @@ impl Process {
     /// process already gets its own physical frames either way (`fork`
     /// isn't implemented, so nothing could ever share these frames'
     /// backing across processes regardless).
-    pub fn mmap_file(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool, content: &[u8]) -> Option<u64> {
-        self.mmap_with_content(pml4, at, len, writable, Some(content))
+    pub fn mmap_file(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool, executable: bool, content: &[u8]) -> Option<u64> {
+        self.mmap_with_content(pml4, at, len, writable, executable, Some(content))
     }
 
     /// `at`, when `Some`, is a `MAP_FIXED` request (used verbatim,
@@ -441,7 +441,7 @@ impl Process {
     /// free address in the bump-allocated arena `MMAP_BASE..MMAP_CEILING`.
     /// No lazy/demand-paged anonymous memory — see Phase 1's plan notes
     /// on why that was deferred.
-    fn mmap_with_content(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool, content: Option<&[u8]>) -> Option<u64> {
+    fn mmap_with_content(&mut self, pml4: u64, at: Option<u64>, len: u64, writable: bool, executable: bool, content: Option<&[u8]>) -> Option<u64> {
         let len = align_up(len.max(1), paging::PAGE_SIZE);
         let addr = match at {
             Some(a) => a & !(paging::PAGE_SIZE - 1),
@@ -469,6 +469,9 @@ impl Process {
         if writable {
             flags |= paging::PAGE_WRITABLE;
         }
+        if !executable {
+            flags |= paging::PAGE_NX;
+        }
         if !paging::map_range_in(pml4, addr, phys as u64, len, flags, &mut self.frames) {
             return None;
         }
@@ -494,7 +497,7 @@ impl Process {
     /// mapped `Mapping` doesn't own these frames (`shm_id: Some(id)`
     /// marks that for `munmap`/process exit): `shm.rs`'s own refcount,
     /// not this process, decides when they're freed.
-    pub fn mmap_shared(&mut self, pml4: u64, at: Option<u64>, shm_id: usize, writable: bool) -> Option<u64> {
+    pub fn mmap_shared(&mut self, pml4: u64, at: Option<u64>, shm_id: usize, writable: bool, executable: bool) -> Option<u64> {
         let phys = shm::phys_of(shm_id)?;
         let pages = shm::pages_of(shm_id)?;
         let len = (pages * paging::PAGE_SIZE as usize) as u64;
@@ -514,6 +517,9 @@ impl Process {
         let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
         if writable {
             flags |= paging::PAGE_WRITABLE;
+        }
+        if !executable {
+            flags |= paging::PAGE_NX;
         }
         if !paging::map_range_in(pml4, addr, phys as u64, len, flags, &mut self.frames) {
             return None;
@@ -565,11 +571,9 @@ impl Process {
     /// Linux `mprotect`. Re-maps each page already owned in
     /// `[addr, addr+len)` at its existing physical address with the new
     /// permission (`map_range_in` overwrites a PTE unconditionally, so
-    /// this needs no fresh frames) — read/write only; there's no
-    /// executable-bit enforcement to change since `paging.rs` has no NX
-    /// support yet (see `elf::Segment::executable`'s doc comment). Fails
-    /// if any page in the range isn't currently owned by this process.
-    pub fn mprotect(&mut self, pml4: u64, addr: u64, len: u64, writable: bool) -> bool {
+    /// this needs no fresh frames). Fails if any page in the range isn't
+    /// currently owned by this process.
+    pub fn mprotect(&mut self, pml4: u64, addr: u64, len: u64, writable: bool, executable: bool) -> bool {
         let len = align_up(len.max(1), paging::PAGE_SIZE);
         let start = addr & !(paging::PAGE_SIZE - 1);
         let mut v = start;
@@ -580,6 +584,9 @@ impl Process {
             let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
             if writable {
                 flags |= paging::PAGE_WRITABLE;
+            }
+            if !executable {
+                flags |= paging::PAGE_NX;
             }
             if !paging::map_range_in(pml4, v, phys, paging::PAGE_SIZE, flags, &mut self.frames) {
                 return false;
@@ -948,6 +955,12 @@ fn load_segments(
         {
             flags |= paging::PAGE_WRITABLE;
         }
+        if !segments
+            .iter()
+            .any(|s| s.executable && s.vaddr < page_end && s.vaddr + s.memsz > page_vaddr)
+        {
+            flags |= paging::PAGE_NX;
+        }
         if !paging::map_range_in(pml4, page_vaddr, page_phys, paging::PAGE_SIZE, flags, &mut process.frames) {
             return Err("failed to map segment");
         }
@@ -998,7 +1011,7 @@ fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str
         USER_STACK_BASE,
         stack_phys,
         stack_len,
-        paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+        paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER | paging::PAGE_NX,
         &mut process.frames,
     ) {
         return Err("failed to map user stack");
@@ -1250,7 +1263,7 @@ fn setup_linux_stack(
         region_start,
         phys,
         region_len,
-        paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER,
+        paging::PAGE_PRESENT | paging::PAGE_WRITABLE | paging::PAGE_USER | paging::PAGE_NX,
         &mut process.frames,
     ) {
         return Err("failed to map linux-style stack");
