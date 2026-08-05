@@ -103,19 +103,37 @@
 //!   available (required by hello)"` and `"undefined symbol:
 //!   __libc_start_main, version GLIBC_2.34"` — with the *program's own
 //!   name* in every position of that error, including where `libc.so.6`
-//!   itself should appear. That specific detail points at an internal
-//!   `ld.so` link_map identity bug (something making its bookkeeping for
-//!   `libc.so.6` alias the main executable's own — e.g. a `brk`/heap
-//!   allocation collision) rather than a straightforwardly-missing
-//!   syscall; reproduced identically across three independent real
-//!   binaries (ruling out a version-mismatched test fixture), so the
-//!   next investigation should look at `Process::brk`/`mmap_anon`'s
-//!   allocation behavior during `ld.so`'s own early bootstrap rather
-//!   than at file I/O. Testing against real binaries is exactly what
-//!   found and fixed the AT_PHDR/`pread64`/`AT_EMPTY_PATH`/stack-buffer/
-//!   `access`(21)/register-preservation bugs the rest of this file's
-//!   history documents; this is the next one, left for follow-up —
-//!   consistent with the plan's own framing of Phase 4/6 dynamic-linking
+//!   itself should appear. That specific detail, cross-checked against
+//!   real glibc source (`elf/dl-version.c`'s `match_symbol` /
+//!   `_dl_check_map_versions`, `glibc-2.36` tag: the second `%s` there
+//!   is `DSO_FILENAME(map->l_name)` where `map` is `needed->l_real` —
+//!   `libc.so.6`'s own resolved `link_map`), means `libc.so.6`'s
+//!   `link_map` in `ld.so`'s own bookkeeping has `l_name` aliasing the
+//!   main executable's, and a null `DT_VERDEF` `l_info` entry — an
+//!   internal `ld.so` object-identity bug, not a straightforwardly-
+//!   missing syscall. `Process::brk`'s own implementation (the obvious
+//!   first suspect) looks sound on inspection. The more promising lead:
+//!   `ld.so`'s early bootstrap allocates small structures like
+//!   `struct link_map` through its own `__minimal_malloc`
+//!   (`elf/dl-minimal-malloc.c`), which bump-allocates out of *leftover
+//!   space in the last page of `ld.so`'s own data segment* (`&_end`
+//!   rounded up to a page) before ever falling back to a real
+//!   `mmap(MAP_ANONYMOUS)` — consistent with the trace showing no early
+//!   anonymous mmaps either. If that leftover-space computation or the
+//!   zero-fill of `ld.so`'s own BSS tail is subtly off, two of these
+//!   small allocations could alias without either side's `mmap` ever
+//!   being wrong. Worth checking directly next: dump the addresses
+//!   `__minimal_malloc` actually hands back (or, from this side,
+//!   whether `process::load_segments` zero-fills exactly the declared
+//!   `memsz` of `ld.so`'s own last segment, no more and no less) before
+//!   assuming the bug is elsewhere. Reproduced identically across three
+//!   independent real binaries (GNU Hello, coreutils `true`/`cat`),
+//!   ruling out a version-mismatched test fixture. Testing against real
+//!   binaries is exactly what found and fixed the AT_PHDR/`pread64`/
+//!   `AT_EMPTY_PATH`/stack-buffer/`access`(21)/register-preservation
+//!   bugs the rest of this file's history documents; this is the next
+//!   one, left for follow-up — consistent with the plan's own framing
+//!   of Phase 4/6 dynamic-linking
 //!   work as roadmap-level rigor rather than Phase 1/2's full-completion
 //!   bar.
 //! - `socket`/`sendmsg`/`recvmsg` only support `AF_UNIX`/`SOCK_STREAM`,
