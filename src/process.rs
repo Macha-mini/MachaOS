@@ -123,6 +123,8 @@ pub enum FdEntry {
     Shm(usize, usize),
     /// `socket.rs` endpoint id.
     Socket(usize),
+    /// `pipe.rs` pipe id; `true` for the read end (fd[0]).
+    Pipe(usize, bool),
 }
 
 impl Drop for FdEntry {
@@ -134,6 +136,7 @@ impl Drop for FdEntry {
         match self {
             FdEntry::Shm(id, _) => shm::close(*id),
             FdEntry::Socket(id) => socket::close(*id),
+            FdEntry::Pipe(id, is_read) => crate::pipe::close_end(*id, *is_read),
             FdEntry::File(_) => {}
         }
     }
@@ -141,10 +144,10 @@ impl Drop for FdEntry {
 
 impl FdEntry {
     /// Copy for `fork`. `File` deep-copies (`vfs::FileHandle::dup`);
-    /// `Shm` shares the object (refcount bumped — `Drop` in the child
-    /// then only drops the child's reference); `Socket` endpoints are
-    /// single-owner in `socket.rs`, so they're not duplicated (the child
-    /// gets no such fd — a documented limitation, and nothing the
+    /// `Shm`/`Pipe` share the object (refcount bumped — `Drop` in the
+    /// child then only drops the child's reference); `Socket` endpoints
+    /// are single-owner in `socket.rs`, so they're not duplicated (the
+    /// child gets no such fd — a documented limitation, and nothing the
     /// current test binaries exercise across a fork).
     pub fn dup(&self) -> Option<FdEntry> {
         match self {
@@ -152,6 +155,10 @@ impl FdEntry {
             FdEntry::Shm(id, cursor) => {
                 shm::dup(*id);
                 Some(FdEntry::Shm(*id, *cursor))
+            }
+            FdEntry::Pipe(id, is_read) => {
+                crate::pipe::dup_end(*id, *is_read);
+                Some(FdEntry::Pipe(*id, *is_read))
             }
             FdEntry::Socket(_) => None,
         }
@@ -278,6 +285,23 @@ impl Process {
 
     pub fn fd_mut(&mut self, fd: usize) -> Option<&mut FdEntry> {
         self.fds.get_mut(fd)?.as_mut()
+    }
+
+    /// Immutable fd access (for `dup` — the entry is copied out).
+    pub fn fd(&self, fd: usize) -> Option<&FdEntry> {
+        self.fds.get(fd)?.as_ref()
+    }
+
+    /// Places `entry` at exactly `fd` (the caller closed any previous
+    /// occupant); returns `fd`.
+    pub fn set_fd(&mut self, fd: usize, entry: FdEntry) -> usize {
+        if fd >= self.fds.len() {
+            while self.fds.len() <= fd {
+                self.fds.push(None);
+            }
+        }
+        self.fds[fd] = Some(entry);
+        fd
     }
 
     /// Closes `fd`, flushing it (see `vfs::FileHandle::drop`). Returns
@@ -710,6 +734,22 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
 /// (`linux_abi.rs`) instead of the native one (`Abi::Linux`). Used both
 /// by the Phase 1/2 test programs and by `shell.rs`'s `runlinux` command.
 pub fn spawn_linux(elf_bytes: &[u8], name: &'static str, argv: &[&str], envp: &[&str]) -> Result<usize, &'static str> {
+    let (process, pml4) = load_linux_process(elf_bytes, argv, envp, (0..FIRST_FILE_FD).map(|_| None).collect())?;
+    Ok(task::spawn_process(process_entry_trampoline, name, pml4, process))
+}
+
+/// The shared Linux-ELF loader behind `spawn_linux` and `execve`:
+/// parses, applies the PIE bias, validates, builds the process (starting
+/// with the given fd table — fresh for `spawn_linux`, the current
+/// process's for `execve`), maps the segments, loads `PT_INTERP`'s
+/// interpreter as the real entry point when present, and builds the
+/// argv/envp/auxv stack. Returns `(process, pml4)`.
+fn load_linux_process(
+    elf_bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+    fds: Vec<Option<FdEntry>>,
+) -> Result<(Process, u64), &'static str> {
     let mut program = elf::parse(elf_bytes)?;
     apply_pie_bias(&mut program);
     validate_segments(&program)?;
@@ -732,7 +772,7 @@ pub fn spawn_linux(elf_bytes: &[u8], name: &'static str, argv: &[&str], envp: &[
         state: ProcessState::Running,
         exit_info: None,
         inbox: None,
-        fds: (0..FIRST_FILE_FD).map(|_| None).collect(),
+        fds,
         stack_low: USER_STACK_BASE,
         stack_phys_base: 0, // set by init_stack_backing below
         abi: Abi::Linux,
@@ -805,7 +845,51 @@ pub fn spawn_linux(elf_bytes: &[u8], name: &'static str, argv: &[&str], envp: &[
     };
     process.user_rsp = user_rsp;
 
-    Ok(task::spawn_process(process_entry_trampoline, name, pml4, process))
+    Ok((process, pml4))
+}
+
+/// `execve`: loads `elf_bytes` into the *current* process — its fd table
+/// carries over (Linux keeps fds across exec), the old address space is
+/// freed, an exit chain is parked on the current task's kernel stack
+/// below the running syscall's frames, and the ring-3 resume state is
+/// stashed for the asm's exec-restart path, which iretq's into the new
+/// program instead of sysretq'ing to the old (freed) instruction
+/// pointer. Returns the new `(entry, user_rsp)`.
+pub fn execve_into_current(
+    elf_bytes: &[u8],
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<(u64, u64), &'static str> {
+    // Take the current fd table (the new process inherits it), build the
+    // new process, then swap it in and free the old address space.
+    let (new_process, new_cr3) = {
+        let taken = task::with_current_process_mut(|p| core::mem::take(&mut p.fds))
+            .ok_or("not a process")?;
+        load_linux_process(elf_bytes, argv, envp, taken)?
+    };
+    let entry = new_process.entry;
+    let user_rsp = new_process.user_rsp;
+    let current = task::current_pid();
+    if let Some(old) = task::replace_current_process(current, new_process) {
+        free_process(old);
+    }
+    task::set_current_cr3(current, new_cr3);
+    // Park the exit chain *below* the current syscall's frames: 6 slots
+    // `.Lsyscall_exit` pops into r15..rbx, then `exit_self`. (A local's
+    // address is inside the handler's own frame; 128 bytes below it is
+    // safely clear of everything the rest of this syscall touches.)
+    let local = 0u8;
+    let chain = (&local as *const u8 as usize) - 128;
+    unsafe {
+        let chain_p = chain as *mut usize;
+        for i in 0..6 {
+            *chain_p.add(i) = 0;
+        }
+        *chain_p.add(6) = exit_self as usize;
+    }
+    task::set_current_ring3_kernel_rsp(current, chain as u64);
+    crate::syscall::set_exec_restart(entry as u64, user_rsp);
+    Ok((entry as u64, user_rsp))
 }
 
 /// The process's segments must live outside the kernel's own territory:
@@ -1318,10 +1402,22 @@ extern "C" fn process_entry_trampoline() -> ! {
 /// skips exited processes, so control passes back to the kernel tasks at
 /// the next timer tick, and `reap` can then free the process's frames.
 extern "C" fn exit_self() -> ! {
+    close_fds_on_exit();
     task::mark_current_exited(ExitInfo::Normal);
     loop {
         interrupts::halt();
     }
+}
+
+/// Drops the current process's fd table *at exit* (not at reap), the way
+/// real Linux closes fds when a process dies: a pipe's write end closing
+/// is what makes a reader see EOF, and an exited-but-unreaped child must
+/// not keep its pipe ends alive. Safe for the exit path — nothing after
+/// this point reads the fd table (`read_result`/`wait` don't use it).
+pub fn close_fds_on_exit() {
+    let _ = task::with_current_process_mut(|p| {
+        p.fds.clear();
+    });
 }
 
 /// Exit stub for a CLONE_VM thread (see `task::spawn_child`): clears the
@@ -1341,6 +1437,7 @@ extern "C" fn thread_exit_self() -> ! {
         }
     }
     if crate::syscall::exit_group_flag() {
+        close_fds_on_exit();
         task::mark_current_exited_group(ExitInfo::Normal);
     } else {
         task::mark_current_exited(ExitInfo::Normal);
@@ -1426,7 +1523,27 @@ fn fork_copy(parent: &Process) -> Result<(Process, u64), &'static str> {
         unsafe {
             core::ptr::copy_nonoverlapping(m.phys as *const u8, phys as *mut u8, m.len as usize);
         }
-        let flags = read_pte_flags(parent_cr3, m.vaddr) | paging::PAGE_PRESENT;
+        // Use the attributes of the first *user-mapped* page in this
+        // mapping: the stack mapping's region below the initial stack
+        // was created when the kernel's 2 MiB identity entry got split,
+        // so those PTEs are the split's supervisor copies (P|W only) —
+        // taking the first *present* page's flags would map the child's
+        // whole stack supervisor-only and every user access would fault
+        // with P=1,U=1. The demand-grown region between them is
+        // user-mapped, so skipping non-user pages lands on the real
+        // stack attributes.
+        let mut flags = 0u64;
+        let mut page = m.vaddr;
+        while page < m.vaddr + m.len {
+            flags = read_pte_flags(parent_cr3, page);
+            if flags & paging::PAGE_USER != 0 {
+                break;
+            }
+            page += paging::PAGE_SIZE;
+        }
+        if flags & paging::PAGE_USER == 0 {
+            continue; // no user page in this mapping — leave it unmapped
+        }
         if !paging::map_range_in(pml4, m.vaddr, phys as u64, m.len, flags, &mut child.frames) {
             return Err("fork: mapping copy failed");
         }
@@ -1560,6 +1677,7 @@ fn redirect_to_exit(frame: &mut interrupts::InterruptFrame) {
 
 /// Called from the #PF handler when the faulting task is a process.
 pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
+    close_fds_on_exit();
     task::mark_current_exited(ExitInfo::PageFault { cr2 });
     let rip = frame.rip;
     redirect_to_exit(frame);

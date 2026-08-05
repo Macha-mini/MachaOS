@@ -40,6 +40,7 @@ mod pci;
 mod pic;
 mod pit;
 mod pmm;
+mod pipe;
 mod port;
 mod power;
 mod process;

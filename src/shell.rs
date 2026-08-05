@@ -1502,6 +1502,21 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2g: Phase 7b fork + pipe2 + wait4. The
+    // parent pipes a message through a forked child and reaps it; 2
+    // checks, one bit each.
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_FORK, "linux-fork", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 400) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux fork process exited normally"),
+        other => selftest_fail(&format!("linux-fork process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0x3) => println!("[OK] Linux fork: pipe through child + wait4 all correct"),
+        other => selftest_fail(&format!("linux-fork process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.

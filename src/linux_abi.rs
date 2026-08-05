@@ -188,6 +188,7 @@ const ENOENT: i32 = 2;
 const EAGAIN: i32 = 11;
 const EIO: i32 = 5;
 const ENOMEM: i32 = 12;
+const ENOEXEC: i32 = 8;
 
 /// Negates and sign-extends `errno` into the raw `u64` a syscall returns
 /// on failure, matching the real Linux convention (small negative values
@@ -349,6 +350,14 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
         },
         Some(FdEntry::Shm(id, cursor)) => shm_write(*id, cursor, bytes) as u64,
         Some(FdEntry::Socket(id)) => socket::send(*id, bytes, &[]).map(|n| n as u64).unwrap_or(err(EPIPE)),
+        Some(FdEntry::Pipe(id, _)) => {
+            let n = crate::pipe::write(*id, bytes);
+            if n == 0 {
+                err(EPIPE)
+            } else {
+                n as u64
+            }
+        }
         None => err(EBADF),
     })
     .unwrap_or(err(EBADF))
@@ -385,6 +394,10 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
         Some(FdEntry::Shm(id, cursor)) => {
             let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
             shm_read(*id, cursor, out) as u64
+        }
+        Some(FdEntry::Pipe(id, _)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            crate::pipe::read(*id, out) as u64
         }
         Some(FdEntry::Socket(id)) => {
             let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
@@ -476,6 +489,183 @@ fn sys_access(pathname: u64, _mode: u64) -> u64 {
     }
 }
 
+/// Reads a NUL-terminated string from user memory (the old address
+/// space — safe to call before an execve frees it).
+fn read_user_cstr(ptr: u64) -> Option<alloc::string::String> {
+    let mut out = alloc::vec::Vec::new();
+    let mut i = 0u64;
+    loop {
+        let phys = resolve(ptr + i, 1)?;
+        let b = unsafe { core::ptr::read(phys as *const u8) };
+        if b == 0 {
+            break;
+        }
+        out.push(b);
+        i += 1;
+    }
+    Some(alloc::string::String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Reads a NULL-terminated array of string pointers from user memory.
+fn read_user_argv(ptr: u64) -> Option<Vec<alloc::string::String>> {
+    let mut v = Vec::new();
+    let mut i = 0u64;
+    loop {
+        let phys = resolve(ptr + i * 8, 8)?;
+        let p = unsafe { core::ptr::read_unaligned(phys as *const u64) };
+        if p == 0 {
+            break;
+        }
+        v.push(read_user_cstr(p)?);
+        i += 1;
+    }
+    Some(v)
+}
+
+/// `execve(path, argv, envp)`: replaces the current process's address
+/// space with the ELF at `path` and restarts it at the new entry. On
+/// success returns the `EXECVE_RESTART_MAGIC` sentinel the asm uses to
+/// iretq into the new program instead of returning to the old rip.
+fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+    let Some(path) = read_user_cstr(path_ptr) else {
+        return err(EFAULT);
+    };
+    let argv = match read_user_argv(argv_ptr) {
+        Some(v) => v,
+        None => return err(EFAULT),
+    };
+    let envp = match read_user_argv(envp_ptr) {
+        Some(v) => v,
+        None => return err(EFAULT),
+    };
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let envp_refs: Vec<&str> = envp.iter().map(|s| s.as_str()).collect();
+    let bytes = match crate::fat::read_file(&path) {
+        Ok(b) => b,
+        Err(_) => return err(ENOENT),
+    };
+    match crate::process::execve_into_current(&bytes, &argv_refs, &envp_refs) {
+        Ok((_entry, _rsp)) => crate::syscall::EXECVE_RESTART_MAGIC_VALUE,
+        Err(e) => {
+            crate::io::exception_print(crate::io::sprint(
+                &mut [0u8; 256],
+                format_args!("[EXECVE] {}: {}\n", path, e),
+            ));
+            err(ENOEXEC)
+        }
+    }
+}
+
+/// `wait4(pid, wstatus, options, rusage)`: waits for a process to exit
+/// and reports it. `pid > 0` waits for that exact pid; `-1`/`0` waits
+/// for any exited process (scanning in pid order). `WNOHANG` returns
+/// immediately with 0 instead of blocking. The wait is a poll loop
+/// yielding between checks — the child's exit is marked by its own
+/// exit path, and the parent simply re-checks after each reschedule.
+/// The status is Linux's wait encoding: `exit_code << 8` for a normal
+/// exit, the signal number for a signal/exception death.
+fn sys_wait4(pid: u64, wstatus: u64, options: u64, _rusage: u64) -> u64 {
+    const WNOHANG: u64 = 1;
+    const WIFEXITED_SHIFT: u64 = 8;
+    let status_ptr = wstatus;
+    let target = pid as i64;
+    loop {
+        // Find an exited process matching the request.
+        let mut found: Option<(usize, crate::process::ExitInfo)> = None;
+        let count = crate::task::task_count();
+        for cand in 0..count {
+            let is_match = if target == -1 || target == 0 {
+                true
+            } else {
+                cand as i64 == target
+            };
+            if !is_match {
+                continue;
+            }
+            if let Some(info) = crate::task::process_exit_status(cand) {
+                found = Some((cand, info));
+                break;
+            }
+        }
+        if let Some((cand, info)) = found {
+            let status = match info {
+                crate::process::ExitInfo::Normal => 0u64 << WIFEXITED_SHIFT,
+                crate::process::ExitInfo::PageFault { .. } => 11, // SIGSEGV
+                crate::process::ExitInfo::Exception { .. } => 6,  // SIGABRT-ish
+            };
+            if status_ptr != 0 {
+                if let Some(phys) = resolve(status_ptr, 4) {
+                    unsafe {
+                        core::ptr::write_unaligned(phys as *mut u32, status as u32);
+                    }
+                }
+            }
+            return cand as u64;
+        }
+        if options & WNOHANG != 0 {
+            return 0;
+        }
+        // Not exited yet: yield (round-robin) and re-check. If the
+        // target pid doesn't exist at all this would spin forever, but
+        // the only callers wait on pids they forked.
+        crate::task::yield_rr();
+    }
+}
+
+/// `dup(oldfd)`: a new fd referring to the same open description.
+fn sys_dup(oldfd: u64) -> u64 {
+    with_process(|p| {
+        let old = p.fd(oldfd as usize)?.dup()?;
+        Some(p.alloc_fd(old) as u64)
+    })
+    .flatten()
+    .unwrap_or(err(EBADF))
+}
+
+/// `dup2(oldfd, newfd)`: like `dup`, but places the copy at exactly
+/// `newfd` (closing whatever was there).
+fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
+    with_process(|p| {
+        if oldfd == newfd {
+            return Some(newfd);
+        }
+        let old = p.fd(oldfd as usize)?.dup()?;
+        p.close_fd(newfd as usize);
+        Some(p.set_fd(newfd as usize, old) as u64)
+    })
+    .flatten()
+    .unwrap_or(err(EBADF))
+}
+
+/// `pipe2(pipefd, flags)`: creates a pipe and writes the read-end fd to
+/// `pipefd[0]` and the write-end fd to `pipefd[1]`.
+fn sys_pipe2(pipefd: u64, _flags: u64) -> u64 {
+    let Some(phys) = resolve(pipefd, 16) else {
+        return err(EFAULT);
+    };
+    let id = crate::pipe::create();
+    match with_process(|p| {
+        let rd = p.alloc_fd(FdEntry::Pipe(id, true));
+        let wr = p.alloc_fd(FdEntry::Pipe(id, false));
+        Some((rd, wr))
+    })
+    .flatten()
+    {
+        Some((rd, wr)) => {
+            unsafe {
+                // Real Linux writes an `int[2]` (8 bytes total) — writing
+                // u64s here would overflow a caller's `int pipefd[2]`
+                // (the second u64 lands past the array) and corrupt
+                // whatever follows on the stack.
+                core::ptr::write_unaligned(phys as *mut u32, rd as u32);
+                core::ptr::write_unaligned((phys as *mut u8).add(4) as *mut u32, wr as u32);
+            }
+            0
+        }
+        None => err(EBADF),
+    }
+}
+
 fn sys_close(fd: u64) -> u64 {
     if fd < 3 {
         return 0; // stdio: no real fd table entry to remove
@@ -501,6 +691,7 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
             *cursor as u64
         }
         Some(FdEntry::Socket(_)) => err(ESPIPE),
+        Some(FdEntry::Pipe(_, _)) => err(ESPIPE), // pipes aren't seekable
         None => err(EBADF),
     })
     .unwrap_or(err(EBADF))
@@ -576,6 +767,7 @@ fn write_stat(buf_ptr: u64, mode: u32, size: u64, ino: u64) -> u64 {
 }
 
 const S_IFSOCK: u32 = 0o140000;
+const S_IFIFO: u32 = 0o010000;
 
 fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
     if fd < 3 {
@@ -589,6 +781,7 @@ fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         }
         Some(FdEntry::Shm(id, _)) => Some((S_IFREG | 0o600, shm::size_of(*id).unwrap_or(0) as u64, *id as u64 + 1)),
         Some(FdEntry::Socket(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
+        Some(FdEntry::Pipe(id, _)) => Some((S_IFIFO | 0o600, crate::pipe::buffered(*id) as u64, *id as u64 + 1)),
         None => None,
     });
     match result {
@@ -1210,6 +1403,18 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_CONNECT => sys_connect(arg1, arg2, arg3),
         SYS_SENDMSG => sys_sendmsg(arg1, arg2, arg3),
         SYS_RECVMSG => sys_recvmsg(arg1, arg2, arg3),
+        // Phase 7: process control — fork/clone/vfork are intercepted by
+        // the asm special path before dispatch; the rest live here.
+        SYS_EXECVE => sys_execve(arg1, arg2, arg3),
+        SYS_WAIT4 => sys_wait4(arg1, arg2, arg3, arg4),
+        SYS_DUP => sys_dup(arg1),
+        SYS_DUP2 => sys_dup2(arg1, arg2),
+        SYS_DUP3 => {
+            // dup3(oldfd, newfd, flags): flags are all O_CLOEXEC-ish,
+            // which this kernel doesn't track — behave like dup2.
+            sys_dup2(arg1, arg2)
+        }
+        SYS_PIPE2 => sys_pipe2(arg1, arg2),
         _ => {
             let mut buf = [0u8; 64];
             let msg = crate::io::sprint(&mut buf, format_args!("[UNKSYSCALL] num={}\n", num));

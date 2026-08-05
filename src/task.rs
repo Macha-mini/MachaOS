@@ -195,10 +195,6 @@ pub static COUNTERS: [AtomicU64; COUNTER_COUNT] =
 // dereferencing the raw pointer locally is the standard workaround, and
 // is sound here precisely because `TASKS` is only ever touched from the
 // contexts listed in the module docs.
-fn tasks_mut() -> &'static mut Vec<Task> {
-    unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
-}
-
 fn tasks() -> &'static Vec<Task> {
     unsafe { &*core::ptr::addr_of!(TASKS) }
 }
@@ -369,6 +365,14 @@ pub fn yield_blocked(key: u64) {
     switch_to_next();
     // Woken: clear the block marker and let the futex handler re-check.
     tasks_mut()[CURRENT.load(Ordering::Relaxed)].block_key = None;
+}
+
+/// Cooperative round-robin yield for a polling syscall (wait4's wait
+/// loop): switches to the next runnable task without blocking this one,
+/// so it gets rescheduled on the next quantum and can re-check its
+/// condition. Same stack requirements as `yield_blocked`.
+pub fn yield_rr() {
+    switch_to_next();
 }
 
 /// Marks every task blocked on `key` runnable again (FUTEX_WAKE). Wakes
@@ -584,6 +588,31 @@ pub fn with_current_process_mut<R>(f: impl FnOnce(&mut Process) -> R) -> Option<
         tasks[current].thread_of?
     };
     tasks.get_mut(owner)?.process.as_mut().map(f)
+}
+
+/// The raw task table (pub for `execve`, which swaps the current task's
+/// process out from under the running syscall; private otherwise).
+pub fn tasks_mut() -> &'static mut Vec<Task> {
+    unsafe { &mut *core::ptr::addr_of_mut!(TASKS) }
+}
+
+pub fn replace_current_process(pid: usize, process: Process) -> Option<Process> {
+    tasks_mut().get_mut(pid)?.process.replace(process)
+}
+
+/// Updates a task's CR3 (execve installs a fresh address space).
+pub fn set_current_cr3(pid: usize, cr3: u64) {
+    if let Some(task) = tasks_mut().get_mut(pid) {
+        task.cr3 = cr3;
+    }
+}
+
+/// Points a task's ring-3 return chain at a freshly parked chain
+/// (execve parks one below the running syscall's frames).
+pub fn set_current_ring3_kernel_rsp(pid: usize, rsp: u64) {
+    if let Some(task) = tasks_mut().get_mut(pid) {
+        task.ring3_kernel_rsp = rsp;
+    }
 }
 
 /// Saves the current task's kernel-side resume point for when its process

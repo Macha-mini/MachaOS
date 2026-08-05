@@ -87,6 +87,27 @@ static mut SAVED_USER_RSP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut EXIT_GROUP_FLAG: u64 = 0;
 
+/// Sentinel `sys_execve` returns on success; the asm's exec-restart path
+/// compares against it and iretq's into the new program (whose entry and
+/// stack the handler stashed in `EXEC_ENTRY`/`EXEC_USER_RSP`) instead of
+/// sysretq'ing to the old, now-freed instruction pointer.
+#[unsafe(no_mangle)]
+static EXECVE_RESTART_MAGIC: u64 = 0x4E584543_52455354;
+/// The value `sys_execve` returns on success (the asm compares the
+/// dispatch result against `EXECVE_RESTART_MAGIC`).
+pub const EXECVE_RESTART_MAGIC_VALUE: u64 = 0x4E584543_52455354;
+#[unsafe(no_mangle)]
+static mut EXEC_ENTRY: u64 = 0;
+#[unsafe(no_mangle)]
+static mut EXEC_USER_RSP: u64 = 0;
+
+pub fn set_exec_restart(entry: u64, user_rsp: u64) {
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(EXEC_ENTRY), entry);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(EXEC_USER_RSP), user_rsp);
+    }
+}
+
 pub fn exit_group_flag() -> bool {
     unsafe { core::ptr::read_volatile(core::ptr::addr_of!(EXIT_GROUP_FLAG)) != 0 }
 }
@@ -302,10 +323,36 @@ syscall_entry:
     pop rsi
     pop rdi
 
+    # execve-restart check (Phase 7b): on success sys_execve replaced
+    # the whole address space and parked an exit chain; it returns the
+    # EXECVE_RESTART_MAGIC sentinel and expects us to iretq into the new
+    # program (entry/rsp stashed by the handler) instead of sysretq'ing
+    # to the old rip in the now-freed space.
+    cmp rax, [rip + EXECVE_RESTART_MAGIC]
+    je .Lsyscall_exec_restart
+
     pop r11
     pop rcx
     mov rsp, [rip + SAVED_USER_RSP]
     sysretq
+.Lsyscall_exec_restart:
+    # Iretq into the new program like enter_usermode does — the handler
+    # already parked the exit chain and set ring3_kernel_rsp, so the new
+    # program's own exit syscall unwinds cleanly to exit_self.
+    mov rax, 0x33
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov rax, [rip + EXEC_USER_RSP]
+    push 0x33            # ss
+    push rax             # user rsp
+    mov rax, 0x202       # rflags (IF set)
+    push rax
+    push 0x3B            # cs
+    mov rax, [rip + EXEC_ENTRY]
+    push rax             # rip
+    iretq
 .Lsyscall_exit:
     sti
     # rax still holds the syscall number here; remember whether it was
