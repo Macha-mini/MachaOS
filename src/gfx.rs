@@ -409,7 +409,40 @@ pub fn scale_image(src: &[u32], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) 
 /// `scale_image` writing into a preallocated `dst_w`x`dst_h` buffer
 /// (avoiding an allocation on the hot composite path).
 pub fn scale_into(src: &[u32], src_w: u32, src_h: u32, dst: &mut [u32], dst_w: u32, dst_h: u32) {
-    scale_pixels(|x, y| src[(y * src_w + x) as usize], src_w, src_h, dst, dst_w, dst_h);
+    scale_pixels(
+        |x, y| src[(y * src_w + x) as usize],
+        src_w,
+        src_h,
+        dst,
+        dst_w,
+        dst_h,
+        None,
+    );
+}
+
+/// `scale_into` with caller-owned row scratch buffers, so the bilinear
+/// filter's two working rows aren't reallocated on every frame (the
+/// present path calls this once per composite at non-native
+/// resolutions).
+pub fn scale_into_scratch(
+    src: &[u32],
+    src_w: u32,
+    src_h: u32,
+    dst: &mut [u32],
+    dst_w: u32,
+    dst_h: u32,
+    scratch: &mut [u32],
+) {
+    let (top_row, bot_row) = scratch.split_at_mut(dst_w as usize);
+    scale_pixels(
+        |x, y| src[(y * src_w + x) as usize],
+        src_w,
+        src_h,
+        dst,
+        dst_w,
+        dst_h,
+        Some((top_row, bot_row)),
+    );
 }
 
 /// Scales raw little-endian 0x00RRGGBB pixel *bytes* (the wallpaper.raw
@@ -435,11 +468,15 @@ pub fn scale_bytes(
         &mut dst,
         dst_w,
         dst_h,
+        None,
     );
     dst
 }
 
 /// Bilinear fixed-point scaling with pluggable source pixel access.
+/// When `scratch` is `Some((top, bot))` those two `dst_w`-sized buffers
+/// are used as the row caches instead of allocating fresh ones (see
+/// `scale_into_scratch`).
 fn scale_pixels<F: Fn(u32, u32) -> u32>(
     get: F,
     src_w: u32,
@@ -447,6 +484,7 @@ fn scale_pixels<F: Fn(u32, u32) -> u32>(
     dst: &mut [u32],
     dst_w: u32,
     dst_h: u32,
+    scratch: Option<(&mut [u32], &mut [u32])>,
 ) {
     if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
         return;
@@ -467,10 +505,25 @@ fn scale_pixels<F: Fn(u32, u32) -> u32>(
         out
     };
 
-    let mut prev_y: Option<(u32, u32)> = None; // (y0, y1) of the last row
-    let mut top_row = vec![0u32; dst_w as usize];
-    let mut bot_row = vec![0u32; dst_w as usize];
+    // Caller-provided scratch rows when available; otherwise keep the
+    // freshly allocated ones alive for the duration of the loop.
+    let mut owned_top: Option<Vec<u32>> = None;
+    let mut owned_bot: Option<Vec<u32>> = None;
+    let (top_row, bot_row): (&mut [u32], &mut [u32]) = match scratch {
+        Some((top, bot)) => (top, bot),
+        None => {
+            owned_top = Some(alloc::vec![0u32; dst_w as usize]);
+            owned_bot = Some(alloc::vec![0u32; dst_w as usize]);
+            (
+                owned_top.as_mut().unwrap().as_mut_slice(),
+                owned_bot.as_mut().unwrap().as_mut_slice(),
+            )
+        }
+    };
+    let top_row = &mut top_row[..dst_w as usize];
+    let bot_row = &mut bot_row[..dst_w as usize];
 
+    let mut prev_y: Option<(u32, u32)> = None; // (y0, y1) of the last row
     for dy in 0..dst_h {
         let sy = ymap(dy);
         let y0 = (sy >> 16) as usize;

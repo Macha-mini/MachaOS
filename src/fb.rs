@@ -43,6 +43,11 @@ struct State {
     vback_buffer: Vec<u32>,
     // Physical back buffer: `vback_buffer` scaled to the real mode.
     back_buffer: Vec<u32>,
+    // Persistent bilinear-scale row scratch (2 rows of the physical
+    // width), so `present()` doesn't reallocate working buffers on
+    // every frame when the virtual resolution differs from the
+    // physical one.
+    scale_scratch: Vec<u32>,
 }
 
 impl Surface for State {
@@ -142,6 +147,7 @@ pub fn init(info: &MultibootInfo) -> bool {
 
     let vback_buffer = vec![0u32; (fb.width * fb.height) as usize];
     let back_buffer = vec![0u32; (fb.width * fb.height) as usize];
+    let scale_scratch = vec![0u32; (fb.width as usize) * 2];
     *STATE.lock() = Some(State {
         addr: fb.addr,
         pitch: fb.pitch,
@@ -151,6 +157,7 @@ pub fn init(info: &MultibootInfo) -> bool {
         vheight: fb.height,
         vback_buffer,
         back_buffer,
+        scale_scratch,
     });
 
     FB_ADDR.store(fb.addr, Ordering::Release);
@@ -330,13 +337,17 @@ pub fn present() {
         return;
     };
     if state.vwidth != state.width || state.vheight != state.height {
-        gfx::scale_into(
+        if state.scale_scratch.len() < state.width as usize * 2 {
+            state.scale_scratch = vec![0u32; (state.width as usize) * 2];
+        }
+        gfx::scale_into_scratch(
             &state.vback_buffer,
             state.vwidth,
             state.vheight,
             &mut state.back_buffer,
             state.width,
             state.height,
+            &mut state.scale_scratch,
         );
     } else {
         state.back_buffer.copy_from_slice(&state.vback_buffer);
