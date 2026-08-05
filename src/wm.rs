@@ -1960,6 +1960,35 @@ fn editor_handle_key(
                 Err(e) => *status = format!("save failed: {}", e),
             }
         }
+        keyboard::Event::Ctrl('c') => {
+            // Copy the current line (there's no selection model yet).
+            crate::clipboard::copy_text(lines[*cursor_row].clone());
+            *status = format!("copied {} chars", lines[*cursor_row].chars().count());
+        }
+        keyboard::Event::Ctrl('v') => {
+            if let Some(text) = crate::clipboard::paste_text() {
+                let idx = byte_index(&lines[*cursor_row], *cursor_col);
+                lines[*cursor_row].insert_str(idx, &text);
+                *cursor_col += text.chars().count();
+                *status = format!("pasted {} chars", text.chars().count());
+            } else {
+                *status = "clipboard is empty or holds an image".to_string();
+            }
+        }
+        keyboard::Event::Ctrl('x') => {
+            // Cut the current line (no selection model yet).
+            crate::clipboard::copy_text(lines[*cursor_row].clone());
+            if lines.len() > 1 {
+                lines.remove(*cursor_row);
+                if *cursor_row >= lines.len() {
+                    *cursor_row = lines.len() - 1;
+                }
+            } else {
+                lines[*cursor_row].clear();
+            }
+            *cursor_col = 0;
+            *status = "cut current line".to_string();
+        }
         keyboard::Event::Ctrl('o') => {
             match fat::read_file(save_path) {
                 Ok(data) => {

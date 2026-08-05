@@ -120,6 +120,21 @@ impl ImageViewerApp {
 
     pub fn handle_key(&mut self, event: keyboard::Event) {
         match event {
+            keyboard::Event::Ctrl('c') => {
+                // Copy the displayed (unzoomed) image to the clipboard.
+                if let Some(pixels) = &self.image_data {
+                    crate::clipboard::copy_image(
+                        self.image_width,
+                        self.image_height,
+                        pixels.clone(),
+                    );
+                    self.status = format!(
+                        "copied {}x{} image to clipboard",
+                        self.image_width, self.image_height
+                    );
+                    self.render();
+                }
+            }
             keyboard::Event::Char('+') | keyboard::Event::Char('=') => {
                 if self.zoom < 8 {
                     self.zoom += 1;

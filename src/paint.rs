@@ -156,6 +156,33 @@ impl PaintApp {
                 // Return action to load a file
                 Some(PaintAction::Load)
             }
+            keyboard::Event::Ctrl('c') => {
+                // Copy the whole canvas to the clipboard as an image.
+                crate::clipboard::copy_image(CANVAS_WIDTH, CANVAS_HEIGHT, self.canvas.clone());
+                self.status = "copied canvas to clipboard".to_string();
+                self.render();
+                None
+            }
+            keyboard::Event::Ctrl('v') => {
+                // Paste an image from the clipboard onto the canvas
+                // (scaled to fit when the clipboard image is larger).
+                if let Some((w, h, pixels)) = crate::clipboard::paste_image() {
+                    let (sw, sh) = (w.max(1), h.max(1));
+                    for py in 0..CANVAS_HEIGHT {
+                        for px in 0..CANVAS_WIDTH {
+                            let sx = px * sw / CANVAS_WIDTH;
+                            let sy = py * sh / CANVAS_HEIGHT;
+                            let src = (sy * w + sx).min(pixels.len() as u32 - 1) as usize;
+                            self.canvas[(py * CANVAS_WIDTH + px) as usize] = pixels[src];
+                        }
+                    }
+                    self.status = format!("pasted {}x{} image", w, h);
+                } else {
+                    self.status = "clipboard is empty or holds text".to_string();
+                }
+                self.render();
+                None
+            }
             keyboard::Event::Char('1') => {
                 self.current_tool = Tool::Pen;
                 self.render();

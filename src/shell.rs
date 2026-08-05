@@ -1660,8 +1660,23 @@ impl LineEditor {
             keyboard::Event::Left
             | keyboard::Event::Right
             | keyboard::Event::Escape
-            | keyboard::Event::F2
-            | keyboard::Event::Ctrl(_) => Feed::Pending,
+            | keyboard::Event::F2 => Feed::Pending,
+            keyboard::Event::Ctrl('v') => {
+                // Paste the clipboard at the end of the line (no
+                // mid-line cursor yet). Pasting a multi-line command
+                // would confuse the single-line editor, so only the
+                // first line of the clipboard is inserted.
+                if let Some(text) = crate::clipboard::paste_text() {
+                    let first = text.lines().next().unwrap_or("");
+                    if self.line.len() + first.len() <= 256 {
+                        self.line.push_str(first);
+                        print!("{}", first);
+                    }
+                }
+                self.history_index = None;
+                Feed::Pending
+            }
+            keyboard::Event::Ctrl(_) => Feed::Pending,
         }
     }
 }
