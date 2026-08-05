@@ -103,16 +103,16 @@ disk-linux: disk $(BUSYBOX)
 	mcopy -i $(DISK) $(BUSYBOX) ::/bin/busybox.elf
 
 run: iso disk
-	$(QEMU) -m 256 -cdrom $(ISO) -boot d -drive file=$(DISK),format=raw -serial stdio
+	$(QEMU) -m 4G -cdrom $(ISO) -boot d -drive file=$(DISK),format=raw -serial stdio
 
 run-nographic: iso disk
-	$(QEMU) -m 256 -cdrom $(ISO) -boot d -display none -serial stdio
+	$(QEMU) -m 4G -cdrom $(ISO) -boot d -display none -serial stdio
 
 test: GRUB_CFG=boot/grub/grub-selftest.cfg
 test: iso disk
 	@rm -f $(TEST_LOG)
 	@echo "== running MachaOS selftest in QEMU =="
-	@$(QEMU) -m 256 -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
+	@$(QEMU) -m 4G -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 &
 	@for i in $$(seq 1 60); do \
 		sleep 1; \
