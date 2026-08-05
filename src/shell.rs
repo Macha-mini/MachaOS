@@ -109,7 +109,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "netinfo", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
+    "tasks", "netinfo", "netudp", "nettcp", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
 ];
 
 pub fn run() -> ! {
@@ -309,6 +309,8 @@ pub fn execute(line: &str) {
         "mousetest" => cmd_mousetest(),
         "tasks" => cmd_tasks(),
         "netinfo" => cmd_netinfo(),
+        "netudp" => cmd_netudp(&args),
+        "nettcp" => cmd_nettcp(&args),
         "ls" => cmd_ls(&args),
         "cat" => cmd_cat(&args),
         "fatinfo" => cmd_fatinfo(),
@@ -582,6 +584,50 @@ fn cmd_netinfo() {
             );
         }
         None => println!("no e1000 NIC (driver not initialized)"),
+    }
+}
+
+/// UDP echo to the gateway (QEMU user-net host): `netudp <port> [msg]`.
+/// Requires the host to run `tools/echo_server.py`.
+fn cmd_netudp(args: &[&str]) {
+    let Some(port) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
+        println!("usage: netudp <port> [message]");
+        return;
+    };
+    let msg = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        "hello from MachaOS".to_string()
+    };
+    let mut reply = [0u8; 2048];
+    match crate::net::udp_echo(port, msg.as_bytes(), &mut reply, 300) {
+        Ok(n) => {
+            let text = core::str::from_utf8(&reply[..n]).unwrap_or("<binary>");
+            println!("udp echo ({} bytes): {}", n, text);
+        }
+        Err(e) => println!("udp echo failed: {}", e),
+    }
+}
+
+/// TCP request/response to the gateway (QEMU user-net host):
+/// `nettcp <port> [msg]`. Requires the host to run `tools/echo_server.py`.
+fn cmd_nettcp(args: &[&str]) {
+    let Some(port) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
+        println!("usage: nettcp <port> [message]");
+        return;
+    };
+    let msg = if args.len() > 1 {
+        args[1..].join(" ")
+    } else {
+        "hello from MachaOS".to_string()
+    };
+    let mut reply = [0u8; 2048];
+    match crate::net::tcp_request(crate::net::GATEWAY_IP, port, msg.as_bytes(), &mut reply, 300) {
+        Ok(n) => {
+            let text = core::str::from_utf8(&reply[..n]).unwrap_or("<binary>");
+            println!("tcp echo ({} bytes): {}", n, text);
+        }
+        Err(e) => println!("tcp echo failed: {}", e),
     }
 }
 
@@ -1589,6 +1635,39 @@ pub fn selftest() -> ! {
                     );
                 }
                 None => selftest_fail("ARP request for 10.0.2.2 got no reply"),
+            }
+            // UDP echo through the host's tools/echo_server.py (started
+            // by `make test`; slirp forwards to the host loopback).
+            let mut reply = [0u8; 256];
+            match crate::net::udp_echo(9999, b"ping from MachaOS", &mut reply, 300) {
+                Ok(n) => {
+                    let text = core::str::from_utf8(&reply[..n]).unwrap_or("<binary>");
+                    if text == "ping from MachaOS" {
+                        println!("[OK] UDP echo round trip ({} bytes)", n);
+                    } else {
+                        selftest_fail("UDP echo returned wrong payload");
+                    }
+                }
+                Err(e) => selftest_fail(&format!("UDP echo failed: {}", e)),
+            }
+            // TCP echo: full 3-way handshake, data, and FIN exchange.
+            let mut treply = [0u8; 256];
+            match crate::net::tcp_request(
+                [10, 0, 2, 2],
+                9998,
+                b"tcp ping from MachaOS",
+                &mut treply,
+                300,
+            ) {
+                Ok(n) => {
+                    let text = core::str::from_utf8(&treply[..n]).unwrap_or("<binary>");
+                    if text == "tcp ping from MachaOS" {
+                        println!("[OK] TCP echo round trip ({} bytes)", n);
+                    } else {
+                        selftest_fail("TCP echo returned wrong payload");
+                    }
+                }
+                Err(e) => selftest_fail(&format!("TCP echo failed: {}", e)),
             }
         }
         Err(e) => selftest_fail(&format!("e1000 init failed: {}", e)),

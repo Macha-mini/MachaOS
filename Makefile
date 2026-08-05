@@ -115,8 +115,9 @@ run-nographic: iso disk
 
 test: GRUB_CFG=boot/grub/grub-selftest.cfg
 test: iso disk
-	@rm -f $(TEST_LOG)
+	@rm -f $(TEST_LOG) $(TEST_LOG).pid
 	@echo "== running MachaOS selftest in QEMU =="
+	@python3 tools/echo_server.py >/dev/null 2>&1 & echo $$! > $(TEST_LOG).pid
 	@$(QEMU) -m 4G -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
 		$(NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 &
 	@for i in $$(seq 1 60); do \
@@ -124,16 +125,22 @@ test: iso disk
 		if grep -q "SELFTEST OK" $(TEST_LOG) 2>/dev/null; then \
 			echo "== PASS: selftest completed =="; \
 			cat $(TEST_LOG); \
+			kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
+			rm -f $(TEST_LOG).pid; \
 			exit 0; \
 		fi; \
 		if ! pgrep -q qemu-system-x86_64; then \
 			echo "== FAIL: QEMU exited before the selftest finished =="; \
 			cat $(TEST_LOG); \
+			kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
+			rm -f $(TEST_LOG).pid; \
 			exit 1; \
 		fi; \
 	done; \
 	echo "== FAIL: selftest timed out =="; \
 	cat $(TEST_LOG); \
+	kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
+	rm -f $(TEST_LOG).pid; \
 	exit 1
 
 clean:

@@ -1,21 +1,43 @@
-//! Minimal network protocols on top of the e1000 driver. Currently
-//! just ARP (Ethernet/IPv4): enough to resolve the gateway on QEMU's
-//! user-mode network. The IPv4/UDP/TCP stack lands here next.
+//! Minimal network stack over the e1000 driver: Ethernet framing,
+//! ARP (with a small cache), IPv4, UDP, and a minimal TCP client —
+//! enough for request/response traffic through QEMU's user-mode
+//! network (guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3).
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 pub const ETHERTYPE_ARP: u16 = 0x0806;
+pub const ETHERTYPE_IPV4: u16 = 0x0800;
 const ARP_REQUEST: u16 = 1;
 const ARP_REPLY: u16 = 2;
+const IP_PROTO_UDP: u8 = 17;
+const IP_PROTO_TCP: u8 = 6;
 
 /// This guest's address on the QEMU user-mode network.
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
 /// QEMU user-net gateway (the host, NATed).
 pub const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
-/// Sends an ARP request for `target_ip` and returns the responder's
-/// MAC if a reply arrives within `timeout_ticks` (100 Hz ticks).
+/// How long to wait for an ARP reply (100 Hz ticks).
+const ARP_TIMEOUT_TICKS: u64 = 300;
+
+static ARP_CACHE: crate::sync::SpinLock<Vec<([u8; 4], [u8; 6])>> =
+    crate::sync::SpinLock::new(Vec::new());
+
+// ---------------------------------------------------------------------
+// ARP
+// ---------------------------------------------------------------------
+
+/// Resolves `target_ip` to a MAC address, using the cache first and
+/// falling back to an ARP request. NOTE: while waiting for the reply,
+/// any other received frames are dropped.
 pub fn resolve(target_ip: [u8; 4], timeout_ticks: u64) -> Option<[u8; 6]> {
+    {
+        let cache = ARP_CACHE.lock();
+        if let Some((_, mac)) = cache.iter().find(|(ip, _)| *ip == target_ip) {
+            return Some(*mac);
+        }
+    }
     let mac = crate::e1000::mac()?;
     let mut pkt = Vec::with_capacity(42);
     pkt.extend_from_slice(&[0xFF; 6]); // destination: broadcast
@@ -35,6 +57,12 @@ pub fn resolve(target_ip: [u8; 4], timeout_ticks: u64) -> Option<[u8; 6]> {
     loop {
         if let Some(frame) = crate::e1000::poll_rx() {
             if let Some(sha) = parse_arp_reply(&frame) {
+                let mut cache = ARP_CACHE.lock();
+                cache.retain(|(ip, _)| *ip != target_ip);
+                cache.push((target_ip, sha));
+                if cache.len() > 8 {
+                    cache.remove(0);
+                }
                 return Some(sha);
             }
         }
@@ -60,6 +88,382 @@ fn parse_arp_reply(frame: &[u8]) -> Option<[u8; 6]> {
         return None;
     }
     Some([frame[22], frame[23], frame[24], frame[25], frame[26], frame[27]])
+}
+
+// ---------------------------------------------------------------------
+// IPv4
+// ---------------------------------------------------------------------
+
+/// Builds and sends an IPv4 packet to `dst_ip` (resolving its MAC via
+/// ARP first).
+pub fn send_ipv4(dst_ip: [u8; 4], proto: u8, payload: &[u8]) -> Result<(), &'static str> {
+    let dst_mac = resolve(dst_ip, ARP_TIMEOUT_TICKS).ok_or("ARP failed")?;
+    let src_mac = crate::e1000::mac().ok_or("NIC down")?;
+    let mut frame = vec![0u8; 14 + 20 + payload.len()];
+    frame[0..6].copy_from_slice(&dst_mac);
+    frame[6..12].copy_from_slice(&src_mac);
+    frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    let ip = &mut frame[14..34];
+    ip[0] = 0x45; // IPv4, 5 words
+    ip[2..4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+    ip[4..6].copy_from_slice(&0u16.to_be_bytes()); // id
+    ip[6..8].copy_from_slice(&0u16.to_be_bytes()); // flags/frag
+    ip[8] = 64; // ttl
+    ip[9] = proto;
+    ip[10..12].copy_from_slice(&0u16.to_be_bytes()); // checksum (computed below)
+    ip[12..16].copy_from_slice(&OUR_IP);
+    ip[16..20].copy_from_slice(&dst_ip);
+    let csum = checksum(ip);
+    ip[10..12].copy_from_slice(&csum.to_be_bytes());
+    frame[34..].copy_from_slice(payload);
+    crate::e1000::send(&frame)
+}
+
+/// Parses an Ethernet frame into an IPv4 packet: (src_ip, dst_ip,
+/// protocol, payload slice). Returns `None` for non-IPv4 or malformed
+/// frames.
+fn parse_ipv4(frame: &[u8]) -> Option<([u8; 4], [u8; 4], u8, &[u8])> {
+    if frame.len() < 14 + 20 {
+        return None;
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let ihl = (frame[14] & 0x0F) as usize * 4;
+    if ihl < 20 || frame.len() < 14 + ihl {
+        return None;
+    }
+    let total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+    let end = (14 + total).min(frame.len());
+    let src = [frame[26], frame[27], frame[28], frame[29]];
+    let dst = [frame[30], frame[31], frame[32], frame[33]];
+    let proto = frame[23];
+    Some((src, dst, proto, &frame[14 + ihl..end]))
+}
+
+// ---------------------------------------------------------------------
+// UDP
+// ---------------------------------------------------------------------
+
+/// Builds and sends a UDP datagram.
+pub fn send_udp(
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    src_port: u16,
+    payload: &[u8],
+) -> Result<(), &'static str> {
+    let len = 8 + payload.len();
+    let mut udp = vec![0u8; len];
+    udp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    udp[4..6].copy_from_slice(&(len as u16).to_be_bytes());
+    udp[8..].copy_from_slice(payload);
+    // Checksum over the pseudo-header + datagram.
+    let mut pseudo = Vec::with_capacity(12 + len);
+    pseudo.extend_from_slice(&OUR_IP);
+    pseudo.extend_from_slice(&dst_ip);
+    pseudo.push(0);
+    pseudo.push(IP_PROTO_UDP);
+    pseudo.extend_from_slice(&(len as u16).to_be_bytes());
+    pseudo.extend_from_slice(&udp);
+    let csum = checksum(&pseudo);
+    udp[6..8].copy_from_slice(&csum.to_be_bytes());
+    send_ipv4(dst_ip, IP_PROTO_UDP, &udp)
+}
+
+/// A received UDP datagram.
+pub struct UdpPacket {
+    pub src_ip: [u8; 4],
+    pub src_port: u16,
+    pub payload: Vec<u8>,
+}
+
+/// Drains the RX ring, returning the next UDP datagram addressed to
+/// `dst_port` (other frames are dropped).
+pub fn poll_udp(dst_port: u16) -> Option<UdpPacket> {
+    while let Some(frame) = crate::e1000::poll_rx() {
+        let Some((src_ip, _, proto, payload)) = parse_ipv4(&frame) else {
+            continue;
+        };
+        if proto != IP_PROTO_UDP || payload.len() < 8 {
+            continue;
+        }
+        let sport = u16::from_be_bytes([payload[0], payload[1]]);
+        let dport = u16::from_be_bytes([payload[2], payload[3]]);
+        if dport != dst_port {
+            continue;
+        }
+        return Some(UdpPacket {
+            src_ip,
+            src_port: sport,
+            payload: payload[8..].to_vec(),
+        });
+    }
+    None
+}
+
+/// Sends `payload` to the gateway's `port` and waits for the echo,
+/// returning how many reply bytes were copied into `reply`.
+pub fn udp_echo(
+    port: u16,
+    payload: &[u8],
+    reply: &mut [u8],
+    timeout_ticks: u64,
+) -> Result<usize, &'static str> {
+    const SRC_PORT: u16 = 5555;
+    send_udp(GATEWAY_IP, port, SRC_PORT, payload)?;
+    let deadline = crate::interrupts::ticks() + timeout_ticks;
+    loop {
+        if let Some(pkt) = poll_udp(SRC_PORT) {
+            if pkt.src_port == port {
+                let n = pkt.payload.len().min(reply.len());
+                reply[..n].copy_from_slice(&pkt.payload[..n]);
+                return Ok(n);
+            }
+        }
+        if crate::interrupts::ticks() >= deadline {
+            return Err("UDP echo timeout");
+        }
+        crate::interrupts::halt();
+    }
+}
+
+// ---------------------------------------------------------------------
+// TCP (minimal client)
+// ---------------------------------------------------------------------
+
+const TCP_SYN: u8 = 0x02;
+const TCP_ACK: u8 = 0x10;
+const TCP_FIN: u8 = 0x01;
+const TCP_PSH: u8 = 0x08;
+
+/// A received TCP segment.
+struct TcpSegment {
+    src_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: Vec<u8>,
+}
+
+/// Parses a TCP segment out of an IPv4 payload.
+fn parse_tcp(payload: &[u8]) -> Option<TcpSegment> {
+    if payload.len() < 20 {
+        return None;
+    }
+    let data_offset = ((payload[12] >> 4) as usize) * 4;
+    if data_offset < 20 || payload.len() < data_offset {
+        return None;
+    }
+    Some(TcpSegment {
+        src_port: u16::from_be_bytes([payload[0], payload[1]]),
+        seq: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+        ack: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
+        flags: payload[13],
+        payload: payload[data_offset..].to_vec(),
+    })
+}
+
+/// One-shot TCP client exchange against `ip:port`: open the connection,
+/// send `request`, read the response into `reply`, and close. Returns
+/// the number of reply bytes received. No retransmission, no window
+/// scaling — fine for a local slirp link.
+pub fn tcp_request(
+    ip: [u8; 4],
+    port: u16,
+    request: &[u8],
+    reply: &mut [u8],
+    timeout_ticks: u64,
+) -> Result<usize, &'static str> {
+    const SRC_PORT: u16 = 7777;
+    let dst_mac = resolve(ip, ARP_TIMEOUT_TICKS).ok_or("ARP failed")?;
+    let mut our_seq: u32 = 0x1234_5678;
+    let mut their_seq: Option<u32> = None;
+    let mut got = 0usize;
+    let mut sent_data = false;
+    let mut we_finned = false;
+
+    // SYN (seq = our_seq).
+    let mut seg = build_tcp(SRC_PORT, port, our_seq, 0, TCP_SYN, &[], ip);
+    send_tcp(&dst_mac, ip, &seg)?;
+    our_seq = our_seq.wrapping_add(1);
+
+    let deadline = crate::interrupts::ticks() + timeout_ticks;
+    loop {
+        // Send the request data as soon as the handshake completes —
+        // the server is waiting for it, so this must not depend on the
+        // next received segment.
+        if let Some(their) = their_seq {
+            if !sent_data {
+                sent_data = true;
+                seg = build_tcp(
+                    SRC_PORT,
+                    port,
+                    our_seq,
+                    their.wrapping_add(1),
+                    TCP_PSH | TCP_ACK,
+                    request,
+                    ip,
+                );
+                send_tcp(&dst_mac, ip, &seg)?;
+                our_seq = our_seq.wrapping_add(request.len() as u32);
+            }
+        }
+        if let Some(frame) = crate::e1000::poll_rx() {
+            let Some((src_ip, _, proto, payload)) = parse_ipv4(&frame) else {
+                continue;
+            };
+            if proto != IP_PROTO_TCP {
+                continue;
+            }
+            let Some(s) = parse_tcp(payload) else { continue };
+            if s.src_port != port {
+                continue;
+            }
+            if their_seq.is_none() {
+                // Expect the SYN-ACK.
+                if s.flags & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK {
+                    their_seq = Some(s.seq);
+                    our_seq = s.ack; // server acknowledged our SYN
+                    // ACK their SYN.
+                    seg = build_tcp(
+                        SRC_PORT,
+                        port,
+                        our_seq,
+                        s.seq.wrapping_add(1),
+                        TCP_ACK,
+                        &[],
+                        ip,
+                    );
+                    send_tcp(&dst_mac, ip, &seg)?;
+                }
+                continue;
+            }
+            let their = their_seq.unwrap();
+            // Data from the server: seq starts at their+1.
+            if !s.payload.is_empty() {
+                let base = their.wrapping_add(1);
+                let offset = s.seq.wrapping_sub(base) as usize;
+                if offset < reply.len() {
+                    let n = (s.payload.len()).min(reply.len() - offset);
+                    reply[offset..offset + n].copy_from_slice(&s.payload[..n]);
+                    got = got.max(offset + n);
+                    // ACK what we received.
+                    seg = build_tcp(
+                        SRC_PORT,
+                        port,
+                        our_seq,
+                        s.seq.wrapping_add(s.payload.len() as u32),
+                        TCP_ACK,
+                        &[],
+                        ip,
+                    );
+                    send_tcp(&dst_mac, ip, &seg)?;
+                    // Response complete (echo semantics: the reply is as
+                    // long as the request): close our side; the server
+                    // sees EOF, closes, and FINs back.
+                    if got >= request.len() && !we_finned {
+                        we_finned = true;
+                        seg = build_tcp(
+                            SRC_PORT,
+                            port,
+                            our_seq,
+                            s.seq.wrapping_add(s.payload.len() as u32),
+                            TCP_ACK | TCP_FIN,
+                            &[],
+                            ip,
+                        );
+                        send_tcp(&dst_mac, ip, &seg)?;
+                    }
+                }
+            }
+            if s.flags & TCP_FIN != 0 {
+                // The server closed: the exchange is complete.
+                return Ok(got);
+            }
+        }
+        if crate::interrupts::ticks() >= deadline {
+            return Err("TCP exchange timeout");
+        }
+        crate::interrupts::halt();
+    }
+}
+
+/// Builds a TCP segment (header + payload) with a valid checksum.
+fn build_tcp(
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+    dst_ip: [u8; 4],
+) -> Vec<u8> {
+    let mut seg = vec![0u8; 20 + payload.len()];
+    seg[0..2].copy_from_slice(&src_port.to_be_bytes());
+    seg[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    seg[4..8].copy_from_slice(&seq.to_be_bytes());
+    seg[8..12].copy_from_slice(&ack.to_be_bytes());
+    seg[12] = 5 << 4; // data offset
+    seg[13] = flags;
+    seg[14..16].copy_from_slice(&8192u16.to_be_bytes()); // window
+    seg[16..18].copy_from_slice(&0u16.to_be_bytes()); // checksum
+    seg[18..20].copy_from_slice(&0u16.to_be_bytes()); // urgent
+    seg[20..].copy_from_slice(payload);
+    // Checksum over the pseudo-header + segment.
+    let len = seg.len();
+    let mut pseudo = Vec::with_capacity(12 + len);
+    pseudo.extend_from_slice(&OUR_IP);
+    pseudo.extend_from_slice(&dst_ip);
+    pseudo.push(0);
+    pseudo.push(IP_PROTO_TCP);
+    pseudo.extend_from_slice(&(len as u16).to_be_bytes());
+    pseudo.extend_from_slice(&seg);
+    let csum = checksum(&pseudo);
+    seg[16..18].copy_from_slice(&csum.to_be_bytes());
+    seg
+}
+
+/// Sends a raw TCP segment (Ethernet + IPv4 + TCP).
+fn send_tcp(dst_mac: &[u8; 6], dst_ip: [u8; 4], seg: &[u8]) -> Result<(), &'static str> {
+    let src_mac = crate::e1000::mac().ok_or("NIC down")?;
+    let mut frame = vec![0u8; 14 + 20 + seg.len()];
+    frame[0..6].copy_from_slice(dst_mac);
+    frame[6..12].copy_from_slice(&src_mac);
+    frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    let ip = &mut frame[14..34];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&((20 + seg.len()) as u16).to_be_bytes());
+    ip[8] = 64;
+    ip[9] = IP_PROTO_TCP;
+    ip[12..16].copy_from_slice(&OUR_IP);
+    ip[16..20].copy_from_slice(&dst_ip);
+    let csum = checksum(ip);
+    ip[10..12].copy_from_slice(&csum.to_be_bytes());
+    frame[34..].copy_from_slice(seg);
+    crate::e1000::send(&frame)
+}
+
+// ---------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------
+
+/// One's-complement Internet checksum.
+fn checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 /// Formats a MAC for printing without allocating.
