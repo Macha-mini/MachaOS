@@ -154,6 +154,31 @@ syscall_entry:
     test r11, r11
     jnz .Lsyscall_exit
 
+    # Real Linux's syscall ABI promises the caller that rdi/rsi/rdx/r10/
+    # r8/r9 (like rbx/rbp/r12-r15, which this path never touches at all)
+    # come back exactly as they went in — only rax (the return value)
+    # and rcx/r11 (clobbered by the `syscall`/`sysretq` pair itself)
+    # change. Real Linux's kernel entry saves the full register set into
+    # `pt_regs` and restores it verbatim before `sysretq`, and real
+    # glibc code relies on that: rseq registration (ld.so's TLS setup)
+    # keeps `__rseq_offset` cached live in r8 *across* the `rseq(2)`
+    # syscall and reuses it immediately after on the error path without
+    # reloading it — caught by testing against a real dynamically-linked
+    # binary, where that fallback write faulted on whatever garbage
+    # `syscall_dispatch`'s own internal computation happened to leave in
+    # r8, not on the original argument value at all. Save the six here,
+    # since the shuffle below and `syscall_dispatch` itself (an ordinary
+    # C call, free to clobber any of them) both need to reuse the
+    # physical registers, and restore them right after — before this,
+    # only the *shuffled* values downstream of the call, never the
+    # user's originals, ever made it back past `sysretq`.
+    push rdi
+    push rsi
+    push rdx
+    push r10
+    push r8
+    push r9
+
     # SysV syscall args arrive in rdi/rsi/rdx/r10/r8/r9 (r10 instead of
     # rcx, which `syscall` clobbers); shuffle num+6 args into what
     # `extern "C" fn syscall_dispatch` expects — arg6 doesn't fit in a
@@ -175,6 +200,16 @@ syscall_entry:
     mov r9, r11             # arg5 = a5
     call syscall_dispatch
     add rsp, 8              # pop arg6
+
+    # Restore the user's original argument registers (see above) — rax
+    # already holds `syscall_dispatch`'s real return value, which must
+    # survive these pops untouched, so it's deliberately not among them.
+    pop r9
+    pop r8
+    pop r10
+    pop rdx
+    pop rsi
+    pop rdi
 
     pop r11
     pop rcx

@@ -1310,8 +1310,8 @@ pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
     let message = io::sprint(
         &mut buf,
         format_args!(
-            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x})\n",
-            cr2, frame.error_code, rip
+            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x}, r8={:#x})\n",
+            cr2, frame.error_code, rip, frame.r8
         ),
     );
     io::exception_print(message);

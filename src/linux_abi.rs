@@ -37,6 +37,30 @@
 //! is non-blocking by construction — see `socket.rs`'s module docs on
 //! why a syscall handler can never wait the way `process::wait` does.
 //!
+//! Phase 6 (finishing real dynamic linking — see the plan file's
+//! extended roadmap) found and fixed the real root cause of the crash
+//! documented below in earlier phases' commits: `syscall_entry`
+//! (`syscall.rs`) never restored the caller's rdi/rsi/rdx/r10/r8/r9
+//! after `syscall_dispatch` returned — only rax (the result) and rcx/r11
+//! (clobbered by the `syscall`/`sysretq` instructions themselves) made
+//! it back to user space unchanged; the other five held whatever
+//! `syscall_dispatch`'s own internal computation last left in those
+//! physical registers. Real Linux's syscall ABI guarantees all of them
+//! survive unchanged (the kernel saves/restores the full register set),
+//! and real glibc code relies on that guarantee in ways this repo's own
+//! hand-written test programs never exercised — this repo's own
+//! `common::syscall` wrapper (`user/src/common.rs`) has always marked
+//! them clobbered, matching this kernel's old, non-compliant behavior,
+//! which is exactly why nothing caught this until testing against a
+//! real, unmodified glibc binary's `ld.so`. Confirmed by tracing: ld.so
+//! caches `__rseq_offset` live in r8 across the `rseq(2)` syscall during
+//! its own TLS setup and reuses it immediately afterward on the error
+//! path without reloading it; this kernel's dispatch clobbered r8
+//! computing something unrelated, and the stale value (observed
+//! directly in the CPU register at fault time via `frame.r8`, now
+//! logged permanently in `process::kill_current`) sent the fallback
+//! write to a wild address. Fixing this removed the crash entirely.
+//!
 //! KNOWN GAPS left beyond Phase 4:
 //! - No signal delivery: `rt_sigaction`/`rt_sigprocmask` just record
 //!   nothing and return success.
@@ -54,24 +78,39 @@
 //!   doc comment) — fine for the single-threaded, uncontended-lock case
 //!   glibc's own startup hits, but `clone`/real threading aren't
 //!   implemented at all, so this is the extent of it for now.
-//! - A real dynamically-linked glibc binary (tested against GNU Hello +
-//!   a real `ld.so`/`libc.so.6` pair — see the Phase 4 commit and
-//!   `shell.rs`'s selftest hook) doesn't run to completion yet: `ld.so`
-//!   opens `libc.so.6`, `pread64`s its program headers (verified via
-//!   tracing to return the correct byte count) and `fstat`s it (verified
-//!   to report the correct real file size), then goes straight into
-//!   symbol version processing and faults — without ever calling `mmap`
-//!   on that fd to actually load its segments. Metadata about the file
-//!   is reaching `ld.so` correctly, but whatever `ld.so` does with that
-//!   metadata between "headers parsed" and "map the PT_LOAD segments" is
-//!   still going wrong in a way this kernel's own tracing can't see
-//!   further into without instrumenting `ld.so`'s disassembly directly.
-//!   Testing against that real binary is exactly what found and fixed
-//!   the AT_PHDR/`pread64`/`AT_EMPTY_PATH`/stack-buffer/`access`(21)
-//!   bugs the rest of this file's history documents; this is the next
-//!   one, left for follow-up rather than resolved here — consistent
-//!   with this plan's own framing of Phase 4 as roadmap-level rigor
-//!   rather than Phase 1/2's full-completion bar.
+//! - A real dynamically-linked glibc binary (tested against GNU Hello,
+//!   real coreutils `true`/`cat`, and a real `ld.so`/`libc.so.6` pair —
+//!   see `shell.rs`'s selftest hook) still doesn't run to completion, but
+//!   Phase 6's register-preservation fix (above) got much further than
+//!   before: the crash during `ld.so`'s TLS/rseq setup is gone, and
+//!   `ld.so` now genuinely reaches real symbol resolution against
+//!   `libc.so.6` — confirmed by disassembling `ld.so` around the old
+//!   fault site (`llvm-objdump`) and cross-checking against a real
+//!   Debian bookworm libc6 (2.36) package, whose `libc.so.6` was
+//!   verified (via `strings`) to actually contain a `GLIBC_2.34` version
+//!   definition. What's left is a *different*, earlier bug: `ld.so`
+//!   still never calls `mmap` on the fd it opens for `libc.so.6` (traced
+//!   directly — every `mmap` call during the whole run is anonymous,
+//!   `fd == -1`) despite successfully `openat`/`pread64`/`fstat`-ing it,
+//!   and ultimately reports `"hello: hello: no version information
+//!   available (required by hello)"` and `"undefined symbol:
+//!   __libc_start_main, version GLIBC_2.34"` — with the *program's own
+//!   name* in every position of that error, including where `libc.so.6`
+//!   itself should appear. That specific detail points at an internal
+//!   `ld.so` link_map identity bug (something making its bookkeeping for
+//!   `libc.so.6` alias the main executable's own — e.g. a `brk`/heap
+//!   allocation collision) rather than a straightforwardly-missing
+//!   syscall; reproduced identically across three independent real
+//!   binaries (ruling out a version-mismatched test fixture), so the
+//!   next investigation should look at `Process::brk`/`mmap_anon`'s
+//!   allocation behavior during `ld.so`'s own early bootstrap rather
+//!   than at file I/O. Testing against real binaries is exactly what
+//!   found and fixed the AT_PHDR/`pread64`/`AT_EMPTY_PATH`/stack-buffer/
+//!   `access`(21)/register-preservation bugs the rest of this file's
+//!   history documents; this is the next one, left for follow-up —
+//!   consistent with the plan's own framing of Phase 4/6 dynamic-linking
+//!   work as roadmap-level rigor rather than Phase 1/2's full-completion
+//!   bar.
 //! - `socket`/`sendmsg`/`recvmsg` only support `AF_UNIX`/`SOCK_STREAM`,
 //!   don't expose `bind`/`listen`/`accept` at all (only `socket.rs`'s
 //!   Rust API does — `wayland.rs`'s compositor task is the only thing

@@ -1138,7 +1138,7 @@ pub fn selftest() -> ! {
     }
 
     // Process management, part 6: a real *dynamically-linked* glibc
-    // binary (GNU Hello), if present — exercises Phase 4's PT_INTERP
+    // binary (GNU Hello), if present — exercises Phase 4/6's PT_INTERP
     // handling for real: the process's actual entry point is the real
     // /lib64/ld-linux-x86-64.so.2, which is expected to mmap and relocate
     // the real /lib/x86_64-linux-gnu/libc.so.6 itself before ever
@@ -1146,13 +1146,17 @@ pub fn selftest() -> ! {
     // (getting a real glibc + ld.so pair needs extracting Debian
     // packages, done by hand for this — see the Phase 4 commit) and not
     // a hard selftest failure either way: testing against the real
-    // binary is what found and fixed several real gaps (AT_PHDR for a
-    // binary whose phdrs are covered by its own segment, pread64,
-    // fstat's AT_EMPTY_PATH form, a syscall pointer landing in the
-    // stack's not-yet-grown region), but ld.so does not yet run hello to
-    // completion — it gets past opening/reading libc.so.6 and into
-    // symbol version processing before faulting, a gap left for
-    // follow-up work rather than this session's remaining time.
+    // binary is what found and fixed several real gaps, most recently
+    // (Phase 6) a page fault during `ld.so`'s TLS/rseq setup traced to
+    // `syscall_entry` never restoring the caller's rdi/rsi/rdx/r10/r8/r9
+    // after `syscall_dispatch` — real Linux's syscall ABI guarantees
+    // those survive a syscall unchanged, and real glibc (unlike this
+    // repo's own hand-written test programs, whose `common::syscall`
+    // deliberately marks them clobbered to match this kernel's old,
+    // non-compliant behavior) relies on that guarantee. Fixing it
+    // removed the crash entirely, but `ld.so` still never calls `mmap`
+    // on the fd it opens for `libc.so.6` — see `linux_abi.rs`'s module
+    // docs for the current diagnosis of what's left.
     match fat::read_file("/bin/hello.elf") {
         Ok(elf) => {
             let pid = crate::process::spawn_linux(&elf, "hello", &["hello"], &["PATH=/bin"])
@@ -1164,6 +1168,36 @@ pub fn selftest() -> ! {
             crate::process::reap(pid);
         }
         Err(_) => println!("[SKIP] /bin/hello.elf not present"),
+    }
+
+    // Same real-binary methodology against real coreutils `true`/`cat`
+    // (Debian coreutils 9.1-1) — confirms the remaining gap above isn't
+    // specific to GNU Hello's own build: both fail identically
+    // ("undefined symbol: __libc_start_main, version GLIBC_2.34"),
+    // ruling out a version-mismatched test fixture as the explanation.
+    match fat::read_file("/bin/true.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "true", &["true"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("true spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(info) => println!("[INFO] real coreutils true: {}", process::describe_exit(&info)),
+                None => println!("[INFO] real coreutils true: did not exit within 5s"),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/true.elf not present"),
+    }
+    match fat::read_file("/bin/cat.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "cat", &["cat", "/dev/null"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("cat spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(info) => println!("[INFO] real coreutils cat: {}", process::describe_exit(&info)),
+                None => println!("[INFO] real coreutils cat: did not exit within 5s"),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/cat.elf not present"),
     }
 
     // Process management, part 7 (Phase 5): a real Linux-ABI client
