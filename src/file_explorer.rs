@@ -1469,4 +1469,24 @@ impl Surface for FileExplorer {
             self.buffer[idx] = color;
         }
     }
+
+    // Row-wise fast paths over the contiguous buffer (see `fb::State`);
+    // hover re-renders the whole window on every cursor move.
+    fn blit_span(&mut self, x: u32, y: u32, src: &[u32], offset: usize, len: u32) {
+        if y >= HEIGHT || x >= WIDTH || len == 0 {
+            return;
+        }
+        let n = len.min(WIDTH - x) as usize;
+        let row_start = (y * WIDTH + x) as usize;
+        self.buffer[row_start..row_start + n].copy_from_slice(&src[offset..offset + n]);
+    }
+
+    fn fill_span(&mut self, x: u32, y: u32, len: u32, color: u32) {
+        if y >= HEIGHT || x >= WIDTH || len == 0 {
+            return;
+        }
+        let n = len.min(WIDTH - x) as usize;
+        let row_start = (y * WIDTH + x) as usize;
+        self.buffer[row_start..row_start + n].fill(color);
+    }
 }
