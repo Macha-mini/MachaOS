@@ -8,9 +8,20 @@ GRUB_CFG ?= boot/grub/grub.cfg
 ISO_DIR := target/machaos-iso
 ISO := target/machaos.iso
 DISK := target/disk.img
+WALLPAPER_SRC := himawari.png
+WALLPAPER := target/wallpaper.raw
+WALLPAPER_W := 1920
+WALLPAPER_H := 1080
 TEST_LOG := /tmp/machaos-selftest.log
+# A real static-musl x86_64 Linux binary (BusyBox), fetched on demand
+# rather than checked in, for testing the Linux ABI layer (linux_abi.rs)
+# against something that wasn't hand-built for MachaOS. Not needed for
+# `build`/`test` (those cover the native ABI and the Phase 1/2 test
+# programs) — only for `runlinux`-style manual runs against a real binary.
+BUSYBOX := target/busybox
+BUSYBOX_URL := https://www.busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
 
-.PHONY: all build gen user iso disk run run-nographic test clean
+.PHONY: all build gen user iso disk disk-linux wallpaper run run-nographic run-linux test clean busybox
 
 all: build
 
@@ -23,6 +34,13 @@ user:
 	cd user && cargo build --release --bins
 	cp user/target/x86_64-unknown-none/release/prog_exit target/user-exit.elf
 	cp user/target/x86_64-unknown-none/release/prog_fault target/user-fault.elf
+	cp user/target/x86_64-unknown-none/release/prog_syscall target/user-syscall.elf
+	cp user/target/x86_64-unknown-none/release/prog_ipc target/user-ipc.elf
+	cp user/target/x86_64-unknown-none/release/prog_stack target/user-stack.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_stack target/user-linux-stack.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_syscall target/user-linux-syscall.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_phase3 target/user-linux-phase3.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_wayland_client target/user-linux-wayland-client.elf
 
 build: gen user
 	cargo build --release
@@ -35,32 +53,66 @@ iso: build
 	cp $(GRUB_CFG) $(ISO_DIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(ISO) $(ISO_DIR)
 
-disk:
+# Converts the source wallpaper image into the raw 0x00RRGGBB pixel dump
+# wm.rs loads from disk (see tools/gen_wallpaper.py). Only regenerated
+# when the source image or the converter script changes.
+$(WALLPAPER): $(WALLPAPER_SRC) tools/gen_wallpaper.py
+	python3 tools/gen_wallpaper.py $(WALLPAPER_SRC) $(WALLPAPER) $(WALLPAPER_W) $(WALLPAPER_H)
+
+wallpaper: $(WALLPAPER)
+
+disk: wallpaper
 	@test -n "$$(command -v mkfs.fat)" || (echo "dosfstools (mkfs.fat) is required: brew install dosfstools"; exit 1)
 	dd if=/dev/zero of=$(DISK) bs=1m count=64 2>/dev/null
 	mkfs.fat -F 32 $(DISK)
 	printf 'hello from the host\n' > target/fixture.txt
 	printf 'welcome to MachaOS\n' > target/fixture2.txt
-	mmd -i $(DISK) ::/docs
-	mcopy -i $(DISK) target/fixture.txt "::/hello world.txt"
-	mcopy -i $(DISK) target/fixture2.txt ::/greetings.txt
-	mcopy -i $(DISK) target/fixture.txt ::/docs/readme.txt
 	mmd -i $(DISK) ::/bin
 	mcopy -i $(DISK) target/user-exit.elf ::/bin/prog_exit.elf
 	mcopy -i $(DISK) target/user-fault.elf ::/bin/prog_fault.elf
+	mmd -i $(DISK) ::/system
+	mmd -i $(DISK) ::/users
+	mmd -i $(DISK) ::/users/macha
+	mmd -i $(DISK) ::/users/macha/Desktop
+	mmd -i $(DISK) ::/users/macha/Documents
+	mmd -i $(DISK) ::/users/macha/Downloads
+	mmd -i $(DISK) ::/users/macha/Pictures
+	mmd -i $(DISK) ::/users/macha/Music
+	printf 'MachaOS system files\n' > target/system-readme.txt
+	printf 'Welcome to MachaOS Desktop\n' > target/desktop-welcome.txt
+	mcopy -i $(DISK) target/system-readme.txt ::/system/README.TXT
+	mcopy -i $(DISK) target/desktop-welcome.txt ::/users/macha/Desktop/welcome.txt
+	mcopy -i $(DISK) target/fixture.txt "::/users/macha/Documents/hello world.txt"
+	mcopy -i $(DISK) target/fixture2.txt ::/users/macha/Documents/greetings.txt
+	mcopy -i $(DISK) target/fixture.txt ::/users/macha/Documents/readme.txt
+	mcopy -i $(DISK) $(WALLPAPER) ::/system/wallpaper.raw
 	rm -f target/fixture.txt target/fixture2.txt
+	rm -f target/system-readme.txt target/desktop-welcome.txt
+
+$(BUSYBOX):
+	curl -sL $(BUSYBOX_URL) -o $(BUSYBOX)
+	chmod +x $(BUSYBOX)
+
+busybox: $(BUSYBOX)
+
+# Copies BusyBox onto an already-built disk image, for a manual
+# `runlinux /bin/busybox.elf ...` smoke test of the Linux ABI layer
+# against a real binary. Kept separate from `disk` so the automated
+# `make test` selftest suite never needs network access.
+disk-linux: disk $(BUSYBOX)
+	mcopy -i $(DISK) $(BUSYBOX) ::/bin/busybox.elf
 
 run: iso disk
-	$(QEMU) -cdrom $(ISO) -hda $(DISK) -serial stdio
+	$(QEMU) -m 256 -cdrom $(ISO) -boot d -drive file=$(DISK),format=raw -serial stdio
 
 run-nographic: iso disk
-	$(QEMU) -cdrom $(ISO) -boot d -display none -serial stdio
+	$(QEMU) -m 256 -cdrom $(ISO) -boot d -display none -serial stdio
 
 test: GRUB_CFG=boot/grub/grub-selftest.cfg
 test: iso disk
 	@rm -f $(TEST_LOG)
 	@echo "== running MachaOS selftest in QEMU =="
-	@$(QEMU) -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
+	@$(QEMU) -m 256 -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 &
 	@for i in $$(seq 1 60); do \
 		sleep 1; \

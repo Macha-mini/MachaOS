@@ -79,7 +79,7 @@ fn exception(name: &str, frame: &mut InterruptFrame) -> ! {
     halt_forever()
 }
 
-fn dump_registers(frame: &InterruptFrame) {
+pub(crate) fn dump_registers(frame: &InterruptFrame) {
     let mut buf = [0u8; 512];
     let text = io::sprint(
         &mut buf,
@@ -115,8 +115,21 @@ fn dump_registers(frame: &InterruptFrame) {
     io::exception_print(text);
 }
 
+/// Shared by the exceptions a ring-3 process can plausibly trigger on its
+/// own (divide-by-zero, invalid opcode, a privileged instruction causing
+/// #GP): if the current task is a process, kill just it, mirroring how
+/// `page_fault` already handles #PF; otherwise it's a real kernel bug and
+/// stays fatal.
+fn process_or_exception(name: &str, frame: &mut InterruptFrame) {
+    if task::current_is_process() {
+        crate::process::kill_current_exception(frame.vector as u8, frame);
+        return;
+    }
+    exception(name, frame)
+}
+
 fn divide_error(frame: &mut InterruptFrame) {
-    exception("#DE Divide-by-zero", frame)
+    process_or_exception("#DE Divide-by-zero", frame)
 }
 
 fn debug_exception(frame: &mut InterruptFrame) {
@@ -136,7 +149,7 @@ fn overflow(frame: &mut InterruptFrame) {
 }
 
 fn invalid_opcode(frame: &mut InterruptFrame) {
-    exception("#UD Invalid opcode", frame)
+    process_or_exception("#UD Invalid opcode", frame)
 }
 
 fn double_fault(frame: &mut InterruptFrame) {
@@ -144,7 +157,7 @@ fn double_fault(frame: &mut InterruptFrame) {
 }
 
 fn general_protection_fault(frame: &mut InterruptFrame) {
-    exception("#GP General protection fault", frame)
+    process_or_exception("#GP General protection fault", frame)
 }
 
 fn page_fault(frame: &mut InterruptFrame) {
@@ -156,6 +169,15 @@ fn page_fault(frame: &mut InterruptFrame) {
     // kernel's own map — is still fatal. (Until ring 3 lands, kernel code
     // executing *in* process context is also attributed to the process.)
     if task::current_is_process() {
+        // A legitimate stack-growth touch (see `process::handle_fault`)
+        // gets mapped in and the faulting instruction just re-executes —
+        // returning from an interrupt handler without redirecting `rip`
+        // resumes exactly where the fault happened. Anything else is a
+        // real fault: not-present outside the growth region, or a
+        // protection violation.
+        if crate::process::handle_fault(cr2, frame.error_code) {
+            return;
+        }
         crate::process::kill_current(cr2, frame);
         return;
     }

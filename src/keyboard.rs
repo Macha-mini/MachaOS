@@ -16,6 +16,8 @@ pub enum Event {
     Down,
     Left,
     Right,
+    Escape,
+    F2,
 }
 
 const BUFFER_CAPACITY: usize = 256;
@@ -121,6 +123,8 @@ fn decode(scancode: u8, extended: bool) -> Option<Event> {
         0x1C => Some(Event::Enter),
         0x0F => Some(Event::Tab),
         0x39 => Some(Event::Char(' ')),
+        0x01 => Some(Event::Escape),
+        0x3C => Some(Event::F2),
         _ if scancode >= 0x80 => None, // key release
         _ => {
             let shifted = SHIFT_DOWN.load(Ordering::Relaxed);

@@ -1,9 +1,40 @@
 //! 8x8 monochrome bitmap font for printable ASCII (0x00-0x7F).
 //! Data: font8x8_basic by Daniel Hepper, based on Marcel Sondaar / IBM's
 //! public-domain VGA fonts. Public Domain.
+//!
+//! Glyphs are rendered at an integer scale factor (1 or 2) so the whole
+//! UI's font size can be changed at runtime from the Settings app; the
+//! base `GLYPH_WIDTH`/`GLYPH_HEIGHT` constants stay 8x8 and the
+//! `glyph_w()`/`glyph_h()` accessors report the scaled metrics every
+//! layout decision should use.
+
+use core::sync::atomic::{AtomicU8, Ordering};
 
 pub const GLYPH_WIDTH: usize = 8;
 pub const GLYPH_HEIGHT: usize = 8;
+
+static FONT_SCALE: AtomicU8 = AtomicU8::new(1);
+
+/// Sets the global font scale factor (1x or 2x). Applied at boot from
+/// the persisted settings and at runtime when the Settings app changes
+/// the font size.
+pub fn set_scale(scale: u8) {
+    FONT_SCALE.store(scale.max(1), Ordering::Relaxed);
+}
+
+pub fn scale() -> u8 {
+    FONT_SCALE.load(Ordering::Relaxed)
+}
+
+/// Scaled glyph width in pixels.
+pub fn glyph_w() -> usize {
+    GLYPH_WIDTH * scale() as usize
+}
+
+/// Scaled glyph height in pixels.
+pub fn glyph_h() -> usize {
+    GLYPH_HEIGHT * scale() as usize
+}
 
 pub static FONT8X8_BASIC: [[u8; 8]; 128] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],

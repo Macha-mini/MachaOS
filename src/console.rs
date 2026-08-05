@@ -22,8 +22,8 @@ pub struct Console {
 
 impl Console {
     pub fn new(cols: usize, rows: usize, fg: u32, bg: u32) -> Self {
-        let width = cols * font::GLYPH_WIDTH;
-        let height = rows * font::GLYPH_HEIGHT;
+        let width = cols * font::glyph_w();
+        let height = rows * font::glyph_h();
         Self {
             cols,
             rows,
@@ -36,11 +36,11 @@ impl Console {
     }
 
     pub fn width_px(&self) -> u32 {
-        (self.cols * font::GLYPH_WIDTH) as u32
+        (self.cols * font::glyph_w()) as u32
     }
 
     pub fn height_px(&self) -> u32 {
-        (self.rows * font::GLYPH_HEIGHT) as u32
+        (self.rows * font::glyph_h()) as u32
     }
 
     pub fn pixels(&self) -> &[u32] {
@@ -71,8 +71,8 @@ impl Console {
         self.rows = rows;
         self.row = 0;
         self.col = 0;
-        let width = cols * font::GLYPH_WIDTH;
-        let height = rows * font::GLYPH_HEIGHT;
+        let width = cols * font::glyph_w();
+        let height = rows * font::glyph_h();
         self.buffer = vec![self.bg; width * height];
     }
 
@@ -120,8 +120,8 @@ impl Console {
     }
 
     fn draw_cell(&mut self, col: usize, row: usize, byte: u8) {
-        let x = (col * font::GLYPH_WIDTH) as u32;
-        let y = (row * font::GLYPH_HEIGHT) as u32;
+        let x = (col * font::glyph_w()) as u32;
+        let y = (row * font::glyph_h()) as u32;
         let fg = self.fg;
         let bg = self.bg;
         gfx::draw_char(self, x, y, byte, fg, Some(bg));
@@ -129,7 +129,7 @@ impl Console {
 
     fn scroll(&mut self) {
         let width = self.width_px() as usize;
-        let row_height = font::GLYPH_HEIGHT;
+        let row_height = font::glyph_h();
         let total_rows_px = self.rows * row_height;
         self.buffer.copy_within(width * row_height..width * total_rows_px, 0);
         let last_row_start = width * (total_rows_px - row_height);
@@ -155,6 +155,30 @@ impl Surface for Console {
             let idx = y as usize * self.width_px() as usize + x as usize;
             self.buffer[idx] = color;
         }
+    }
+
+    // Fast paths over the contiguous `buffer` (see `fb::State`); the
+    // console's own pixel buffer is the window content the compositor
+    // blits every frame.
+
+    fn blit_span(&mut self, x: u32, y: u32, src: &[u32], offset: usize, len: u32) {
+        let w = self.width_px() as usize;
+        if y as usize >= self.buffer.len() / w.max(1) || x as usize >= w || len == 0 {
+            return;
+        }
+        let n = (len as usize).min(w - x as usize);
+        let row_start = y as usize * w + x as usize;
+        self.buffer[row_start..row_start + n].copy_from_slice(&src[offset..offset + n]);
+    }
+
+    fn fill_span(&mut self, x: u32, y: u32, len: u32, color: u32) {
+        let w = self.width_px() as usize;
+        if y as usize >= self.buffer.len() / w.max(1) || x as usize >= w || len == 0 {
+            return;
+        }
+        let n = (len as usize).min(w - x as usize);
+        let row_start = y as usize * w + x as usize;
+        self.buffer[row_start..row_start + n].fill(color);
     }
 }
 

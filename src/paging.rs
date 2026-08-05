@@ -26,15 +26,31 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_PRESENT: u64 = 1;
 pub const PAGE_WRITABLE: u64 = 2;
 pub const PAGE_USER: u64 = 4;
+/// No-execute (bit 63) — only takes effect once `EFER.NXE` is set (see
+/// `syscall::init`); before that the CPU ignores it and treats every
+/// present page as executable regardless of this bit. Only ever set on
+/// a *leaf* PTE (map_range_in`'s/`map_page`'s own writes) — an
+/// intermediate PML4/PDPT/PD entry with NX set would disable execution
+/// for its *entire* subtree, not just one page, so `pt_entry_ptr_in`
+/// never propagates it upward the way it does `PAGE_USER`.
+pub const PAGE_NX: u64 = 1 << 63;
 
 // Defined by the boot assembly in main.rs (.bss).
 unsafe extern "C" {
     static page_table_pml4: u8;
 }
 
-const PRESENT_MASK: u64 = 0xFFF; // low 12 attribute bits
+// Low 12 attribute bits plus NX (bit 63) — everything `map_range_in`/
+// `map_page` accept as a leaf PTE's flags. Widened from just `0xFFF`
+// once NX existed: masking it out here would silently drop it from
+// every PTE this module writes.
+const PRESENT_MASK: u64 = 0xFFF | PAGE_NX;
 const PS_BIT: u64 = 1 << 7;
-const ADDR_MASK: u64 = !(0xFFF);
+// Physical address field only (bits 12-51) — deliberately excludes NX
+// (bit 63) and the reserved bits above the address field, unlike a bare
+// `!0xFFF`, so `table_base`/`ADDR_MASK` can never accidentally fold NX
+// into a directory-pointer address if an entry ever carries it.
+const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
 /// Physical address of the kernel's own PML4 (the boot map). Its virtual
 /// address equals its physical address, since the boot map is an identity
@@ -172,6 +188,39 @@ pub fn map_range_in(
         invlpg(v);
         v += PAGE_SIZE;
         p += PAGE_SIZE;
+    }
+    true
+}
+
+/// Clears the mapping for each 4 KiB page in `[virt, virt+len)` in the
+/// address space rooted at `pml4_base` (the counterpart to
+/// `map_range_in`, for a process's private table — `unmap_page` below is
+/// kernel-map-only). Does not free the physical frames; the caller owns
+/// them (see `process::Process::munmap`). Returns false for a
+/// misaligned/invalid range.
+pub fn unmap_range_in(pml4_base: u64, virt: u64, len: u64) -> bool {
+    if virt % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 || len == 0 || virt.checked_add(len).is_none() || virt + len > IDENTITY_MAP_END
+    {
+        return false;
+    }
+    let mut v = virt;
+    let end = virt + len;
+    while v < end {
+        // entry_flags = 0 (no USER promotion needed to clear an entry)
+        // and no frame list: if a bare 2 MiB entry is still in the way
+        // here, `pt_entry_ptr_in` splits it (installing a full page
+        // table) same as `map_range_in` would, but every page this
+        // kernel ever hands to a process first goes through
+        // `map_range_in` (which does track that split's frame) before
+        // anything could `unmap_range_in` it — so in practice this path
+        // only ever clears an already-4-KiB entry.
+        if let Some(entry) = unsafe { pt_entry_ptr_in(pml4_base, v, 0, None) } {
+            unsafe {
+                *entry = 0;
+            }
+            invlpg(v);
+        }
+        v += PAGE_SIZE;
     }
     true
 }

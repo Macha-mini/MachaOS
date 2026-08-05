@@ -97,6 +97,19 @@ struct Task {
     // PML4 the task runs with: the kernel's own map, or a process's
     // private address space.
     cr3: u64,
+    // Top of this task's own kernel stack. Written into TSS.rsp0 whenever
+    // this task becomes current: a ring 3 -> ring 0 transition (any
+    // interrupt/exception firing while a process is in ring 3) always
+    // switches SS:RSP to TSS.rsp0, so it must point at *this* task's
+    // stack, not a shared one, or an interrupt hitting a different
+    // process at the same fixed address would clobber it.
+    kernel_stack_top: u64,
+    // Resume point `syscall.rs`'s `.Lsyscall_exit` unwinds to when this
+    // task's process calls `exit`: the kernel-side rsp `run_ring3` saved
+    // just before its `iretq` into ring 3. Per-task (not a global) because
+    // a second process entering ring 3 before the first one exits would
+    // otherwise overwrite a shared slot.
+    ring3_kernel_rsp: u64,
     // `Some` exactly for processes; carries the ELF entry, the frames
     // and mappings the process owns, and its exit state.
     process: Option<Process>,
@@ -112,6 +125,35 @@ impl Task {
 
 const STACK_SIZE: usize = 16 * 1024;
 const QUANTUM_TICKS: u64 = 5; // 50ms at the 100Hz PIT rate
+
+/// Bytes of headroom kept below `kernel_stack_top` when programming
+/// TSS.RSP0 for a task (see `scheduler_tick`'s `set_kernel_stack` call).
+///
+/// A process's `enter_usermode` (syscall.rs) "parks" a return chain —
+/// `process_entry_trampoline` -> `run_ring3` -> `enter_usermode`'s own
+/// 6 pushed registers, plus each frame's own return address — on this
+/// same 16 KiB buffer, at whatever depth that short call chain reaches,
+/// then does its `iretq` into ring 3. That parked chain isn't touched
+/// again until the process's `exit` syscall unwinds it (`.Lsyscall_exit`
+/// in syscall.rs). But every *other* trip through ring 0 while the
+/// process runs — any interrupt or exception, not just ones that kill
+/// the process — gets its stack frame from TSS.RSP0, which if pointed
+/// at the literal top would land *above* the parked chain and grow
+/// straight through it. A shallow handler (the timer tick) or one that
+/// never returns to ring 3 (`kill_current`, which redirects rip to
+/// `exit_self` instead of resuming) never surfaced this. A #PF that
+/// resolves and resumes ring 3 — `process::handle_fault`'s stack-growth
+/// path — calls deep enough (`pmm::alloc_contiguous`, `paging::map_range_in`)
+/// to overwrite it, corrupting the very state `exit` later needs,
+/// which showed up as `exit`'s `ret` landing on garbage. This reserve
+/// keeps every such trip through ring 0 confined below the parked chain
+/// instead. Comfortably covers that chain's actual depth (a handful of
+/// stack frames, well under 100 bytes) with room to spare.
+const RING3_PARK_RESERVE: u64 = 1024;
+
+/// IA32_FS_BASE — see `scheduler_tick`'s save/restore of
+/// `process::Process::fs_base` around a task switch.
+const MSR_FS_BASE: u32 = 0xC000_0100;
 
 // Built once in `init()` before interrupts are enabled, then mutated from
 // `scheduler_tick()` (timer-interrupt context) or from `push_task` /
@@ -142,6 +184,8 @@ pub fn init() {
         _stack: None,
         name: "main",
         cr3: paging::kernel_pml4(),
+        kernel_stack_top: crate::gdt::boot_stack_top(),
+        ring3_kernel_rsp: 0,
         process: None,
     });
     spawn(counter_task_0, "bg-0");
@@ -151,6 +195,16 @@ pub fn init() {
 
 fn spawn(entry: fn() -> !, name: &'static str) {
     push_task(entry as *const () as usize, name, paging::kernel_pml4(), None);
+}
+
+/// Registers a kernel-native background task (own stack, kernel address
+/// space, no `Process`) — `wayland.rs`'s compositor loop uses this
+/// instead of running as a Linux-ABI process, so it can freely `hlt`-wait
+/// for a connection or more data the way `process::wait` does; a
+/// syscall-driven process can't (see `syscall.rs`'s module docs on
+/// `SFMASK` clearing IF for a syscall's whole duration).
+pub fn spawn_kernel_task(entry: fn() -> !, name: &'static str) {
+    spawn(entry, name);
 }
 
 /// Registers a new task running `entry` (a kernel function address) on a
@@ -189,6 +243,8 @@ fn push_task(entry: usize, name: &'static str, cr3: u64, process: Option<Process
         _stack: Some(stack),
         name,
         cr3,
+        kernel_stack_top: stack_top as u64,
+        ring3_kernel_rsp: 0,
         process,
     });
     let pid = tasks().len() - 1;
@@ -222,11 +278,26 @@ pub fn scheduler_tick() {
         }
     }
     let Some(next) = next else { return }; // kernel tasks are always runnable
+
+    // FS_BASE (the Linux ABI's TLS base — see `process::Process::fs_base`'s
+    // doc comment) is a single CPU-global MSR, not part of what
+    // `context_switch` itself saves/restores in callee-saved registers.
+    // Save the outgoing process's (a no-op — reads back whatever was last
+    // written — for one that never called arch_prctl) and restore the
+    // incoming one's before switching, or a second Linux process's TLS
+    // would silently clobber the first's the moment they're interleaved.
+    if let Some(process) = tasks[current].process.as_mut() {
+        process.fs_base = unsafe { crate::syscall::rdmsr(MSR_FS_BASE) };
+    }
     CURRENT.store(next, Ordering::Relaxed);
+    if let Some(process) = tasks[next].process.as_ref() {
+        unsafe { crate::syscall::wrmsr(MSR_FS_BASE, process.fs_base) };
+    }
 
     if paging::read_cr3() != tasks[next].cr3 {
         paging::write_cr3(tasks[next].cr3);
     }
+    crate::gdt::set_kernel_stack(tasks[next].kernel_stack_top - RING3_PARK_RESERVE);
     let new_rsp = tasks[next].context.rsp;
     let old_rsp_ptr = &mut tasks[current].context.rsp as *mut usize;
     unsafe {
@@ -256,6 +327,11 @@ pub fn current_is_process() -> bool {
         .is_some_and(|task| task.process.is_some())
 }
 
+/// Index of the currently running task ("pid" for a process).
+pub fn current_pid() -> usize {
+    CURRENT.load(Ordering::Relaxed)
+}
+
 /// ELF entry address of the current task (only valid for processes).
 pub fn current_process_entry() -> usize {
     tasks()[CURRENT.load(Ordering::Relaxed)]
@@ -263,6 +339,59 @@ pub fn current_process_entry() -> usize {
         .as_ref()
         .expect("current task is not a process")
         .entry
+}
+
+/// Initial ring-3 stack pointer of the current task (only valid for
+/// processes).
+pub fn current_process_user_rsp() -> u64 {
+    tasks()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_ref()
+        .expect("current task is not a process")
+        .user_rsp
+}
+
+/// Which syscall table the current task's process should dispatch
+/// through (`None` for a kernel task, which never issues a syscall in
+/// the first place). Used by `syscall::syscall_dispatch` to route
+/// between the native and Linux (`linux_abi.rs`) tables.
+pub fn current_process_abi() -> Option<crate::process::Abi> {
+    tasks()[CURRENT.load(Ordering::Relaxed)].process.as_ref().map(|p| p.abi)
+}
+
+/// The current task's CR3 (its own PML4), if it is a process — `None` for
+/// a kernel task. Used by `process::handle_fault` to map a new page into
+/// the *faulting* process's address space regardless of which task's
+/// stack the #PF handler happens to be running on.
+pub fn current_process_cr3() -> Option<u64> {
+    let task = &tasks()[CURRENT.load(Ordering::Relaxed)];
+    task.process.as_ref().map(|_| task.cr3)
+}
+
+/// Runs `f` on the current task's process, if it is one. Used by
+/// `process::handle_fault` to grow the ring-3 stack from inside the #PF
+/// handler, where the fault could interrupt any point in the process's
+/// execution — the same non-reentrancy argument `deliver_message`'s doc
+/// comment makes applies here (interrupts are already disabled for the
+/// whole handler).
+pub fn with_current_process_mut<R>(f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_mut()
+        .map(f)
+}
+
+/// Saves the current task's kernel-side resume point for when its process
+/// exits (see `Task::ring3_kernel_rsp`). Called from `syscall::run_ring3`
+/// right before it drops into ring 3.
+pub fn set_current_ring3_return_rsp(rsp: u64) {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)].ring3_kernel_rsp = rsp;
+}
+
+/// Reads back the value `set_current_ring3_return_rsp` stored for the
+/// current task. Called from `syscall.rs`'s `.Lsyscall_exit` path.
+pub fn current_ring3_return_rsp() -> u64 {
+    tasks()[CURRENT.load(Ordering::Relaxed)].ring3_kernel_rsp
 }
 
 /// The process's exit status once it has exited, `None` while it runs
@@ -295,6 +424,34 @@ pub fn process_mappings(pid: usize) -> Option<&'static [crate::process::Mapping]
     tasks()
         .get(pid)
         .and_then(|task| task.process.as_ref().map(|p| p.mappings.as_slice()))
+}
+
+/// Delivers `bytes` to `pid`'s single-message inbox (a mailbox, not a
+/// queue: a second delivery before the first is read overwrites it).
+/// Returns false if `pid` isn't a running process. Safe to call from
+/// syscall context: interrupts are already disabled there for the whole
+/// non-blocking, non-reentrant duration (see syscall.rs's module docs),
+/// which is the same precondition `push_task`/`remove_process` rely on.
+pub fn deliver_message(pid: usize, bytes: &[u8]) -> bool {
+    let Some(task) = tasks_mut().get_mut(pid) else {
+        return false;
+    };
+    let Some(process) = task.process.as_mut() else {
+        return false;
+    };
+    if process.is_exited() {
+        return false;
+    }
+    process.inbox = Some(bytes.to_vec());
+    true
+}
+
+/// Takes (clearing) the current task's pending message, if any.
+pub fn take_current_message() -> Option<alloc::vec::Vec<u8>> {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)]
+        .process
+        .as_mut()
+        .and_then(|process| process.inbox.take())
 }
 
 /// Marks the current task's process as exited. Keeps the first exit info
@@ -331,20 +488,30 @@ pub fn remove_process(pid: usize) -> Option<Process> {
     task.process
 }
 
-fn counter_task_0() -> ! {
+// Background demo tasks: bump a counter to prove preemptive
+// multitasking works. They deliberately pace themselves with `hlt`
+// (waking on the next timer tick) instead of spinning: an unconditional
+// `loop { fetch_add }` in three tasks would burn 100% of one core and
+// starve the desktop/main task for CPU, which makes the whole OS feel
+// sluggish in QEMU. Pacing keeps the counters visibly advancing while
+// leaving the CPU to the UI.
+fn counter_task(index: usize) -> ! {
     loop {
-        COUNTERS[0].fetch_add(1, Ordering::Relaxed);
+        for _ in 0..100 {
+            COUNTERS[index].fetch_add(1, Ordering::Relaxed);
+        }
+        interrupts::halt();
     }
+}
+
+fn counter_task_0() -> ! {
+    counter_task(0)
 }
 
 fn counter_task_1() -> ! {
-    loop {
-        COUNTERS[1].fetch_add(1, Ordering::Relaxed);
-    }
+    counter_task(1)
 }
 
 fn counter_task_2() -> ! {
-    loop {
-        COUNTERS[2].fetch_add(1, Ordering::Relaxed);
-    }
+    counter_task(2)
 }

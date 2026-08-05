@@ -1,6 +1,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
@@ -11,12 +12,17 @@ const BANNER: &str = "MachaOS v0.1.0";
 pub const PROMPT: &str = "machaos> ";
 
 // Current working directory on the mounted disk (absolute, normalized).
-// Defaults to the filesystem root until the user runs `cd`.
+// Empty means "not set yet": the shell starts in the user's home.
 static CWD: SpinLock<String> = SpinLock::new(String::new());
 
 /// Returns the current working directory (always starts with `/`).
 pub fn cwd() -> String {
-    CWD.lock().clone()
+    let dir = CWD.lock().clone();
+    if dir.is_empty() {
+        crate::users::home()
+    } else {
+        dir
+    }
 }
 
 fn set_cwd(path: &str) {
@@ -55,12 +61,22 @@ fn normalize_path(path: &str) -> String {
     out
 }
 
-/// Resolves `path` against the current working directory.
+/// Resolves `path` against the current working directory. A leading
+/// `~` (or `~/`) expands to the user's home directory.
 fn abs_path(path: &str) -> String {
-    if path.starts_with('/') {
-        normalize_path(path)
+    let expanded = if let Some(rest) = path.strip_prefix('~') {
+        if rest.is_empty() || rest.starts_with('/') {
+            format!("{}{}", crate::users::home(), rest)
+        } else {
+            path.to_string()
+        }
     } else {
-        normalize_path(&format!("{}/{}", cwd(), path))
+        path.to_string()
+    };
+    if expanded.starts_with('/') {
+        normalize_path(&expanded)
+    } else {
+        normalize_path(&format!("{}/{}", cwd(), expanded))
     }
 }
 
@@ -93,7 +109,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "run",
+    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
 ];
 
 pub fn run() -> ! {
@@ -219,6 +235,7 @@ fn read_line() -> String {
                 }
                 // The plain VGA fallback shell has no cursor movement.
                 keyboard::Event::Left | keyboard::Event::Right => {}
+                keyboard::Event::Escape | keyboard::Event::F2 => {}
                 keyboard::Event::Ctrl(_) => {}
             }
         }
@@ -294,9 +311,12 @@ pub fn execute(line: &str) {
         "write" => cmd_write(&args),
         "mkdir" => cmd_mkdir(&args),
         "rm" => cmd_rm(&args),
+        "mv" => cmd_mv(&args),
         "run" => cmd_run(&args),
+        "runlinux" => cmd_runlinux(&args),
         "cd" => cmd_cd(&args),
         "pwd" => println!("{}", cwd()),
+        "whoami" => println!("{}", crate::users::USER),
         _ => println!("unknown command: '{}' (type 'help')", command),
     }
 }
@@ -328,11 +348,16 @@ fn cmd_help() {
     println!("               write text to a file (LFN supported)");
     println!("  mkdir <path> create a directory");
     println!("  rm <path>   remove a file or empty directory");
+    println!("  mv <path> <new-name>");
+    println!("               rename a file or directory in place");
     println!("  run <path>  load and run an ELF program as a process");
-    println!("  cd [path]   change directory (default: root, .. goes up)");
+    println!("  runlinux <path> [args...]");
+    println!("               load and run a Linux ELF binary (Linux ABI, see linux_abi.rs)");
+    println!("  cd [path]   change directory (default: home, .. goes up)");
     println!("  pwd         print the current directory");
-    println!("Paths may be relative to the current directory; quote arguments");
-    println!("containing spaces: write notes.txt \"hello world\"");
+    println!("  whoami      print the current user");
+    println!("Paths may be relative to the current directory; '~' means the");
+    println!("home directory; quote arguments containing spaces: write notes.txt \"hello world\"");
 }
 
 fn cmd_date() {
@@ -429,10 +454,24 @@ fn cmd_rm(args: &[&str]) {
     }
 }
 
+fn cmd_mv(args: &[&str]) {
+    if args.len() != 2 {
+        println!("usage: mv <path> <new-name>");
+        return;
+    }
+    let path = abs_path(args[0]);
+    let new_name = args[1].to_string();
+    match fat::rename(&path, &new_name) {
+        Ok(()) => println!("renamed {} to {}", path, new_name),
+        Err(e) => println!("mv: {}: {}", path, e),
+    }
+}
+
 fn cmd_cd(args: &[&str]) {
-    // No argument: back to the root. Quoted paths may contain spaces.
+    // No argument: back to the user's home. Quoted paths may contain
+    // spaces, and `~` expands to the home directory.
     let target = if args.is_empty() {
-        String::from("/")
+        crate::users::home()
     } else {
         abs_path(&args.join(" "))
     };
@@ -476,6 +515,40 @@ fn cmd_run(args: &[&str]) {
             Err(e) => println!("run: {}: {}", path, e),
         },
         Err(e) => println!("run: {}: {}", path, e),
+    }
+}
+
+/// Like `cmd_run`, but for a Linux binary: loads the ELF from disk and
+/// spawns it via `process::spawn_linux` (Linux-style argv/envp/auxv
+/// stack, syscalls routed through `linux_abi.rs`) instead of the native
+/// ABI's `process::spawn`. `argv[0]` is the path as given (matching what
+/// a real shell passes); any further words become `argv[1..]`.
+fn cmd_runlinux(args: &[&str]) {
+    let Some(&path) = args.first() else {
+        println!("usage: runlinux <path> [args...]");
+        return;
+    };
+    let abs = abs_path(path);
+    match fat::read_file(&abs) {
+        Ok(elf) => {
+            let mut argv = alloc::vec![path];
+            argv.extend_from_slice(&args[1..]);
+            match process::spawn_linux(&elf, "app", &argv, &["PATH=/bin"]) {
+                Ok(pid) => {
+                    println!("spawned Linux process {} from {} ({} byte ELF)", pid, abs, elf.len());
+                    match process::wait(pid, 500) {
+                        Some(info) => {
+                            println!("process {} {}", pid, process::describe_exit(&info));
+                            process::reap(pid);
+                            println!("process {} reaped", pid);
+                        }
+                        None => println!("process {} did not exit within 5s", pid),
+                    }
+                }
+                Err(e) => println!("runlinux: {}: {}", abs, e),
+            }
+        }
+        Err(e) => println!("runlinux: {}: {}", abs, e),
     }
 }
 
@@ -684,29 +757,31 @@ pub fn selftest() -> ! {
     execute("tasks");
     execute("fatinfo");
     execute("ls");
-    execute("ls /docs");
-    execute("cat /hello world.txt");
-    execute("cat /greetings.txt");
-    execute("cat /docs/readme.txt");
+    execute("ls /users/macha/Documents");
+    execute("cat /users/macha/Documents/hello world.txt");
+    execute("cat /users/macha/Documents/greetings.txt");
+    execute("cat /users/macha/Documents/readme.txt");
+    execute("whoami");
 
     // FAT32 read verification: the fixture files were placed on the disk
     // image by `make disk` (mtools), so this exercises LFN parsing, the
-    // FAT cluster chain, and subdirectory traversal.
-    match fat::list_dir("/") {
+    // FAT cluster chain, and subdirectory traversal. Fixtures live in
+    // the user's Documents folder.
+    match fat::list_dir("/users/macha/Documents") {
         Ok(entries) => {
             let fixture = entries.iter().find(|e| e.name == "hello world.txt");
             match fixture {
                 Some(entry) if !entry.is_dir && entry.size == 20 => {
-                    println!("[OK] FAT32 root listing finds fixture (20 bytes)")
+                    println!("[OK] FAT32 Documents listing finds fixture (20 bytes)")
                 }
-                _ => selftest_fail("FAT32 fixture file missing or wrong size in /"),
+                _ => selftest_fail("FAT32 fixture file missing or wrong size in Documents"),
             }
         }
-        Err(_) => selftest_fail("FAT32 root listing failed"),
+        Err(_) => selftest_fail("FAT32 Documents listing failed"),
     }
-    match fat::read_file("/docs/readme.txt") {
+    match fat::read_file("/users/macha/Documents/readme.txt") {
         Ok(data) if data == b"hello from the host\n" => {
-            println!("[OK] FAT32 read /docs/readme.txt matches fixture")
+            println!("[OK] FAT32 read Documents/readme.txt matches fixture")
         }
         _ => selftest_fail("FAT32 subdirectory read mismatch"),
     }
@@ -739,6 +814,27 @@ pub fn selftest() -> ! {
         }
         _ => selftest_fail("FAT32 overwrite mismatch"),
     }
+    if let Err(_e) = fat::write_file("/selftest/movable.txt", b"move payload") {
+        selftest_fail("FAT32 move source write failed");
+    }
+    if let Err(_e) = fat::make_dir("/selftest/destination") {
+        selftest_fail("FAT32 move destination mkdir failed");
+    }
+    if let Err(_e) = fat::move_file("/selftest/movable.txt", "/selftest/destination/movable.txt") {
+        selftest_fail("FAT32 move failed");
+    }
+    match fat::read_file("/selftest/destination/movable.txt") {
+        Ok(data) if data == b"move payload" && fat::read_file("/selftest/movable.txt").is_err() => {
+            println!("[OK] FAT32 move file round trip")
+        }
+        _ => selftest_fail("FAT32 move result mismatch"),
+    }
+    if let Err(_e) = fat::remove("/selftest/destination/movable.txt") {
+        selftest_fail("FAT32 move cleanup file failed");
+    }
+    if let Err(_e) = fat::remove("/selftest/destination") {
+        selftest_fail("FAT32 move cleanup directory failed");
+    }
     if let Err(_e) = fat::remove("/selftest/multicluster payload.txt") {
         selftest_fail("FAT32 rm file failed");
     }
@@ -757,30 +853,252 @@ pub fn selftest() -> ! {
         );
     }
 
-    // Shell path handling: cd/pwd, `..`, and relative access.
-    execute("cd /docs");
-    if cwd() != "/docs" {
-        selftest_fail("cd /docs did not update cwd");
+    // Desktop session persistence: serialize a representative set of
+    // open windows and remembered geometries, save it to the disk,
+    // load it back and check every field survives the round trip.
+    // Also proves the parser is lenient (garbage lines are skipped).
+    use crate::session::{self, SessionData, SessionWindow};
+    let original = SessionData {
+        windows: vec![
+            SessionWindow {
+                app: "terminal".into(),
+                x: 100,
+                y: 80,
+                cols: 80,
+                rows: 24,
+                minimized: false,
+                maximized: false,
+            },
+            SessionWindow {
+                app: "notepad".into(),
+                x: 300,
+                y: 200,
+                cols: 60,
+                rows: 12,
+                minimized: true,
+                maximized: false,
+            },
+            SessionWindow {
+                app: "settings".into(),
+                x: 20,
+                y: 40,
+                cols: 0,
+                rows: 0,
+                minimized: false,
+                maximized: true,
+            },
+            SessionWindow {
+                app: "sysinfo".into(),
+                x: -5,
+                y: 700,
+                cols: 38,
+                rows: 16,
+                minimized: false,
+                maximized: false,
+            },
+        ],
+        remembered: vec![
+            SessionWindow {
+                app: "calculator".into(),
+                x: 140,
+                y: 100,
+                cols: 0,
+                rows: 0,
+                minimized: false,
+                maximized: false,
+            },
+            SessionWindow {
+                app: "paint".into(),
+                x: 512,
+                y: 384,
+                cols: 0,
+                rows: 0,
+                minimized: false,
+                maximized: true,
+            },
+        ],
+    };
+    let text = session::serialize(&original);
+    let reparsed = session::parse(&text);
+    if reparsed != original {
+        selftest_fail("desktop session serialize/parse round trip mismatch");
+    }
+    println!(
+        "[OK] desktop session serialize/parse round trip ({} bytes)",
+        text.len()
+    );
+
+    // Disk round trip through the real persistence path: save_to_disk
+    // writes /system/desktop.session, load_from_disk reads it back —
+    // exactly what happens across a reboot.
+    if !session::save_to_disk(&original) {
+        selftest_fail("desktop session disk write failed");
+    }
+    let loaded = session::load_from_disk();
+    if loaded != original {
+        selftest_fail("desktop session save/load round trip mismatch");
+    }
+    println!("[OK] desktop session survives save/load round trip via /system/desktop.session");
+    if fat::remove("/system/desktop.session").is_err() {
+        selftest_fail("desktop session test cleanup failed");
+    }
+
+    // Missing file: loading yields an empty session, never an error.
+    let missing = session::load_from_disk();
+    if !missing.windows.is_empty() || !missing.remembered.is_empty() {
+        selftest_fail("desktop session missing-file load is not empty");
+    }
+    println!("[OK] desktop session missing file restores an empty session");
+
+    // Lenient parsing: unknown/malformed lines are skipped, the rest
+    // still loads.
+    let junk = "# comment\nwindow bogus notanumber 2 3 4 0 0\nnot a session\nremembered\nwindow terminal 50 60 40 10 0 1\n";
+    let parsed = session::parse(junk);
+    if parsed.windows.len() != 1
+        || parsed.windows[0].app != "terminal"
+        || parsed.windows[0].x != 50
+        || !parsed.windows[0].maximized
+    {
+        selftest_fail("desktop session lenient parsing failed");
+    }
+    println!("[OK] desktop session parsing skips malformed lines");
+
+    // File rename (FAT32 rename-impl): a file keeps its contents under
+    // the new name and disappears from the old one; a non-empty
+    // directory renames in place too (its children move with it).
+    if fat::make_dir("/selftest").is_err() {
+        selftest_fail("rename test mkdir failed");
+    }
+    if let Err(_e) = fat::write_file("/selftest/old name.txt", b"rename payload") {
+        selftest_fail("rename test source write failed");
+    }
+    if let Err(e) = fat::rename("/selftest/old name.txt", "new name.txt") {
+        selftest_fail(&format!("file rename failed: {}", e));
+    }
+    match fat::read_file("/selftest/new name.txt") {
+        Ok(data) if data == b"rename payload" && fat::read_file("/selftest/old name.txt").is_err() => {
+            println!("[OK] FAT32 rename keeps file contents under the new name")
+        }
+        _ => selftest_fail("file rename result mismatch"),
+    }
+    if let Err(_e) = fat::write_file("/selftest/taken.txt", b"taken") {
+        selftest_fail("rename collision setup failed");
+    }
+    match fat::rename("/selftest/new name.txt", "taken.txt") {
+        Err(FatError::AlreadyExists) => println!("[OK] FAT32 rename rejects an existing name"),
+        _ => selftest_fail("rename collision was not rejected"),
+    }
+    if fat::make_dir("/selftest/dir").is_err() {
+        selftest_fail("rename dir setup mkdir failed");
+    }
+    if let Err(_e) = fat::write_file("/selftest/dir/child.txt", b"child") {
+        selftest_fail("rename dir child write failed");
+    }
+    if let Err(e) = fat::rename("/selftest/dir", "moved-dir") {
+        selftest_fail(&format!("directory rename failed: {}", e));
+    }
+    match fat::read_file("/selftest/moved-dir/child.txt") {
+        Ok(data) if data == b"child" && fat::list_dir("/selftest/dir").is_err() => {
+            println!("[OK] FAT32 rename moves a non-empty directory in place")
+        }
+        _ => selftest_fail("directory rename result mismatch"),
+    }
+
+    // Empty files: writing zero bytes creates a 0-byte entry that reads
+    // back empty — what the explorer's "New File" button produces.
+    if let Err(e) = fat::write_file("/selftest/empty file.txt", b"") {
+        selftest_fail(&format!("empty file write failed: {}", e));
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Ok(data) if data.is_empty() => println!("[OK] FAT32 empty file round trip"),
+        _ => selftest_fail("empty file read mismatch"),
+    }
+
+    // Overwriting an existing empty file (first_cluster == 0) must not
+    // free reserved cluster 0: the file survives, both as an empty
+    // overwrite and then as a content write. Removing an empty file
+    // must succeed for the same reason.
+    if fat::write_file("/selftest/empty file.txt", b"").is_err() {
+        selftest_fail("empty file overwrite failed");
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Ok(data) if data.is_empty() => println!("[OK] FAT32 empty file overwrite keeps the file"),
+        _ => selftest_fail("empty file overwrite lost the file"),
+    }
+    if fat::write_file("/selftest/empty file.txt", b"now has content").is_err() {
+        selftest_fail("empty file content write failed");
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Ok(data) if data == b"now has content" => {
+            println!("[OK] FAT32 empty file grows content on overwrite")
+        }
+        _ => selftest_fail("empty file content overwrite mismatch"),
+    }
+    if fat::remove("/selftest/empty file.txt").is_err() {
+        selftest_fail("empty file remove failed");
+    }
+    match fat::read_file("/selftest/empty file.txt") {
+        Err(FatError::NotFound) => println!("[OK] FAT32 empty file removes cleanly"),
+        _ => selftest_fail("empty file remove left it behind"),
+    }
+
+    // The shell's `mv` command drives the same rename path (quote paths
+    // with spaces, like `write`).
+    if let Err(e) = fat::write_file("/selftest/mv source.txt", b"mv me") {
+        selftest_fail(&format!("mv test setup failed: {}", e));
+    }
+    execute("mv \"/selftest/mv source.txt\" \"renamed-empty.txt\"");
+    if fat::read_file("/selftest/renamed-empty.txt").is_err() || fat::read_file("/selftest/mv source.txt").is_ok() {
+        selftest_fail("shell mv did not rename the file");
+    }
+    println!("[OK] shell mv command renames files");
+
+    // Clean up every rename-test artifact.
+    for leftover in ["/selftest/renamed-empty.txt", "/selftest/taken.txt", "/selftest/new name.txt"] {
+        let _ = fat::remove(leftover);
+    }
+    if let Err(_e) = fat::remove("/selftest/moved-dir/child.txt") {
+        selftest_fail("rename test cleanup file failed");
+    }
+    if let Err(_e) = fat::remove("/selftest/moved-dir") {
+        selftest_fail("rename test cleanup dir failed");
+    }
+    if let Err(_e) = fat::remove("/selftest") {
+        selftest_fail("rename test cleanup root failed");
+    }
+
+    // Shell path handling: cd/pwd, `..`, home expansion, and relative access.
+    execute("cd /users/macha/Documents");
+    if cwd() != "/users/macha/Documents" {
+        selftest_fail("cd Documents did not update cwd");
     }
     execute("pwd");
     execute("ls");
     execute("cat readme.txt"); // relative to cwd
     execute("cd ..");
-    if cwd() != "/" {
-        selftest_fail("cd .. did not return to the root");
+    if cwd() != "/users/macha" {
+        selftest_fail("cd .. did not return to the home directory");
     }
     execute("pwd");
+    execute("cd ~/Documents");
+    if cwd() != "/users/macha/Documents" {
+        selftest_fail("~ expansion did not resolve to Documents");
+    }
+    execute("cd");
+    if cwd() != "/users/macha" {
+        selftest_fail("cd with no argument did not return home");
+    }
     println!("[OK] shell cd/pwd and relative paths");
 
     // Quoting: a double-quoted argument keeps embedded spaces whole.
-    execute("write /qt.txt \"hello world from quotes\"");
-    match fat::read_file("/qt.txt") {
+    execute("write ~/Documents/qt.txt \"hello world from quotes\"");
+    match fat::read_file("/users/macha/Documents/qt.txt") {
         Ok(data) if data == b"hello world from quotes" => {
             println!("[OK] shell quoting keeps spaces in one argument")
         }
         _ => selftest_fail("shell quoting mismatch"),
     }
-    execute("rm /qt.txt");
+    execute("rm ~/Documents/qt.txt");
 
     // Physical memory manager: allocate two frames, scribble on the
     // first, free both, then confirm the first allocation hands the
@@ -879,6 +1197,87 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2b: stack growth. The embedded ELF recurses
+    // deep enough to blow well past the 32 KiB mapped for a fresh
+    // process's stack; without `process::try_grow_stack` this would be
+    // indistinguishable from part 2's fault and the process would be
+    // killed instead of returning sum(0..=2000) = 2001000.
+    let pid = crate::process::spawn(crate::user_prog::PROG_STACK, "deep-stack")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 200) {
+        Some(process::ExitInfo::Normal) => println!("[OK] deep recursion exited normally (stack grew instead of faulting)"),
+        other => selftest_fail(&format!("stack-growth process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(2_001_000) => println!("[OK] deep recursion computed sum(0..=2000) = 2001000"),
+        other => selftest_fail(&format!("stack-growth process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 2c: Linux-style initial stack layout.
+    // `process::spawn_linux` builds a real argv/argc/envp/auxv stack
+    // (`process::setup_linux_stack`) instead of the native ABI's single
+    // return-address slot; the embedded ELF reads it straight off its
+    // entry `rsp` (the way a real libc's `_start` does) and reports which
+    // of 13 checks (argc, argv[], envp[], the auxv terminator, and each
+    // auxv value including a round trip through the copied program
+    // header table) passed as a bitmask.
+    let pid = crate::process::spawn_linux(
+        crate::user_prog::PROG_LINUX_STACK,
+        "linux-stack",
+        &["prog_linux_stack", "hello"],
+        &["FOO=bar"],
+    )
+    .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux-style stack layout process exited normally"),
+        other => selftest_fail(&format!("linux-stack process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0x1FFF) => println!("[OK] Linux-style stack layout: argv/envp/auxv all read back correctly"),
+        other => selftest_fail(&format!("linux-stack process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 2d: Linux syscall dispatch routing.
+    // `process::Abi::Linux` (also set by `spawn_linux`) makes
+    // `syscall::syscall_dispatch` route to `linux_abi::syscall_dispatch`
+    // instead of the native table; the embedded ELF calls Linux syscall
+    // 39 (getpid), an unrecognized number (expecting `-ENOSYS` per the
+    // real Linux errno convention), and Linux syscall 1 (`write`, not
+    // the native ABI's exit — proves `syscall_entry`'s ABI-aware exit
+    // check keeps the two numbering schemes from colliding), then exits
+    // via the real Linux `exit` (60).
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_SYSCALL, "linux-syscall", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux syscall dispatch process exited normally"),
+        other => selftest_fail(&format!("linux-syscall process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0b111) => println!("[OK] Linux syscall dispatch: getpid, -ENOSYS, and real write(1, ...) all correct"),
+        other => selftest_fail(&format!("linux-syscall process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 2e: Phase 3 syscalls (futex/rseq/
+    // prlimit64/sched_getaffinity/sysinfo) a static glibc binary's
+    // startup needs beyond Phase 2's musl-oriented set. No glibc
+    // toolchain was available to build a real test binary against, so
+    // this checks each syscall's documented (simplified — see
+    // linux_abi.rs) behavior directly; 7 checks, one bit each.
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_PHASE3, "linux-phase3", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] Linux Phase 3 syscalls process exited normally"),
+        other => selftest_fail(&format!("linux-phase3 process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0x7F) => println!("[OK] Linux Phase 3: futex/rseq/prlimit64/sched_getaffinity/sysinfo all correct"),
+        other => selftest_fail(&format!("linux-phase3 process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.
@@ -901,11 +1300,175 @@ pub fn selftest() -> ! {
         Err(e) => selftest_fail(&format!("reading /bin/prog_exit.elf failed: {e}")),
     }
 
+    // Process management, part 4: real multi-argument syscalls. The
+    // embedded ELF writes a buffer via sys_write(stdout, ptr, len) and
+    // stores the sys_clock return value in its result — nonzero only if
+    // both syscalls actually ran and returned through the normal SYSRET
+    // path (not just the sys_exit unwind the other tests exercise).
+    let pid = crate::process::spawn(crate::user_prog::PROG_SYSCALL, "syscall")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] process syscall test exited normally"),
+        other => selftest_fail(&format!("syscall test process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(ticks) if ticks > 0 => {
+            println!("[OK] process sys_write + sys_clock round trip (clock = {} ticks)", ticks)
+        }
+        other => selftest_fail(&format!("syscall test process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 5: IPC. The kernel delivers a message to
+    // the process's inbox right after spawning it — nothing yields
+    // between `spawn` and `send_from_kernel` here, so it's guaranteed to
+    // land before the process can possibly have run — and the process
+    // reads it back via sys_recv and reports the first byte.
+    let pid = crate::process::spawn(crate::user_prog::PROG_IPC, "ipc")
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    if !crate::process::send_from_kernel(pid, b"ping") {
+        selftest_fail("send_from_kernel failed to deliver to a freshly spawned process");
+    }
+    match crate::process::wait(pid, 100) {
+        Some(process::ExitInfo::Normal) => println!("[OK] IPC process exited normally"),
+        other => selftest_fail(&format!("IPC process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(n) if n == b'p' as u64 => {
+            println!("[OK] sys_recv delivered the message sent via send_from_kernel")
+        }
+        other => selftest_fail(&format!("IPC process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
     let frames_after = crate::pmm::free_frames();
     if frames_after == frames_before {
         println!("[OK] all process frames returned to the PMM");
     } else {
         println!("[WARN] free frames changed across process tests: {} -> {}", frames_before, frames_after);
+    }
+
+    // Process management, part 5: a real Linux binary, if one happens to
+    // be on the disk (`make disk-linux`, see the Makefile — not part of
+    // the plain `disk` target `make test` itself uses, so this quietly
+    // skips rather than needing network access for the normal build).
+    // BusyBox's `echo` applet exercises the Linux ABI layer end to end:
+    // real musl _start (brk/arch_prctl/mmap during startup), argv
+    // dispatch, and a real write(1, ...) syscall — not just a MachaOS-
+    // native test program that happens to use Linux syscall numbers.
+    match fat::read_file("/bin/busybox.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "busybox", &["busybox", "echo", "hello-from-busybox"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("busybox spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(process::ExitInfo::Normal) => println!("[OK] real busybox binary (echo applet) exited normally"),
+                other => selftest_fail(&format!("busybox gave unexpected exit: {:?}", other)),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/busybox.elf not present (run `make disk-linux` to fetch it)"),
+    }
+
+    // Process management, part 6: a real *dynamically-linked* glibc
+    // binary (GNU Hello), if present — exercises Phase 4/6's PT_INTERP
+    // handling for real: the process's actual entry point is the real
+    // /lib64/ld-linux-x86-64.so.2, which is expected to mmap and relocate
+    // the real /lib/x86_64-linux-gnu/libc.so.6 itself before ever
+    // reaching hello's own main. Not fetched by any Makefile target
+    // (getting a real glibc + ld.so pair needs extracting Debian
+    // packages, done by hand for this — see the Phase 4 commit) and not
+    // a hard selftest failure either way: testing against the real
+    // binary is what found and fixed several real gaps, most recently
+    // (Phase 6) a page fault during `ld.so`'s TLS/rseq setup traced to
+    // `syscall_entry` never restoring the caller's rdi/rsi/rdx/r10/r8/r9
+    // after `syscall_dispatch` — real Linux's syscall ABI guarantees
+    // those survive a syscall unchanged, and real glibc (unlike this
+    // repo's own hand-written test programs, whose `common::syscall`
+    // deliberately marks them clobbered to match this kernel's old,
+    // non-compliant behavior) relies on that guarantee. Fixing it
+    // removed the crash entirely, but `ld.so` still never calls `mmap`
+    // on the fd it opens for `libc.so.6` — see `linux_abi.rs`'s module
+    // docs for the current diagnosis of what's left.
+    match fat::read_file("/bin/hello.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "hello", &["hello"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("hello spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(info) => println!("[INFO] real dynamically-linked hello binary: {}", process::describe_exit(&info)),
+                None => println!("[INFO] real dynamically-linked hello binary: did not exit within 5s"),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/hello.elf not present"),
+    }
+
+    // Same real-binary methodology against real coreutils `true`/`cat`
+    // (Debian coreutils 9.1-1) — confirms the remaining gap above isn't
+    // specific to GNU Hello's own build: both fail identically
+    // ("undefined symbol: __libc_start_main, version GLIBC_2.34"),
+    // ruling out a version-mismatched test fixture as the explanation.
+    match fat::read_file("/bin/true.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "true", &["true"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("true spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(info) => println!("[INFO] real coreutils true: {}", process::describe_exit(&info)),
+                None => println!("[INFO] real coreutils true: did not exit within 5s"),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/true.elf not present"),
+    }
+    match fat::read_file("/bin/cat.elf") {
+        Ok(elf) => {
+            let pid = crate::process::spawn_linux(&elf, "cat", &["cat", "/dev/null"], &["PATH=/bin"])
+                .unwrap_or_else(|e| selftest_fail(&format!("cat spawn failed: {e}")));
+            match crate::process::wait(pid, 500) {
+                Some(info) => println!("[INFO] real coreutils cat: {}", process::describe_exit(&info)),
+                None => println!("[INFO] real coreutils cat: did not exit within 5s"),
+            }
+            crate::process::reap(pid);
+        }
+        Err(_) => println!("[SKIP] /bin/cat.elf not present"),
+    }
+
+    // Process management, part 7 (Phase 5): a real Linux-ABI client
+    // process drawing through `wayland.rs`'s kernel-native compositor —
+    // memfd_create/ftruncate/mmap(MAP_SHARED), socket/connect, and
+    // sendmsg with SCM_RIGHTS to hand the compositor task a real shared
+    // frame of pixels over a real AF_UNIX socket. Checking the client's
+    // own exit code only proves its own syscalls succeeded; the pixel
+    // check below is what proves the whole chain — two independently
+    // scheduled tasks sharing physical memory through a kernel-mediated
+    // fd handoff — actually worked, not just returned success codes.
+    {
+        // Must match `prog_linux_wayland_client.rs`'s TEST_COLOR/WIDTH.
+        const TEST_COLOR: u32 = 0x00_FF10_C0;
+        const SURFACE_X: u32 = 40;
+        const SURFACE_Y: u32 = 40;
+
+        let frames_before = crate::wayland::FRAMES_RENDERED.load(core::sync::atomic::Ordering::Acquire);
+        let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_WAYLAND_CLIENT, "wl-client", &["wl-client"], &[])
+            .unwrap_or_else(|e| selftest_fail(&format!("wayland client spawn failed: {e}")));
+        match crate::process::wait(pid, 200) {
+            Some(process::ExitInfo::Normal) => println!("[OK] Wayland client process exited normally"),
+            other => selftest_fail(&format!("wayland client gave unexpected exit: {:?}", other)),
+        }
+        match crate::process::read_result(pid) {
+            Some(0x7F) => println!("[OK] Wayland client: memfd/mmap/socket/connect/sendmsg all correct"),
+            other => selftest_fail(&format!("wayland client result mismatch: {:?}", other)),
+        }
+        crate::process::reap(pid);
+
+        if !crate::wayland::wait_for_frame(frames_before, 100) {
+            selftest_fail("compositor never rendered a frame for the wayland client");
+        }
+        match crate::fb::get_pixel(SURFACE_X, SURFACE_Y) {
+            Some(color) if color == TEST_COLOR => {
+                println!("[OK] compositor blitted the client's shared-memory buffer onto the real framebuffer")
+            }
+            other => selftest_fail(&format!("framebuffer pixel after wayland commit: {:?} (want {:#x})", other, TEST_COLOR)),
+        }
     }
 
     // Ring 3 round trip: run a hand-assembled user-mode program (mapped
@@ -1094,7 +1657,11 @@ impl LineEditor {
             }
             // Not supported yet: LineEditor only ever appends/removes at
             // the end of `line`, it has no notion of a cursor within it.
-            keyboard::Event::Left | keyboard::Event::Right | keyboard::Event::Ctrl(_) => Feed::Pending,
+            keyboard::Event::Left
+            | keyboard::Event::Right
+            | keyboard::Event::Escape
+            | keyboard::Event::F2
+            | keyboard::Event::Ctrl(_) => Feed::Pending,
         }
     }
 }

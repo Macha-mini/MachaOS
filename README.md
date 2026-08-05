@@ -65,20 +65,50 @@ runs. The disk only holds fixtures if you recreate it with `make disk`.
 
 On normal boot, MachaOS switches to a 1920x1080 graphical desktop with four
 windows: a **Terminal** (the interactive shell), a **System Info** panel, a
-**Calculator**, and a **Notepad** text editor. Click a title bar to
-focus/raise a window and drag it around; click `_` to minimize it (it stays
-in the taskbar, click it there to restore) or the red `x` to close it.
-Terminal and Notepad have a resize grip in their bottom-right corner — drag
-it to resize the window. The taskbar at the bottom lists open windows,
-three counters (`bg: ...`) incrementing in the background scheduler tasks,
-and uptime. If no linear framebuffer is available, MachaOS falls back to
-the plain VGA text shell automatically.
+**Calculator**, and a **Notepad** text editor. The chrome follows the
+Windows 11 design language: rounded windows with soft shadows and flat dark
+title bars (hover the min/max/close buttons — close turns red), a
+translucent acrylic taskbar with a centered button group and the four-pane
+start logo, and a centered start-menu popup with a search box and a grid of
+pinned app tiles. Click a title bar to focus/raise a window and drag it
+around; click `_` to minimize it (it stays in the taskbar, click it there
+to restore) or the `x` to close it. Terminal and Notepad have a resize grip
+in their bottom-right corner — drag it to resize the window. The taskbar
+shows open windows, the clock, three counters (`bg: ...`) incrementing in
+the background scheduler tasks, and uptime. If no linear framebuffer is
+available, MachaOS falls back to the plain VGA text shell automatically.
+
+The **Settings** app (start menu -> Settings) is a Win11-style panel with a
+left navigation sidebar: *System* lets you change the display **resolution**
+(any of 1920x1080, 1600x900, 1366x768, 1280x720, 1024x576, 800x600 that fit
+the physical mode — the desktop scales to fill the real framebuffer) and
+the **font size** (100% / 200% — the whole UI relayouts and the desktop
+rebuilds at the new scale), *Personalization* has the accent color,
+wallpaper and background-task toggles, and *About* shows system info.
+Settings persist to `/system/settings.conf` and are applied at boot, and
+the desktop **session** persists too: the set of open windows (app,
+position, size, minimized/maximized state) is written to
+`/system/desktop.session` whenever a window opens, closes, moves, resizes
+or changes state, and the desktop restores it at the next boot — so the
+OS comes back the way you left it. (Remembered geometry of closed apps
+survives a reboot as well, so reopening an app from the start menu puts
+it back where it was.) The session file is plain text and is ignored
+entirely if it is missing or malformed.
 
 The Notepad is a text editor with arrow-key cursor movement and
-Enter/Backspace line editing. Press **Ctrl+S** to save the document to
-`/notepad.txt` and **Ctrl+O** to load it back (the bottom row shows a
-status message for both). The Calculator does integer-only four-function
-arithmetic via mouse clicks.
+Enter/Backspace line editing. Press **Ctrl+S** to save the document and
+**Ctrl+O** to load it back (the bottom row shows a status message for
+both). The plain Notepad edits `/users/macha/Documents/notepad.txt`, but
+a document opened from the File Explorer remembers the file it came from
+and saves straight back to it with Ctrl+S. The Calculator does
+integer-only four-function arithmetic via mouse clicks.
+
+The File Explorer has sidebar shortcuts, breadcrumbs, a details/grid
+view, drag-and-drop moves, two-step deletes, and (toolbar buttons or
+`n`/`f` keys) new folders and new empty text files. Press **F2** on a
+selected item to rename it inline — type a new name and press Enter to
+confirm or Esc to cancel — and text files open in Notepad and save back
+to the same path.
 
 ## Shell
 
@@ -90,7 +120,8 @@ text-mode fallback). Available commands: `help`, `clear`/`cls`, `echo`,
 processes with their running/exited state), `run <path>` (loads an ELF from
 disk as a process and waits for it to exit), and the filesystem commands
 `ls [path]`, `cat <path>`, `write <path> <text>`, `mkdir <path>`,
-`rm <path>`, `fatinfo`, `cd [path]`, and `pwd`. Paths may be relative to
+`rm <path>`, `mv <path> <new-name>` (renames a file or directory in
+place), `fatinfo`, `cd [path]`, and `pwd`. Paths may be relative to
 the current directory (the prompt shows it), and arguments containing
 spaces can be double-quoted: `write notes.txt "hello world"`. Up/Down
 recall command history and Tab completes command names (in both the

@@ -13,17 +13,21 @@ mod desktop;
 mod elf;
 mod fb;
 mod fat;
+mod file_explorer;
 mod font;
 mod gdt;
 mod gfx;
 mod idt;
+mod image_viewer;
 mod interrupts;
 #[macro_use]
 mod io;
 mod isr_table;
 mod keyboard;
+mod linux_abi;
 mod mouse;
 mod multiboot;
+mod paint;
 mod paging;
 mod pic;
 mod pit;
@@ -32,12 +36,19 @@ mod port;
 mod process;
 mod rtc;
 mod serial;
+mod session;
+mod settings;
 mod shell;
+mod shm;
+mod socket;
 mod sync;
 mod syscall;
 mod task;
 mod user_prog;
+mod users;
+mod vfs;
 mod vga;
+mod wayland;
 mod wm;
 
 use core::arch::global_asm;
@@ -279,6 +290,8 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     println!("     features: {}", features.join(" "));
 
     interrupts::enable_interrupts();
+
+    wayland::start();
 
     let selftest_mode = info
         .cmdline()
