@@ -235,7 +235,10 @@ fn read_line() -> String {
                 }
                 // The plain VGA fallback shell has no cursor movement.
                 keyboard::Event::Left | keyboard::Event::Right => {}
-                keyboard::Event::Escape | keyboard::Event::F2 | keyboard::Event::AltTab => {}
+                keyboard::Event::Escape
+                | keyboard::Event::F2
+                | keyboard::Event::F3
+                | keyboard::Event::AltTab => {}
                 keyboard::Event::Ctrl(_) => {}
             }
         }
@@ -1711,6 +1714,7 @@ impl LineEditor {
             | keyboard::Event::Right
             | keyboard::Event::Escape
             | keyboard::Event::F2
+            | keyboard::Event::F3
             | keyboard::Event::AltTab => Feed::Pending,
             keyboard::Event::Ctrl('v') => {
                 // Paste the clipboard at the end of the line (no

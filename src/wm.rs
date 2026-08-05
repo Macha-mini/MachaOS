@@ -226,7 +226,7 @@ struct RememberedWindow {
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
-    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String, path: String, ime: crate::ime::Ime },
+    Editor { console: Console, editor: EditorState, ime: crate::ime::Ime },
     Calculator(CalculatorApp),
     FileExplorer(FileExplorer),
     Settings(SettingsApp),
@@ -875,15 +875,13 @@ impl WindowManager {
             LauncherAction::Notepad => {
                 let (cols, rows) = fit_console_cells(self.screen_w, self.screen_h, MAX_EDITOR_COLS, MAX_EDITOR_ROWS);
                 let mut console = Console::new(cols, rows, CONSOLE_FG, CONSOLE_BG);
-                let lines = vec![String::new()];
-                let mut scroll = 0usize;
-                let mut status = String::new();
-                editor_render(&mut console, &lines, 0, 0, &mut scroll, &mut status);
+                let mut editor = EditorState::new(String::new(), vec![String::new()], String::new());
+                editor_render(&mut console, &mut editor);
                 self.spawn_window(
                     "Notepad",
                     true,
                     Some(AppId::Notepad),
-                    AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path: String::new(), ime: crate::ime::Ime::new() },
+                    AppKind::Editor { console, editor, ime: crate::ime::Ime::new() },
                 );
             }
             LauncherAction::SysInfo => {
@@ -973,16 +971,16 @@ impl WindowManager {
             // to type into.
             lines.push(String::new());
         }
-        let mut scroll = 0usize;
         let mut status = format!("opened {} ({} bytes)", path, content.len());
-        editor_render(&mut console, &lines, 0, 0, &mut scroll, &mut status);
-        let base = path.rsplit('/').next().unwrap_or(&path);
+        let base = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let mut editor = EditorState::new(path, lines, status);
+        editor_render(&mut console, &mut editor);
         let title: &'static str = alloc::boxed::Box::leak(format!("Notepad: {}", base).into_boxed_str());
         self.spawn_window(
             title,
             true,
             None,
-            AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path, ime: crate::ime::Ime::new() },
+            AppKind::Editor { console, editor, ime: crate::ime::Ime::new() },
         );
     }
 
@@ -1095,17 +1093,23 @@ impl WindowManager {
                     io::set_console_sink(None);
                     None
                 }
-                AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status, path, ime } => {
+                AppKind::Editor { console, editor, ime } => {
                     // The IME can turn one key into a sequence (e.g.
                     // Space converts romaji to kana/kanji), so feed it
-                    // first and deliver whatever it emits.
-                    let outcome = ime.feed(event);
+                    // first and deliver whatever it emits. Find/replace
+                    // modes take raw keys (they edit search strings).
+                    let outcome = if editor.find_mode || editor.replace_mode {
+                        ime.reset();
+                        crate::ime::ImeOutcome { events: vec![event], status: None }
+                    } else {
+                        ime.feed(event)
+                    };
                     for e in outcome.events {
-                        editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, path, e);
+                        editor_handle_key(console, editor, e);
                     }
                     if let Some(msg) = outcome.status {
-                        *status = msg;
-                        editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
+                        editor.status = msg;
+                        editor_render(console, editor);
                     }
                     None
                 }
@@ -1984,9 +1988,9 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             print!("{}{}", shell::prompt(), editor.current_line());
             io::set_console_sink(None);
         }
-        AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status, .. } => {
+        AppKind::Editor { console, editor, .. } => {
             console.resize(cols, rows);
-            editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
+            editor_render(console, editor);
         }
         AppKind::SysInfo { console } => {
             *console = build_sysinfo_console();
@@ -2005,177 +2009,477 @@ fn byte_index(line: &str, char_index: usize) -> usize {
 
 const NOTEPAD_PATH: &str = "/users/macha/Documents/notepad.txt";
 
-fn editor_handle_key(
-    console: &mut Console,
-    lines: &mut Vec<String>,
-    cursor_row: &mut usize,
-    cursor_col: &mut usize,
-    scroll_offset: &mut usize,
-    status: &mut String,
-    path: &str,
-    event: keyboard::Event,
-) {
-    // An editor opened from the file explorer saves to (and reloads
-    // from) the file it was opened with; the launcher's plain Notepad
-    // keeps the classic fixed default.
-    let save_path = if path.is_empty() { NOTEPAD_PATH } else { path };
-    match event {
-        keyboard::Event::Ctrl('s') => {
-            let mut text = lines.join("\n");
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            match fat::write_file(save_path, text.as_bytes()) {
-                Ok(()) => *status = format!("saved {} bytes to {}", text.len(), save_path),
-                Err(e) => *status = format!("save failed: {}", e),
-            }
+/// Maximum undo snapshots kept per editor window.
+const UNDO_CAP: usize = 50;
+
+/// Mutable state of a Notepad window: the document, cursor, search
+/// fields, and undo/redo stacks. Grouped in one struct so the
+/// `AppKind::Editor` arm stays readable as the editor grows.
+pub struct EditorState {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+    scroll_offset: usize,
+    status: String,
+    path: String,
+    undo: Vec<Vec<String>>,
+    redo: Vec<Vec<String>>,
+    find: String,
+    replace: String,
+    find_mode: bool,
+    replace_mode: bool,
+    // In replace mode, typed characters go to `find` (false) or
+    // `replace` (true); Tab toggles.
+    replace_target: bool,
+    wrap: bool,
+}
+
+impl EditorState {
+    fn new(path: String, lines: Vec<String>, status: String) -> Self {
+        Self {
+            lines,
+            cursor_row: 0,
+            cursor_col: 0,
+            scroll_offset: 0,
+            status,
+            path,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            find: String::new(),
+            replace: String::new(),
+            find_mode: false,
+            replace_mode: false,
+            replace_target: false,
+            wrap: false,
         }
-        keyboard::Event::Ctrl('c') => {
-            // Copy the current line (there's no selection model yet).
-            crate::clipboard::copy_text(lines[*cursor_row].clone());
-            *status = format!("copied {} chars", lines[*cursor_row].chars().count());
-        }
-        keyboard::Event::Ctrl('v') => {
-            if let Some(text) = crate::clipboard::paste_text() {
-                let idx = byte_index(&lines[*cursor_row], *cursor_col);
-                lines[*cursor_row].insert_str(idx, &text);
-                *cursor_col += text.chars().count();
-                *status = format!("pasted {} chars", text.chars().count());
-            } else {
-                *status = "clipboard is empty or holds an image".to_string();
-            }
-        }
-        keyboard::Event::Ctrl('x') => {
-            // Cut the current line (no selection model yet).
-            crate::clipboard::copy_text(lines[*cursor_row].clone());
-            if lines.len() > 1 {
-                lines.remove(*cursor_row);
-                if *cursor_row >= lines.len() {
-                    *cursor_row = lines.len() - 1;
-                }
-            } else {
-                lines[*cursor_row].clear();
-            }
-            *cursor_col = 0;
-            *status = "cut current line".to_string();
-        }
-        keyboard::Event::Ctrl('o') => {
-            match fat::read_file(save_path) {
-                Ok(data) => {
-                    let text = core::str::from_utf8(&data).unwrap_or("");
-                    lines.clear();
-                    lines.extend(text.split('\n').map(|l| l.to_string()));
-                    if lines.last().map(String::is_empty) == Some(true) {
-                        lines.pop();
-                    }
-                    *cursor_row = 0;
-                    *cursor_col = 0;
-                    *status = format!(
-                        "opened {} ({} bytes)",
-                        save_path,
-                        data.len()
-                    );
-                }
-                Err(e) => *status = format!("open failed: {}", e),
-            }
-        }
-        keyboard::Event::Ctrl(_) => {} // Ctrl+other letters: not bound
-        keyboard::Event::Char(c) => {
-            let idx = byte_index(&lines[*cursor_row], *cursor_col);
-            lines[*cursor_row].insert(idx, c);
-            *cursor_col += 1;
-        }
-        keyboard::Event::Backspace => {
-            if *cursor_col > 0 {
-                let idx = byte_index(&lines[*cursor_row], *cursor_col - 1);
-                lines[*cursor_row].remove(idx);
-                *cursor_col -= 1;
-            } else if *cursor_row > 0 {
-                let current = lines.remove(*cursor_row);
-                *cursor_row -= 1;
-                *cursor_col = lines[*cursor_row].chars().count();
-                lines[*cursor_row].push_str(&current);
-            }
-        }
-        keyboard::Event::Enter => {
-            let idx = byte_index(&lines[*cursor_row], *cursor_col);
-            let rest = lines[*cursor_row].split_off(idx);
-            lines.insert(*cursor_row + 1, rest);
-            *cursor_row += 1;
-            *cursor_col = 0;
-        }
-        keyboard::Event::Tab => {
-            let idx = byte_index(&lines[*cursor_row], *cursor_col);
-            lines[*cursor_row].insert_str(idx, "    ");
-            *cursor_col += 4;
-        }
-        keyboard::Event::Left => {
-            if *cursor_col > 0 {
-                *cursor_col -= 1;
-            } else if *cursor_row > 0 {
-                *cursor_row -= 1;
-                *cursor_col = lines[*cursor_row].chars().count();
-            }
-        }
-        keyboard::Event::Right => {
-            if *cursor_col < lines[*cursor_row].chars().count() {
-                *cursor_col += 1;
-            } else if *cursor_row + 1 < lines.len() {
-                *cursor_row += 1;
-                *cursor_col = 0;
-            }
-        }
-        keyboard::Event::Up => {
-            if *cursor_row > 0 {
-                *cursor_row -= 1;
-                *cursor_col = (*cursor_col).min(lines[*cursor_row].chars().count());
-            }
-        }
-        keyboard::Event::Down => {
-            if *cursor_row + 1 < lines.len() {
-                *cursor_row += 1;
-                *cursor_col = (*cursor_col).min(lines[*cursor_row].chars().count());
-            }
-        }
-        keyboard::Event::Escape | keyboard::Event::F2 | keyboard::Event::AltTab => {}
     }
-    editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
+
+    fn push_undo(&mut self) {
+        if self.undo.len() >= UNDO_CAP {
+            self.undo.remove(0);
+        }
+        self.undo.push(self.lines.clone());
+        self.redo.clear();
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo.pop() {
+            self.redo.push(self.lines.clone());
+            self.lines = prev;
+            self.clamp_cursor();
+            self.status = "元に戻しました".to_string();
+        } else {
+            self.status = "元に戻せる操作がありません".to_string();
+        }
+    }
+
+    fn redo(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            self.undo.push(self.lines.clone());
+            self.lines = next;
+            self.clamp_cursor();
+            self.status = "やり直しました".to_string();
+        } else {
+            self.status = "やり直せる操作がありません".to_string();
+        }
+    }
+
+    fn clamp_cursor(&mut self) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
+        self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].chars().count());
+    }
+
+    /// Visual row layout: (logical line index, char offset of the row
+    /// start). With wrap off, one visual row per logical line; with wrap
+    /// on, lines break at `cols` cells (Japanese glyphs count 2).
+    fn visual_rows(&self, cols: usize) -> Vec<(usize, usize)> {
+        let mut rows = Vec::new();
+        for (li, line) in self.lines.iter().enumerate() {
+            if !self.wrap || cols == 0 {
+                rows.push((li, 0));
+                continue;
+            }
+            let chars: Vec<char> = line.chars().collect();
+            let mut start = 0usize;
+            loop {
+                rows.push((li, start));
+                let mut cells = 0usize;
+                let mut end = start;
+                while end < chars.len() {
+                    let w = font::char_cells(chars[end]) as usize;
+                    if cells + w > cols {
+                        break;
+                    }
+                    cells += w;
+                    end += 1;
+                }
+                if end >= chars.len() {
+                    break;
+                }
+                start = end;
+            }
+        }
+        rows
+    }
+
+    /// Vertical cursor motion over visual rows (Up = -1, Down = +1).
+    /// The cursor keeps its visual column; landing on a different
+    /// logical line clamps to that line's length.
+    fn move_vertically(&mut self, cols: usize, delta: isize) {
+        let rows = self.visual_rows(cols);
+        let vr = visual_row_of(&rows, self.cursor_row, self.cursor_col);
+        let row_start = rows[vr].1;
+        let mut vc = 0usize;
+        for c in self.lines[self.cursor_row].chars().skip(row_start).take(self.cursor_col.saturating_sub(row_start)) {
+            vc += font::char_cells(c) as usize;
+        }
+        let target = vr as isize + delta;
+        if target < 0 || target >= rows.len() as isize {
+            return; // top / bottom edge
+        }
+        let (tli, tcs) = rows[target as usize];
+        let mut cells = 0usize;
+        let mut col = tcs;
+        for c in self.lines[tli].chars().skip(tcs) {
+            let w = font::char_cells(c) as usize;
+            if cells + w > vc {
+                break;
+            }
+            cells += w;
+            col += 1;
+        }
+        self.cursor_row = tli;
+        self.cursor_col = col;
+    }
+
+    /// Finds the next occurrence of `find` from the cursor, wrapping to
+    /// the top of the document, and moves the cursor onto it.
+    fn find_next(&mut self) {
+        let needle = self.find.clone();
+        if needle.is_empty() {
+            self.status = "検索: 文字を入力してください".to_string();
+            return;
+        }
+        let start_row = self.cursor_row;
+        let start_col = self.cursor_col;
+        // Pass 1: cursor -> EOF. Pass 2: wrap to the document top.
+        for pass in 0..2 {
+            let from_row = if pass == 0 { start_row } else { 0 };
+            let from_col = if pass == 0 { start_col } else { 0 };
+            let stop_row = if pass == 0 { self.lines.len() } else { start_row };
+            for r in from_row..stop_row {
+                let line = &self.lines[r];
+                let from_byte = byte_index(line, if r == from_row { from_col } else { 0 });
+                if let Some(rel) = line[from_byte..].find(needle.as_str()) {
+                    let col = line[..from_byte + rel].chars().count();
+                    self.cursor_row = r;
+                    self.cursor_col = col;
+                    self.status = format!(
+                        "見つかった: {} ({} 行目 {} 文字目)",
+                        self.find,
+                        r + 1,
+                        col + 1
+                    );
+                    return;
+                }
+            }
+        }
+        self.status = format!("見つかりません: {}", self.find);
+    }
+
+    /// Replaces the next occurrence of `find` with `replace` (search
+    /// order same as `find_next`) and moves the cursor past it.
+    fn replace_next(&mut self) {
+        let needle = self.find.clone();
+        if needle.is_empty() {
+            self.status = "置換: 検索文字を入力してください".to_string();
+            return;
+        }
+        let replacement = self.replace.clone();
+        let start_row = self.cursor_row;
+        let start_col = self.cursor_col;
+        let mut found: Option<(usize, usize)> = None;
+        'outer: for pass in 0..2 {
+            let from_row = if pass == 0 { start_row } else { 0 };
+            let from_col = if pass == 0 { start_col } else { 0 };
+            let stop_row = if pass == 0 { self.lines.len() } else { start_row + 1 };
+            for r in from_row..stop_row {
+                let line = &self.lines[r];
+                let from_byte = byte_index(line, if r == from_row { from_col } else { 0 });
+                if let Some(rel) = line[from_byte..].find(needle.as_str()) {
+                    found = Some((r, line[..from_byte + rel].chars().count()));
+                    break 'outer;
+                }
+            }
+        }
+        let Some((r, c)) = found else {
+            self.status = format!("見つかりません: {}", self.find);
+            return;
+        };
+        self.push_undo();
+        let idx = byte_index(&self.lines[r], c);
+        self.lines[r].replace_range(idx..idx + needle.len(), &replacement);
+        self.cursor_row = r;
+        self.cursor_col = c + replacement.chars().count();
+        self.status = format!("置換: {} -> {} ({} 行目)", self.find, self.replace, r + 1);
+    }
+}
+
+/// Visual row index containing logical `(row, col)`.
+fn visual_row_of(rows: &[(usize, usize)], row: usize, col: usize) -> usize {
+    let mut vr = 0usize;
+    for (i, &(li, cs)) in rows.iter().enumerate() {
+        if li == row && cs <= col {
+            vr = i;
+        } else if li > row {
+            break;
+        }
+    }
+    vr
+}
+
+fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboard::Event) {
+    // Find/replace modes intercept the text keys before the document
+    // does; Esc always exits them.
+    match event {
+        keyboard::Event::Escape if ed.find_mode || ed.replace_mode => {
+            ed.find_mode = false;
+            ed.replace_mode = false;
+            ed.status = "検索を終了".to_string();
+        }
+        keyboard::Event::Ctrl('f') => {
+            ed.find_mode = true;
+            ed.replace_mode = false;
+            ed.status = "検索モード: 入力して Enter / Esc で終了".to_string();
+        }
+        keyboard::Event::Ctrl('h') => {
+            ed.replace_mode = true;
+            ed.find_mode = false;
+            ed.replace_target = false;
+            ed.status = "置換モード: Tab で入力欄切替 / Enter で置換".to_string();
+        }
+        keyboard::Event::F3 => ed.find_next(),
+        _ if ed.find_mode => match event {
+            keyboard::Event::Char(c) => {
+                if ed.find.len() < 64 {
+                    ed.find.push(c);
+                }
+                ed.status = format!("検索: {}", ed.find);
+            }
+            keyboard::Event::Backspace => {
+                ed.find.pop();
+                ed.status = format!("検索: {}", ed.find);
+            }
+            keyboard::Event::Enter => ed.find_next(),
+            keyboard::Event::Ctrl(_) => {}
+            _ => {} // arrows etc. do nothing while searching
+        },
+        _ if ed.replace_mode => match event {
+            keyboard::Event::Char(c) => {
+                let target = if ed.replace_target { &mut ed.replace } else { &mut ed.find };
+                if target.len() < 64 {
+                    target.push(c);
+                }
+                ed.status = format!("置換: {} -> {}|", ed.find, ed.replace);
+            }
+            keyboard::Event::Backspace => {
+                let target = if ed.replace_target { &mut ed.replace } else { &mut ed.find };
+                target.pop();
+                ed.status = format!("置換: {} -> {}|", ed.find, ed.replace);
+            }
+            keyboard::Event::Tab => {
+                ed.replace_target = !ed.replace_target;
+                ed.status = format!("置換: {} -> {}|", ed.find, ed.replace);
+            }
+            keyboard::Event::Enter => ed.replace_next(),
+            keyboard::Event::Ctrl(_) => {}
+            _ => {}
+        },
+        _ => {
+            // Normal editing. An editor opened from the file explorer
+            // saves to (and reloads from) the file it was opened with;
+            // the launcher's plain Notepad keeps the classic default.
+            let save_path = if ed.path.is_empty() { NOTEPAD_PATH.to_string() } else { ed.path.clone() };
+            match event {
+                keyboard::Event::Ctrl('s') => {
+                    let mut text = ed.lines.join("\n");
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    match fat::write_file(&save_path, text.as_bytes()) {
+                        Ok(()) => ed.status = format!("saved {} bytes to {}", text.len(), save_path),
+                        Err(e) => ed.status = format!("save failed: {}", e),
+                    }
+                }
+                keyboard::Event::Ctrl('c') => {
+                    // Copy the current line (there's no selection model yet).
+                    crate::clipboard::copy_text(ed.lines[ed.cursor_row].clone());
+                    ed.status = format!("copied {} chars", ed.lines[ed.cursor_row].chars().count());
+                }
+                keyboard::Event::Ctrl('v') => {
+                    if let Some(text) = crate::clipboard::paste_text() {
+                        ed.push_undo();
+                        let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
+                        ed.lines[ed.cursor_row].insert_str(idx, &text);
+                        ed.cursor_col += text.chars().count();
+                        ed.status = format!("pasted {} chars", text.chars().count());
+                    } else {
+                        ed.status = "clipboard is empty or holds an image".to_string();
+                    }
+                }
+                keyboard::Event::Ctrl('x') => {
+                    // Cut the current line (no selection model yet).
+                    ed.push_undo();
+                    crate::clipboard::copy_text(ed.lines[ed.cursor_row].clone());
+                    if ed.lines.len() > 1 {
+                        ed.lines.remove(ed.cursor_row);
+                        if ed.cursor_row >= ed.lines.len() {
+                            ed.cursor_row = ed.lines.len() - 1;
+                        }
+                    } else {
+                        ed.lines[ed.cursor_row].clear();
+                    }
+                    ed.cursor_col = 0;
+                    ed.status = "cut current line".to_string();
+                }
+                keyboard::Event::Ctrl('o') => {
+                    match fat::read_file(&save_path) {
+                        Ok(data) => {
+                            let text = core::str::from_utf8(&data).unwrap_or("");
+                            ed.push_undo();
+                            ed.lines.clear();
+                            ed.lines.extend(text.split('\n').map(|l| l.to_string()));
+                            if ed.lines.last().map(String::is_empty) == Some(true) {
+                                ed.lines.pop();
+                            }
+                            ed.cursor_row = 0;
+                            ed.cursor_col = 0;
+                            ed.status = format!("opened {} ({} bytes)", save_path, data.len());
+                        }
+                        Err(e) => ed.status = format!("open failed: {}", e),
+                    }
+                }
+                keyboard::Event::Ctrl('z') => ed.undo(),
+                keyboard::Event::Ctrl('y') => ed.redo(),
+                keyboard::Event::Ctrl('w') => {
+                    ed.wrap = !ed.wrap;
+                    ed.status = format!("折り返し: {}", if ed.wrap { "オン" } else { "オフ" });
+                }
+                keyboard::Event::Ctrl(_) => {} // Ctrl+other letters: not bound
+                keyboard::Event::Char(c) => {
+                    ed.push_undo();
+                    let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
+                    ed.lines[ed.cursor_row].insert(idx, c);
+                    ed.cursor_col += 1;
+                }
+                keyboard::Event::Backspace => {
+                    ed.push_undo();
+                    if ed.cursor_col > 0 {
+                        let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col - 1);
+                        ed.lines[ed.cursor_row].remove(idx);
+                        ed.cursor_col -= 1;
+                    } else if ed.cursor_row > 0 {
+                        let current = ed.lines.remove(ed.cursor_row);
+                        ed.cursor_row -= 1;
+                        ed.cursor_col = ed.lines[ed.cursor_row].chars().count();
+                        ed.lines[ed.cursor_row].push_str(&current);
+                    }
+                }
+                keyboard::Event::Enter => {
+                    ed.push_undo();
+                    let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
+                    let rest = ed.lines[ed.cursor_row].split_off(idx);
+                    ed.lines.insert(ed.cursor_row + 1, rest);
+                    ed.cursor_row += 1;
+                    ed.cursor_col = 0;
+                }
+                keyboard::Event::Tab => {
+                    ed.push_undo();
+                    let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
+                    ed.lines[ed.cursor_row].insert_str(idx, "    ");
+                    ed.cursor_col += 4;
+                }
+                keyboard::Event::Left => {
+                    if ed.cursor_col > 0 {
+                        ed.cursor_col -= 1;
+                    } else if ed.cursor_row > 0 {
+                        ed.cursor_row -= 1;
+                        ed.cursor_col = ed.lines[ed.cursor_row].chars().count();
+                    }
+                }
+                keyboard::Event::Right => {
+                    if ed.cursor_col < ed.lines[ed.cursor_row].chars().count() {
+                        ed.cursor_col += 1;
+                    } else if ed.cursor_row + 1 < ed.lines.len() {
+                        ed.cursor_row += 1;
+                        ed.cursor_col = 0;
+                    }
+                }
+                keyboard::Event::Up => ed.move_vertically(console.cols(), -1),
+                keyboard::Event::Down => ed.move_vertically(console.cols(), 1),
+                keyboard::Event::Escape
+                | keyboard::Event::F2
+                | keyboard::Event::F3
+                | keyboard::Event::AltTab => {}
+            }
+        }
+    }
+    editor_render(console, ed);
 }
 
 /// Re-renders the whole visible page from `lines` (the real document —
 /// the console is just a display cache) and overlays a block cursor.
-/// The bottom row is a status bar (save/open feedback), so only
-/// `rows - 1` document lines are shown.
+/// The bottom row is a status bar (save/open/search feedback), so only
+/// `rows - 1` document rows are shown; with word wrap on, a logical
+/// line can occupy several of them.
 /// Called after every keystroke and after a resize, since both replace
 /// the console's pixel buffer wholesale.
-fn editor_render(
-    console: &mut Console,
-    lines: &[String],
-    cursor_row: usize,
-    cursor_col: usize,
-    scroll_offset: &mut usize,
-    status: &mut String,
-) {
+fn editor_render(console: &mut Console, ed: &mut EditorState) {
     let rows = console.rows();
     let doc_rows = rows.saturating_sub(1);
-    if cursor_row < *scroll_offset {
-        *scroll_offset = cursor_row;
-    } else if cursor_row >= *scroll_offset + doc_rows {
-        *scroll_offset = cursor_row + 1 - doc_rows;
+    let vrows = ed.visual_rows(console.cols());
+    let cursor_vr = visual_row_of(&vrows, ed.cursor_row, ed.cursor_col);
+    if cursor_vr < ed.scroll_offset {
+        ed.scroll_offset = cursor_vr;
+    } else if cursor_vr >= ed.scroll_offset + doc_rows {
+        ed.scroll_offset = cursor_vr + 1 - doc_rows;
     }
     console.clear();
-    for line in lines.iter().skip(*scroll_offset).take(doc_rows) {
-        let _ = writeln!(console, "{}", line);
+    for &(li, cs) in vrows.iter().skip(ed.scroll_offset).take(doc_rows) {
+        let text: String = ed.lines[li].chars().skip(cs).collect();
+        let _ = writeln!(console, "{}", text);
     }
     let sx = font::glyph_w() as u32;
     let sy = (doc_rows * font::glyph_h()) as u32;
     let cw = console.width_px();
     gfx::fill_rect(console, 0, sy, cw, font::glyph_h() as u32, EDITOR_STATUS_BG);
-    gfx::draw_string(console, sx, sy, status, EDITOR_STATUS_FG, None);
-    let visible = (cursor_row.saturating_sub(*scroll_offset)).min(doc_rows.saturating_sub(1));
-    // Pixel x of the cursor: sum the advance of every char before it
-    // (Japanese glyphs are double-width).
-    let cx: u32 = lines[cursor_row].chars().take(cursor_col).map(font::char_width).sum();
+    // The status line shows the live search prompt while in
+    // find/replace mode, otherwise the editor's own status.
+    let status_text = if ed.find_mode {
+        format!("検索: {}|", ed.find)
+    } else if ed.replace_mode {
+        let active = if ed.replace_target { "置換" } else { "検索" };
+        format!("置換モード [{}]: {} -> {}|", active, ed.find, ed.replace)
+    } else {
+        ed.status.clone()
+    };
+    gfx::draw_string(console, sx, sy, &status_text, EDITOR_STATUS_FG, None);
+    let visible = cursor_vr
+        .saturating_sub(ed.scroll_offset)
+        .min(doc_rows.saturating_sub(1));
+    // Pixel x of the cursor within its visual row: sum the advance of
+    // every char between the row start and the cursor.
+    let line = &ed.lines[ed.cursor_row];
+    let row_start = vrows[cursor_vr].1;
+    let cx: u32 = line
+        .chars()
+        .skip(row_start)
+        .take(ed.cursor_col.saturating_sub(row_start))
+        .map(font::char_width)
+        .sum();
     let cy = (visible * font::glyph_h()) as u32;
     gfx::fill_rect(console, cx, cy, font::glyph_w() as u32, font::glyph_h() as u32, EDITOR_CURSOR_COLOR);
 }

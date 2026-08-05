@@ -54,6 +54,17 @@ impl Ime {
         }
     }
 
+    /// Abandons any in-progress composition (used when the editor
+    /// switches into find/replace mode, where raw keys go to the
+    /// search fields instead of the document).
+    pub fn reset(&mut self) {
+        self.composing = false;
+        self.romaji.clear();
+        self.candidates.clear();
+        self.index = 0;
+        self.inserted.clear();
+    }
+
     pub fn feed(&mut self, event: keyboard::Event) -> ImeOutcome {
         match event {
             keyboard::Event::Char(c) if c.is_ascii_lowercase() => {

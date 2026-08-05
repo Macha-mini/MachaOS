@@ -177,6 +177,16 @@ pub fn glyph(byte: u8) -> &'static [u8; 8] {
     }
 }
 
+/// Cell width of `c` in the text-cell grid: 1 for ASCII, 2 for any
+/// wide (Japanese) glyph. Must match `Console::write_char`'s advance.
+pub fn char_cells(c: char) -> u32 {
+    if c.is_ascii() {
+        1
+    } else {
+        2
+    }
+}
+
 /// Horizontal advance in pixels for `c` at the current font scale: one
 /// 8x8 cell for ASCII, two cells (16x16) for Japanese glyphs, one cell
 /// as a fallback for anything not in the embedded Japanese subset.

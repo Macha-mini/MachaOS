@@ -123,7 +123,7 @@ impl Console {
                 }
             }
             c => {
-                let cells = if c.is_ascii() { 1 } else { 2 };
+                let cells = font::char_cells(c) as usize;
                 if self.col + cells > self.cols {
                     self.row += 1;
                     self.col = 0;
