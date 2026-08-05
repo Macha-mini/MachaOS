@@ -236,6 +236,87 @@ pub fn fill_rounded_rect_blend(
     }
 }
 
+/// Whether the pixel (`px`, `py`) lies inside a rounded rectangle whose
+/// top-left is (`rx`, `ry`), size `w`x`h`, corner radius `r` — the same
+/// coverage test the `fill_rounded_rect*` family uses, but for a single
+/// point.
+fn rounded_rect_contains(px: u32, py: u32, rx: u32, ry: u32, w: u32, h: u32, r: u32) -> bool {
+    if px < rx || py < ry {
+        return false;
+    }
+    let row = py - ry;
+    if row >= h {
+        return false;
+    }
+    let inset = rounded_inset(row, h, r);
+    let inner = w.saturating_sub(2 * inset);
+    px - rx >= inset && px - rx < inset + inner
+}
+
+/// The classic three-layer window drop shadow, drawn in one pass.
+///
+/// `draw_window` used to emit three nested `fill_rounded_rect_blend`s
+/// (offsets 7/5/3, radii r+2/r+1/r, alphas 70/50/30). Because every
+/// layer is pure black, blending is just darkening: a pixel covered by
+/// `k` layers ends up multiplied by `prod((255 - alpha) / 255)` over
+/// the covering layers — no per-layer channel math, and pixels under
+/// the window body (painted over afterwards anyway) are skipped
+/// entirely. Same visuals, a fraction of the work.
+///
+/// `(x, y)` is the window's top-left, `w`x`h` its body size. The
+/// window's own opaque border rect (`x-1, y-1, w+2, h+2, r+1`) is
+/// drawn after this and is skipped here since it fully covers whatever
+/// is beneath it.
+pub fn draw_window_shadow(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32, r: u32) {
+    let x0 = x + 3;
+    let y0 = y + 3;
+    let x1 = x + w + 9;
+    let y1 = y + h + 9;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    // The window's border rect, drawn after the shadow, covers its own
+    // area; the shadow is only visible outside it.
+    let border = (x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, r + 1);
+    let layers = [
+        (7u32, r + 2, 70u32),
+        (5, r + 1, 50),
+        (3, r, 30),
+    ];
+    for py in y0..y1 {
+        if py >= surface.height() {
+            break;
+        }
+        for px in x0..x1 {
+            if px >= surface.width() {
+                break;
+            }
+            if rounded_rect_contains(px, py, border.0, border.1, border.2, border.3, border.4) {
+                continue;
+            }
+            let Some(base) = surface.get_pixel(px, py) else {
+                continue;
+            };
+            // Darken by each covering layer's (255 - alpha) / 255.
+            let mut scale = 255u32;
+            for (offset, radius, alpha) in &layers {
+                if rounded_rect_contains(px, py, x + offset, y + offset, w + 2, h + 2, *radius) {
+                    scale = scale * (255 - alpha) / 255;
+                }
+            }
+            if scale == 255 {
+                continue;
+            }
+            let mut out = 0u32;
+            for shift in [16u32, 8, 0] {
+                let v = (((base >> shift) & 0xFF) * scale + 127) / 255;
+                out |= (v & 0xFF) << shift;
+            }
+            surface.put_pixel(px, py, out);
+        }
+    }
+}
+
 pub fn draw_char(surface: &mut dyn Surface, x: u32, y: u32, ch: u8, fg: u32, bg: Option<u32>) {
     let glyph = font::glyph(ch);
     let s = font::scale() as u32;

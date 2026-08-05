@@ -1862,10 +1862,9 @@ fn draw_window(surface: &mut dyn Surface, window: &Window, focused: bool, cursor
         // Maximized windows bleed edge to edge: no shadow, no rounding.
         gfx::fill_rect(surface, x, y, content_w, total_h, WIN_BG);
     } else {
-        // Soft drop shadow (three nested offsets, darkest furthest out).
-        gfx::fill_rounded_rect_blend(surface, x + 7, y + 7, content_w + 2, total_h + 2, WINDOW_RADIUS + 2, 0x00_000000, 70);
-        gfx::fill_rounded_rect_blend(surface, x + 5, y + 5, content_w + 2, total_h + 2, WINDOW_RADIUS + 1, 0x00_000000, 50);
-        gfx::fill_rounded_rect_blend(surface, x + 3, y + 3, content_w + 2, total_h + 2, WINDOW_RADIUS, 0x00_000000, 30);
+        // Soft drop shadow (three nested offsets, darkest furthest out),
+        // collapsed into a single darkening pass by `draw_window_shadow`.
+        gfx::draw_window_shadow(surface, x, y, content_w, total_h, WINDOW_RADIUS);
         let border_color = if focused { WIN_BORDER_FOCUSED } else { WIN_BORDER };
         gfx::fill_rounded_rect(surface, x - 1, y - 1, content_w + 2, total_h + 2, WINDOW_RADIUS + 1, border_color);
         gfx::fill_rounded_rect(surface, x, y, content_w, total_h, WINDOW_RADIUS, WIN_BG);
