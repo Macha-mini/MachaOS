@@ -80,6 +80,18 @@ pub enum FsAction {
     OpenImage(String, Vec<u8>),
 }
 
+/// A right-click context-menu action the WM can ask the explorer to
+/// perform on its current selection.
+#[derive(Clone, Copy)]
+pub enum ExplorerMenuAction {
+    Open,
+    Rename,
+    Delete,
+    Refresh,
+    NewFolder,
+    NewFile,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum View {
     Details,
@@ -910,6 +922,47 @@ impl FileExplorer {
             _ => {}
         }
         None
+    }
+
+    /// Selects the entry under a content-local point, used by the
+    /// right-click context menu so actions target the item under the
+    /// cursor. Does nothing on empty space (keeps the current selection).
+    pub fn select_at(&mut self, x: i32, y: i32) {
+        if let Some(item) = self.item_at(x, y) {
+            self.selection = item;
+            self.ensure_selection_visible();
+            self.render();
+        }
+    }
+
+    /// Runs a right-click context-menu action on the current selection,
+    /// returning an `FsAction` for the WM when the action opens
+    /// something (mirrors the keyboard shortcuts).
+    pub fn context_action(&mut self, action: ExplorerMenuAction) -> Option<FsAction> {
+        match action {
+            ExplorerMenuAction::Open => self.open_selected(),
+            ExplorerMenuAction::Rename => {
+                self.start_rename();
+                None
+            }
+            ExplorerMenuAction::Delete => {
+                self.delete_selected();
+                None
+            }
+            ExplorerMenuAction::Refresh => {
+                self.status = String::new();
+                self.refresh();
+                None
+            }
+            ExplorerMenuAction::NewFolder => {
+                self.create_folder();
+                None
+            }
+            ExplorerMenuAction::NewFile => {
+                self.create_file();
+                None
+            }
+        }
     }
 
     // ---- rendering -----------------------------------------------------

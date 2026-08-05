@@ -107,6 +107,15 @@ const LAUNCHER_TILE_H: u32 = 84;
 const LAUNCHER_ICON: u32 = 56;
 const LAUNCHER_TILES_Y: u32 = 64;
 
+// Right-click context menu (Win11 style: small rounded popup).
+const MENU_ITEM_H: u32 = 26;
+const MENU_PAD: u32 = 6;
+const MENU_W: u32 = 170;
+const MENU_BG: u32 = 0x00_252525;
+const MENU_BORDER: u32 = 0x00_3F3F3F;
+const MENU_HOVER: u32 = 0x00_2C2C2C;
+const MENU_TEXT: u32 = 0x00_FFFFFF;
+
 // Console / editor content colors
 const CONSOLE_FG: u32 = 0x00_E6E6E6;
 const CONSOLE_BG: u32 = 0x00_202020;
@@ -309,6 +318,32 @@ struct PressState {
     screen_y: i32,
 }
 
+/// A right-click context menu: a small popup listing actions at a
+/// screen position. `target_window` is the File Explorer window the
+/// menu was opened over (`None` for the desktop menu).
+struct ContextMenu {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    target_window: Option<usize>,
+    items: Vec<ContextItem>,
+}
+
+struct ContextItem {
+    label: &'static str,
+    action: ContextAction,
+}
+
+enum ContextAction {
+    /// Run an explorer action on the menu's target window.
+    Explorer(crate::file_explorer::ExplorerMenuAction),
+    /// Launch a built-in app (desktop menu).
+    Launch(LauncherAction),
+    /// Reload settings from disk (desktop "Refresh").
+    ReloadSettings,
+}
+
 pub struct WindowManager {
     windows: Vec<Window>,
     focused: usize,
@@ -347,6 +382,10 @@ pub struct WindowManager {
     // cursor-only frame can erase the old cursor by restoring this
     // region and draw the cursor at its new position.
     cursor_save: Option<(i32, i32, Vec<u32>)>,
+    // Right-click context menu popup, `None` when closed.
+    context_menu: Option<ContextMenu>,
+    // Previous right-button state, for press/release edge detection.
+    right_was_down: bool,
 }
 
 impl WindowManager {
@@ -377,6 +416,8 @@ impl WindowManager {
             settings: Settings::load(),
             clock_cache: (u64::MAX, String::new()),
             cursor_save: None,
+            context_menu: None,
+            right_was_down: false,
         };
         manager.restore_session();
         manager
@@ -1015,6 +1056,13 @@ impl WindowManager {
     }
 
     pub fn handle_key(&mut self, event: keyboard::Event) {
+        // Esc closes a right-click context menu before anything else
+        // sees the key.
+        if let keyboard::Event::Escape = event {
+            if self.context_menu.take().is_some() {
+                return;
+            }
+        }
         if self.windows.is_empty() {
             return;
         }
@@ -1076,6 +1124,25 @@ impl WindowManager {
         let just_pressed = event.left && !self.left_was_down;
         let just_released = !event.left && self.left_was_down;
         self.left_was_down = event.left;
+
+        let just_pressed_right = event.right && !self.right_was_down;
+        self.right_was_down = event.right;
+
+        // Right-click: open (or reposition) the context menu at the
+        // cursor. Always needs a full recomposite to draw the popup.
+        if just_pressed_right {
+            self.open_context_menu();
+            return true;
+        }
+
+        // Left-click with the context menu open routes to the menu
+        // first: an item click runs its action, a click outside closes
+        // the menu and falls through to the normal click handling.
+        if just_pressed && self.context_menu.is_some() {
+            if self.click_context_menu() {
+                return true;
+            }
+        }
 
         if let Some(resize) = &mut self.resizing {
             if event.left {
@@ -1161,6 +1228,16 @@ impl WindowManager {
     /// When the cursor is over plain desktop/window content instead, a
     /// cursor-only redraw is sufficient.
     fn cursor_over_hoverable_at(&self, cx: i32, cy: i32) -> bool {
+        // The context menu highlights items under the cursor.
+        if let Some(menu) = &self.context_menu {
+            if cx >= menu.x
+                && cx < menu.x + menu.w as i32
+                && cy >= menu.y
+                && cy < menu.y + menu.h as i32
+            {
+                return true;
+            }
+        }
         // Taskbar row (buttons + start button light up on hover).
         if cy >= (self.screen_h - TASKBAR_HEIGHT) as i32 {
             return true;
@@ -1195,6 +1272,135 @@ impl WindowManager {
             }
         }
         false
+    }
+
+    /// Opens the right-click context menu at the cursor: a File
+    /// Explorer menu when the click is over an open explorer's content
+    /// area (selecting the item under the cursor), otherwise the
+    /// desktop menu. Closing any previously open menu first.
+    fn open_context_menu(&mut self) {
+        self.context_menu = None;
+        let (cx, cy) = (self.cursor_x, self.cursor_y);
+
+        // Topmost open explorer window whose content area contains the
+        // cursor (checked in z-order, so an overlapping explorer wins).
+        let mut target: Option<usize> = None;
+        for i in (0..self.windows.len()).rev() {
+            let window = &self.windows[i];
+            if !window.open || window.minimized {
+                continue;
+            }
+            let (cw, ch) = window.content_size();
+            let x0 = window.x;
+            let y0 = window.y + TITLE_BAR_HEIGHT as i32;
+            if cx >= x0 && cx < x0 + cw as i32 && cy >= y0 && cy < y0 + ch as i32 {
+                if matches!(window.kind, AppKind::FileExplorer(_)) {
+                    target = Some(i);
+                    break;
+                }
+                // The cursor is over some other app's content: no menu
+                // (only the explorer and the desktop have one).
+                return;
+            }
+        }
+
+        let items: Vec<ContextItem> = match target {
+            Some(index) => {
+                // Select the entry under the cursor so menu actions
+                // target it.
+                let local_x = cx - self.windows[index].x;
+                let local_y = cy - self.windows[index].y - TITLE_BAR_HEIGHT as i32;
+                if let AppKind::FileExplorer(app) = &mut self.windows[index].kind {
+                    app.select_at(local_x, local_y);
+                }
+                vec![
+                    ContextItem { label: "Open", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Open) },
+                    ContextItem { label: "Rename", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Rename) },
+                    ContextItem { label: "Delete", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Delete) },
+                    ContextItem { label: "New Folder", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFolder) },
+                    ContextItem { label: "New File", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFile) },
+                    ContextItem { label: "Refresh", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Refresh) },
+                ]
+            }
+            None => vec![
+                ContextItem { label: "Terminal", action: ContextAction::Launch(LauncherAction::Terminal) },
+                ContextItem { label: "File Explorer", action: ContextAction::Launch(LauncherAction::Files) },
+                ContextItem { label: "Calculator", action: ContextAction::Launch(LauncherAction::Calculator) },
+                ContextItem { label: "Settings", action: ContextAction::Launch(LauncherAction::Settings) },
+                ContextItem { label: "Refresh", action: ContextAction::ReloadSettings },
+            ],
+        };
+
+        let w = MENU_W;
+        let h = MENU_PAD * 2 + items.len() as u32 * MENU_ITEM_H;
+        // Open down-right from the cursor, flipped up when it would
+        // overflow the bottom of the screen, clamped to the edges.
+        let x = (cx + 4).min(self.screen_w as i32 - w as i32).max(0);
+        let y = if cy + 4 + h as i32 <= self.screen_h as i32 {
+            (cy + 4).max(0)
+        } else {
+            (cy - h as i32 - 4).max(0)
+        };
+        self.context_menu = Some(ContextMenu {
+            x,
+            y,
+            w,
+            h,
+            target_window: target,
+            items,
+        });
+    }
+
+    /// Handles a left-click while the context menu is open. Returns
+    /// `true` when the click was consumed by the menu (an item was
+    /// activated); `false` when it landed outside (the menu is closed
+    /// and the click should fall through to the normal handler).
+    fn click_context_menu(&mut self) -> bool {
+        let Some(menu) = self.context_menu.take() else {
+            return false;
+        };
+        let (cx, cy) = (self.cursor_x, self.cursor_y);
+        let inside = cx >= menu.x && cx < menu.x + menu.w as i32 && cy >= menu.y && cy < menu.y + menu.h as i32;
+        if !inside {
+            return false;
+        }
+        let local_y = cy - menu.y;
+        if local_y < MENU_PAD as i32 {
+            return true;
+        }
+        let idx = ((local_y - MENU_PAD as i32) / MENU_ITEM_H as i32) as usize;
+        let action = menu.items.get(idx).map(|item| &item.action);
+        if let Some(action) = action {
+            self.run_context_action(action, menu.target_window);
+        }
+        true
+    }
+
+    fn run_context_action(&mut self, action: &ContextAction, target_window: Option<usize>) {
+        match action {
+            ContextAction::Explorer(explorer_action) => {
+                let Some(index) = target_window else {
+                    return;
+                };
+                let Some(window) = self.windows.get_mut(index) else {
+                    return;
+                };
+                let fs_action = match &mut window.kind {
+                    AppKind::FileExplorer(app) => app.context_action(*explorer_action),
+                    _ => None,
+                };
+                if let Some(fs_action) = fs_action {
+                    self.dispatch_action(fs_action);
+                }
+            }
+            ContextAction::Launch(launcher_action) => {
+                let action = launcher_action.clone();
+                self.run_launcher_action(action);
+            }
+            ContextAction::ReloadSettings => {
+                self.settings = Settings::load();
+            }
+        }
     }
 
     fn set_explorer_drag(&mut self, drag: Option<DragInfo>) {
@@ -1522,6 +1728,9 @@ impl WindowManager {
             if self.launcher_open {
                 self.draw_launcher(surface);
             }
+            if let Some(menu) = &self.context_menu {
+                draw_context_menu(surface, menu, self.cursor_x, self.cursor_y);
+            }
             if let Some(drag) = &self.file_drag {
                 draw_file_drag_tag(surface, self.cursor_x, self.cursor_y, &drag.path, drag.is_dir);
             }
@@ -1672,6 +1881,28 @@ fn content_cursor(x: i32, y: i32, w: u32, h: u32) -> (i32, i32) {
         (x, y)
     } else {
         (i32::MAX, i32::MAX)
+    }
+}
+
+/// Win11-style right-click context menu: a small rounded popup listing
+/// the menu's actions, with a hover highlight under the cursor.
+fn draw_context_menu(surface: &mut dyn Surface, menu: &ContextMenu, cx: i32, cy: i32) {
+    let (x, y) = (menu.x as u32, menu.y as u32);
+    // Soft drop shadow, then the border + surface.
+    gfx::fill_rounded_rect_blend(surface, x + 3, y + 3, menu.w, menu.h, 8, 0x00_000000, 70);
+    gfx::fill_rounded_rect(surface, x - 1, y - 1, menu.w + 2, menu.h + 2, 9, MENU_BORDER);
+    gfx::fill_rounded_rect(surface, x, y, menu.w, menu.h, 8, MENU_BG);
+    for (i, item) in menu.items.iter().enumerate() {
+        let iy = y + MENU_PAD + i as u32 * MENU_ITEM_H;
+        let hovered = cx >= x as i32
+            && cx < (x + menu.w) as i32
+            && cy >= iy as i32
+            && cy < (iy + MENU_ITEM_H) as i32;
+        if hovered {
+            gfx::fill_rounded_rect(surface, x + 3, iy, menu.w - 6, MENU_ITEM_H, 5, MENU_HOVER);
+        }
+        let ty = iy + (MENU_ITEM_H - font::glyph_h() as u32) / 2;
+        gfx::draw_string(surface, x + 14, ty, item.label, MENU_TEXT, None);
     }
 }
 
