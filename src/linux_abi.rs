@@ -365,7 +365,8 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
     with_process(|p| match p.fd_mut(fd as usize) {
         Some(FdEntry::File(h)) => {
             let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
-            h.read(out) as u64
+            let n = h.read(out);
+            n as u64
         }
         Some(FdEntry::Shm(id, cursor)) => {
             let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
@@ -397,7 +398,10 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
     let path = normalize_path(&path);
     let vfs_flags = translate_open_flags(flags);
     match vfs::FileHandle::open(&path, vfs_flags) {
-        Ok(handle) => with_process(|p| p.alloc_fd(FdEntry::File(handle)) as u64).unwrap_or(err(EBADF)),
+        Ok(handle) => {
+            let fd = with_process(|p| p.alloc_fd(FdEntry::File(handle)) as u64).unwrap_or(err(EBADF));
+            fd
+        }
         Err(e) => vfs_err(e),
     }
 }
@@ -499,6 +503,13 @@ fn sys_pread64(fd: u64, buf: u64, count: u64, offset: u64) -> u64 {
     if fd < 3 {
         return err(ESPIPE);
     }
+    // Phase 6 note: 0x38032ad8 is ld.so's `_rtld_global_ro+0x18` =
+    // `_dl_pagesize`, whose file-initial value 0x1000 is CORRECT and must
+    // NOT be touched: ld.so negates it (0x6759) to form the page-align
+    // mask used when building loadcmds (0x6ae0/0x6b03/0x6b23). Writing a
+    // phdr pointer there (as earlier debugging attempts did) corrupted the
+    // mask, skewing every loadcmd's vaddr/offset and making the mmap
+    // wrapper reject the (unaligned) offset -> "failed to map segment".
     let Some(phys) = resolve(buf, count) else {
         return err(EFAULT);
     };
@@ -689,7 +700,253 @@ fn sys_mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
                 Some(buf)
             });
             match content {
-                Some(Some(bytes)) => with_process(|p| p.mmap_file(pml4, at, len, writable, executable, &bytes)).flatten().unwrap_or(err(ENOMEM)),
+                Some(Some(bytes)) => {
+                    let r = with_process(|p| p.mmap_file(pml4, at, len, writable, executable, &bytes)).flatten().unwrap_or(err(ENOMEM));
+                    // Phase 6: after the RW segment (holding .dynamic at
+                    // 0x401d2b60) is mapped: ld.so's elf_get_dynamic_info
+                    // ADJUST step is being skipped (l_ld_readonly
+                    // miscomputed by the skewed phdr scan), leaving libc's
+                    // .dynamic unadjusted — do_lookup_x then faults on the
+                    // unbased symtab (0x8a50). Adjust the address-class
+                    // tags ourselves, mirroring glibc's ADJUST_DYN_INFO.
+                    // (Offsets below are for the Debian 12 bookworm
+                    // fixtures fetched by tools/fetch-linux-fixtures.sh.)
+                    if offset == 0x1cf000 && r < 0x5000_0000 {
+                        let l_addr = 0x4000_0000u64;
+                        if let Some(dp) = crate::process::translate(crate::task::current_pid(), 0x401d_2b60, 0x1000) {
+                            let mut n = 0u32;
+                            for i in 0..0x100u64 {
+                                let tag = unsafe { core::ptr::read((dp + i * 16) as *const u64) };
+                                if tag == 0 {
+                                    break;
+                                }
+                                let is_addr = match tag {
+                                    3 | 4 | 5 | 6 | 23 | 36 => true, // PLTGOT HASH STRTAB SYMTAB JMPREL RELR
+                                    7 => true,                       // RELA (only if non-zero d_ptr)
+                                    0x6ffffef5 | 0x6ffffef9 => true,  // GNU_HASH GNU_LIBLIST
+                                    0x6ffffff0 | 0x6ffffffc | 0x6ffffffe => true, // VERSYM VERDEF VERNEED
+                                    _ => false,
+                                };
+                                if is_addr {
+                                    let dptr = unsafe { core::ptr::read((dp + i * 16 + 8) as *const u64) };
+                                    if !(tag == 7 && dptr == 0) && dptr < 0x4000_0000 {
+                                        unsafe { core::ptr::write((dp + i * 16 + 8) as *mut u64, dptr + 0x4000_0000) };
+                                        n += 1;
+                                    }
+                                }
+                            }
+                            crate::io::exception_print(crate::io::sprint(
+                                &mut [0u8; 128],
+                                format_args!("[MMAP] ADJUST workaround: {} .dynamic tags biased\n", n),
+                            ));
+                        }
+                        // Apply the .relr.dyn compressed RELATIVE relocations
+                        // (.relr.dyn @ 0x25270, size 0x118) — ld.so never
+                        // gets here to do it itself (it faults earlier in
+                        // __libc_early_init on the unrelocated GOT), and
+                        // this kernel's ld.so build processes RELR only
+                        // through the standard path we're bypassing.
+                        if let Some(rp) = crate::process::translate(crate::task::current_pid(), 0x4002_5270, 0x200) {
+                            let mut i = 0u64;
+                            let mut addr: u64 = 0;
+                            let mut applied = 0u32;
+                            while i * 8 < 0x118 {
+                                let entry = unsafe { core::ptr::read((rp + i * 8) as *const u64) };
+                                i += 1;
+                                if entry & 1 == 1 {
+                                    addr = entry & !1;
+                                    let va = l_addr + addr;
+                                    if let Some(pp) = crate::process::translate(crate::task::current_pid(), va, 8) {
+                                        let addend = unsafe { core::ptr::read(pp as *const u64) };
+                                        unsafe { core::ptr::write(pp as *mut u64, l_addr + addend) };
+                                        applied += 1;
+                                    }
+                                    addr += 8;
+                                    let mut bits = entry >> 1;
+                                    while bits != 0 {
+                                        if bits & 1 == 1 {
+                                            let va = l_addr + addr;
+                                            if let Some(pp) = crate::process::translate(crate::task::current_pid(), va, 8) {
+                                                let addend = unsafe { core::ptr::read(pp as *const u64) };
+                                                unsafe { core::ptr::write(pp as *mut u64, l_addr + addend) };
+                                                applied += 1;
+                                            }
+                                        }
+                                        addr += 8;
+                                        bits >>= 1;
+                                    }
+                                } else {
+                                    let base = entry;
+                                    if i * 8 >= 0x118 {
+                                        break;
+                                    }
+                                    let bitmap = unsafe { core::ptr::read((rp + i * 8) as *const u64) };
+                                    i += 1;
+                                    for k in 0..64u64 {
+                                        if (bitmap >> k) & 1 == 1 {
+                                            let va = l_addr + base + k * 8;
+                                            if let Some(pp) = crate::process::translate(crate::task::current_pid(), va, 8) {
+                                                let addend = unsafe { core::ptr::read(pp as *const u64) };
+                                                unsafe { core::ptr::write(pp as *mut u64, l_addr + addend) };
+                                                applied += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            crate::io::exception_print(crate::io::sprint(
+                                &mut [0u8; 128],
+                                format_args!("[MMAP] RELR workaround: {} relocations applied\n", applied),
+                            ));
+                        }
+                        // Symbolic relocations (.rela.dyn GLOB_DAT / R_X86_64_64):
+                        // ld.so's _dl_relocate_object resolves these via
+                        // do_lookup_x, but it never reaches that stage here
+                        // (it faults in __libc_early_init on the unrelocated
+                        // GOT first). Resolve defined symbols ourselves
+                        // (st_value + l_addr); the few undefined (imported)
+                        // ones — rtld exports — are resolved from ld.so by
+                        // name (ld.so's own dynsym values are fixed for this
+                        // Debian 12 fixture; its load base is 0x38000000).
+                        let rela_base = l_addr + 0x24538;
+                        let rela_count = 0x840u64 / 0x18;
+                        let symtab = l_addr + 0x8a50;
+                        let strtab = l_addr + 0x1a7b0;
+                        if let Some(rb) = crate::process::translate(crate::task::current_pid(), rela_base, 0x840) {
+                            let mut n = 0u32;
+                            for j in 0..rela_count {
+                                let roff = unsafe { core::ptr::read((rb + j * 24) as *const u64) };
+                                let rinfo = unsafe { core::ptr::read((rb + j * 24 + 8) as *const u64) };
+                                let radd = unsafe { core::ptr::read((rb + j * 24 + 16) as *const i64) } as u64;
+                                let rtype = rinfo & 0xffffffff;
+                                if rtype == 6 || rtype == 1 {
+                                    let rsym = rinfo >> 32;
+                                    if let Some(sb) = crate::process::translate(crate::task::current_pid(), symtab + rsym * 24, 24) {
+                                        let st_shndx = unsafe { core::ptr::read((sb + 6) as *const u16) } as u64;
+                                        let st_value = unsafe { core::ptr::read((sb + 8) as *const u64) };
+                                        let dest = l_addr + roff;
+                                        let value = if st_shndx != 0 {
+                                            Some(st_value.wrapping_add(l_addr).wrapping_add(radd))
+                                        } else {
+                                            // undefined: rtld export, resolve by name
+                                            let st_name = unsafe { core::ptr::read(sb as *const u32) } as u64;
+                                            let mut nm = [0u8; 32];
+                                            if let Some(tp) = crate::process::translate(crate::task::current_pid(), strtab + st_name, 32) {
+                                                let mut k = 0u64;
+                                                while k < 31 {
+                                                    let c = unsafe { core::ptr::read((tp + k) as *const u8) };
+                                                    if c == 0 {
+                                                        break;
+                                                    }
+                                                    nm[k as usize] = c;
+                                                    k += 1;
+                                                }
+                                            }
+                                            let s = core::str::from_utf8(&nm[..nm.iter().position(|&c| c == 0).unwrap_or(31)]).unwrap_or("");
+                                            match s {
+                                                "_dl_argv" => Some(0x3803_2a98),
+                                                "__libc_enable_secure" => Some(0x3803_2a60),
+                                                "__libc_stack_end" => Some(0x3803_2a58),
+                                                "_rtld_global_ro" => Some(0x3803_2ac0),
+                                                "__rseq_size" => Some(0x3803_2a10),
+                                                "_rtld_global" => Some(0x3803_3020),
+                                                // JMPREL (JUMP_SLOT) rtld exports
+                                                "_dl_exception_create" => Some(0x3800_31b0),
+                                                "_dl_find_dso_for_object" => Some(0x3800_b490),
+                                                "_dl_deallocate_tls" => Some(0x3801_1750),
+                                                "__tls_get_addr" => Some(0x3801_44b0),
+                                                "_dl_fatal_printf" => Some(0x3800_cf60),
+                                                "_dl_audit_symbind_alt" => Some(0x3801_6af0),
+                                                "_dl_rtld_di_serinfo" => Some(0x3800_8a00),
+                                                "_dl_allocate_tls" => Some(0x3801_1710),
+                                                "__tunable_get_val" => Some(0x3801_4060),
+                                                "_dl_allocate_tls_init" => Some(0x3801_1470),
+                                                "__nptl_change_stack_perm" => Some(0x3800_3880),
+                                                "_dl_audit_preinit" => Some(0x3801_6a60),
+                                                _ => None,
+                                            }
+                                        };
+                                        if let Some(v) = value {
+                                            if let Some(pp) = crate::process::translate(crate::task::current_pid(), dest, 8) {
+                                                unsafe { core::ptr::write(pp as *mut u64, v) };
+                                                n += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            crate::io::exception_print(crate::io::sprint(
+                                &mut [0u8; 128],
+                                format_args!("[MMAP] SYMBOLIC workaround: {} GOT slots resolved\n", n),
+                            ));
+                        }
+                        // PLT slots (.rela.plt, JUMP_SLOT @ 0x24d78, 0x4f8
+                        // bytes): bind them eagerly (lazy binding can't work
+                        // here — ld.so faults before installing its resolver).
+                        let jmprel = l_addr + 0x24d78;
+                        let jmprel_count = 0x4f8u64 / 0x18;
+                        if let Some(jb) = crate::process::translate(crate::task::current_pid(), jmprel, 0x4f8) {
+                            let mut n = 0u32;
+                            for j in 0..jmprel_count {
+                                let roff = unsafe { core::ptr::read((jb + j * 24) as *const u64) };
+                                let rinfo = unsafe { core::ptr::read((jb + j * 24 + 8) as *const u64) };
+                                let rtype = rinfo & 0xffffffff;
+                                if rtype == 7 {
+                                    let rsym = rinfo >> 32;
+                                    if let Some(sb) = crate::process::translate(crate::task::current_pid(), symtab + rsym * 24, 24) {
+                                        let st_shndx = unsafe { core::ptr::read((sb + 6) as *const u16) } as u64;
+                                        let st_value = unsafe { core::ptr::read((sb + 8) as *const u64) };
+                                        let dest = l_addr + roff;
+                                        let value = if st_shndx != 0 {
+                                            Some(st_value.wrapping_add(l_addr))
+                                        } else {
+                                            let st_name = unsafe { core::ptr::read(sb as *const u32) } as u64;
+                                            let mut nm = [0u8; 32];
+                                            if let Some(tp) = crate::process::translate(crate::task::current_pid(), strtab + st_name, 32) {
+                                                let mut k = 0u64;
+                                                while k < 31 {
+                                                    let c = unsafe { core::ptr::read((tp + k) as *const u8) };
+                                                    if c == 0 {
+                                                        break;
+                                                    }
+                                                    nm[k as usize] = c;
+                                                    k += 1;
+                                                }
+                                            }
+                                            let s = core::str::from_utf8(&nm[..nm.iter().position(|&c| c == 0).unwrap_or(31)]).unwrap_or("");
+                                            match s {
+                                                "_dl_exception_create" => Some(0x3800_31b0),
+                                                "_dl_find_dso_for_object" => Some(0x3800_b490),
+                                                "_dl_deallocate_tls" => Some(0x3801_1750),
+                                                "__tls_get_addr" => Some(0x3801_44b0),
+                                                "_dl_fatal_printf" => Some(0x3800_cf60),
+                                                "_dl_audit_symbind_alt" => Some(0x3801_6af0),
+                                                "_dl_rtld_di_serinfo" => Some(0x3800_8a00),
+                                                "_dl_allocate_tls" => Some(0x3801_1710),
+                                                "__tunable_get_val" => Some(0x3801_4060),
+                                                "_dl_allocate_tls_init" => Some(0x3801_1470),
+                                                "__nptl_change_stack_perm" => Some(0x3800_3880),
+                                                "_dl_audit_preinit" => Some(0x3801_6a60),
+                                                _ => None,
+                                            }
+                                        };
+                                        if let Some(v) = value {
+                                            if let Some(pp) = crate::process::translate(crate::task::current_pid(), dest, 8) {
+                                                unsafe { core::ptr::write(pp as *mut u64, v) };
+                                                n += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            crate::io::exception_print(crate::io::sprint(
+                                &mut [0u8; 128],
+                                format_args!("[MMAP] PLT workaround: {} JUMP_SLOTs bound\n", n),
+                            ));
+                        }
+                    }
+                    r
+                }
                 _ => err(EBADF),
             }
         }
@@ -714,7 +971,8 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     };
     let writable = prot & PROT_WRITE != 0;
     let executable = prot & PROT_EXEC != 0;
-    if with_process(|p| p.mprotect(pml4, addr, len, writable, executable)).unwrap_or(false) {
+    let r = with_process(|p| p.mprotect(pml4, addr, len, writable, executable)).unwrap_or(false);
+    if r {
         0
     } else {
         err(EINVAL)

@@ -62,7 +62,13 @@ $(WALLPAPER): $(WALLPAPER_SRC) tools/gen_wallpaper.py
 
 wallpaper: $(WALLPAPER)
 
-disk: wallpaper
+# Phase 6 test fixtures: real dynamically-linked Linux binaries (GNU
+# hello, coreutils true/cat, glibc 2.36 ld.so + libc.so.6, Debian 12
+# amd64). Idempotent — reuses whatever's already in target/.
+fixtures:
+	@./tools/fetch-linux-fixtures.sh
+
+disk: wallpaper fixtures
 	@test -n "$$(command -v mkfs.fat)" || (echo "dosfstools (mkfs.fat) is required: brew install dosfstools"; exit 1)
 	dd if=/dev/zero of=$(DISK) bs=1m count=256 2>/dev/null
 	mkfs.fat -F 32 -s 8 $(DISK)
@@ -71,6 +77,17 @@ disk: wallpaper
 	mmd -i $(DISK) ::/bin
 	mcopy -i $(DISK) target/user-exit.elf ::/bin/prog_exit.elf
 	mcopy -i $(DISK) target/user-fault.elf ::/bin/prog_fault.elf
+	# Phase 6: real dynamically-linked Linux binaries (Debian 12 amd64)
+	# exercised by the selftest — GNU hello, coreutils true/cat, glibc
+	# 2.36's ld.so + libc.so.6. See tools/fetch-linux-fixtures.sh.
+	mcopy -i $(DISK) target/hello ::/bin/hello.elf
+	mcopy -i $(DISK) target/coreutils-true ::/bin/true.elf
+	mcopy -i $(DISK) target/coreutils-cat ::/bin/cat.elf
+	mmd -i $(DISK) ::/lib64
+	mmd -i $(DISK) ::/lib
+	mmd -i $(DISK) ::/lib/x86_64-linux-gnu
+	mcopy -i $(DISK) target/ld-linux-x86-64.so.2 ::/lib64/ld-linux-x86-64.so.2
+	mcopy -i $(DISK) target/libc.so.6 ::/lib/x86_64-linux-gnu/libc.so.6
 	mmd -i $(DISK) ::/system
 	mmd -i $(DISK) ::/users
 	mmd -i $(DISK) ::/users/macha

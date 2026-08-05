@@ -1319,15 +1319,17 @@ pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
     let rip = frame.rip;
     redirect_to_exit(frame);
 
-    let mut buf = [0u8; 200];
-    let message = io::sprint(
+    let mut buf = [0u8; 700];
+    let msg = io::sprint(
         &mut buf,
         format_args!(
-            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x}, r8={:#x}, r9={:#x}, rdi={:#x}, rsi={:#x})\n",
-            cr2, frame.error_code, rip, frame.r8, frame.r9, frame.rdi, frame.rsi
+            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x}, r8={:#x}, r9={:#x}, r10={:#x}, r11={:#x}, r12={:#x}, r13={:#x}, r14={:#x}, r15={:#x}, rbx={:#x}, rbp={:#x}, rdx={:#x}, rcx={:#x}, rdi={:#x}, rsi={:#x}, rsp={:#x})\n",
+            cr2, frame.error_code, rip, frame.r8, frame.r9, frame.r10, frame.r11,
+            frame.r12, frame.r13, frame.r14, frame.r15, frame.rbx, frame.rbp,
+            frame.rdx, frame.rcx, frame.rdi, frame.rsi, frame.rsp
         ),
     );
-    io::exception_print(message);
+    io::exception_print(msg);
 }
 
 /// Called from #DE/#UD/#GP (and similar) when the faulting task is a
