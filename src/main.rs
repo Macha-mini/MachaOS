@@ -20,6 +20,7 @@ mod gdt;
 mod gfx;
 mod idt;
 mod image_viewer;
+mod ime;
 mod interrupts;
 #[macro_use]
 mod io;

@@ -226,7 +226,7 @@ struct RememberedWindow {
 pub enum AppKind {
     Terminal { console: Console, editor: LineEditor },
     SysInfo { console: Console },
-    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String, path: String },
+    Editor { console: Console, lines: Vec<String>, cursor_row: usize, cursor_col: usize, scroll_offset: usize, status: String, path: String, ime: crate::ime::Ime },
     Calculator(CalculatorApp),
     FileExplorer(FileExplorer),
     Settings(SettingsApp),
@@ -883,7 +883,7 @@ impl WindowManager {
                     "Notepad",
                     true,
                     Some(AppId::Notepad),
-                    AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path: String::new() },
+                    AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path: String::new(), ime: crate::ime::Ime::new() },
                 );
             }
             LauncherAction::SysInfo => {
@@ -982,7 +982,7 @@ impl WindowManager {
             title,
             true,
             None,
-            AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path },
+            AppKind::Editor { console, lines, cursor_row: 0, cursor_col: 0, scroll_offset: scroll, status, path, ime: crate::ime::Ime::new() },
         );
     }
 
@@ -1095,8 +1095,18 @@ impl WindowManager {
                     io::set_console_sink(None);
                     None
                 }
-                AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status, path } => {
-                    editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, path, event);
+                AppKind::Editor { console, lines, cursor_row, cursor_col, scroll_offset, status, path, ime } => {
+                    // The IME can turn one key into a sequence (e.g.
+                    // Space converts romaji to kana/kanji), so feed it
+                    // first and deliver whatever it emits.
+                    let outcome = ime.feed(event);
+                    for e in outcome.events {
+                        editor_handle_key(console, lines, cursor_row, cursor_col, scroll_offset, status, path, e);
+                    }
+                    if let Some(msg) = outcome.status {
+                        *status = msg;
+                        editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
+                    }
                     None
                 }
                 AppKind::FileExplorer(app) => app.handle_key(event),
