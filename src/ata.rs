@@ -53,7 +53,7 @@ impl AtaDevice {
         0xE0 | if self.master { 0 } else { 0x10 } | ((lba >> 24) as u8 & 0x0F)
     }
 
-    fn model_string(&self) -> String {
+    pub fn model_string(&self) -> String {
         let bytes = &self.model;
         let end = bytes.iter().rposition(|&b| b != b' ' && b != 0).map(|i| i + 1).unwrap_or(0);
         String::from_utf8_lossy(&bytes[..end]).into_owned()

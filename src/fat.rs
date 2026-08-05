@@ -11,7 +11,7 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::ata::AtaDevice;
+use crate::disk::Disk;
 use crate::rtc;
 use crate::sync::SpinLock;
 
@@ -72,7 +72,7 @@ pub struct VolumeInfo {
 }
 
 pub struct Fat32 {
-    device: AtaDevice,
+    device: Disk,
     sectors_per_cluster: u8,
     reserved_sectors: u32,
     fat_count: u8,
@@ -86,7 +86,7 @@ pub struct Fat32 {
 }
 
 impl Fat32 {
-    fn open(device: AtaDevice) -> Result<Fat32, FatError> {
+    fn open(device: Disk) -> Result<Fat32, FatError> {
         let mut sector = [0u8; 512];
         device.read_sectors(0, 1, &mut sector).map_err(FatError::Io)?;
 
@@ -773,9 +773,7 @@ pub fn mounted() -> bool {
 /// Mounts the first ATA block device as FAT32. Safe to call again after
 /// a failed attempt.
 pub fn mount() -> Result<(), FatError> {
-    let device = crate::ata::device(0)
-        .filter(|d| d.present && !d.atapi)
-        .ok_or(FatError::NoDisk)?;
+    let device = crate::disk::first_disk().ok_or(FatError::NoDisk)?;
     let mut fat = Fat32::open(device)?;
     fat.scan_free_clusters();
     *MOUNTED.lock() = Some(fat);

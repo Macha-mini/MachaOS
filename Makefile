@@ -107,11 +107,16 @@ disk-linux: disk $(BUSYBOX)
 # NATed through the host (guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3).
 NET_ARGS := -netdev user,id=n0 -device e1000,netdev=n0
 
+# Storage: the disk attaches to an ICH9 AHCI (SATA) controller instead
+# of the legacy PIIX IDE bus, exercising the kernel's AHCI driver.
+AHCI_ARGS := -device ich9-ahci,id=ahci -drive id=disk0,if=none,file=$(DISK),format=raw \
+	-device ide-hd,drive=disk0,bus=ahci.0
+
 run: iso disk
-	$(QEMU) -m 4G -cdrom $(ISO) -boot d -drive file=$(DISK),format=raw $(NET_ARGS) -serial stdio
+	$(QEMU) -m 4G -cdrom $(ISO) -boot d $(AHCI_ARGS) $(NET_ARGS) -serial stdio
 
 run-nographic: iso disk
-	$(QEMU) -m 4G -cdrom $(ISO) -boot d $(NET_ARGS) -display none -serial stdio
+	$(QEMU) -m 4G -cdrom $(ISO) -boot d $(AHCI_ARGS) $(NET_ARGS) -display none -serial stdio
 
 test: GRUB_CFG=boot/grub/grub-selftest.cfg
 test: iso disk
@@ -119,8 +124,8 @@ test: iso disk
 	@echo "== running MachaOS selftest in QEMU =="
 	@printf 'MachaOS http fixture 1234567890\n' > target/http-fixture.txt
 	@python3 tools/echo_server.py target >/dev/null 2>&1 & echo $$! > $(TEST_LOG).pid
-	@$(QEMU) -m 4G -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) -hda $(DISK) \
-		$(NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 &
+	@$(QEMU) -m 4G -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) \
+		$(AHCI_ARGS) $(NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 &
 	@for i in $$(seq 1 60); do \
 		sleep 1; \
 		if grep -q "SELFTEST OK" $(TEST_LOG) 2>/dev/null; then \

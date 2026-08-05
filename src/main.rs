@@ -6,11 +6,13 @@ extern crate alloc;
 
 mod allocator;
 mod ata;
+mod ahci;
 mod calculator;
 mod clipboard;
 mod console;
 mod cpuid;
 mod desktop;
+mod disk;
 mod e1000;
 mod elf;
 mod fat;
@@ -262,6 +264,11 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     }
     if ata::count() == 0 {
         println!("[WARN] no ATA devices found");
+    }
+
+    match ahci::init() {
+        Ok(()) => println!("[OK] AHCI: {}", ahci::describe()),
+        Err(e) => println!("[WARN] no AHCI: {}", e),
     }
 
     match fat::mount() {

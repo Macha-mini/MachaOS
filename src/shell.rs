@@ -706,6 +706,9 @@ fn cmd_fatinfo() {
             println!("  {}", description);
         }
     }
+    if let Some(disk) = crate::disk::first_disk() {
+        println!("  {}", disk.description());
+    }
 }
 
 fn cmd_meminfo() {
