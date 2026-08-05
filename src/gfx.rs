@@ -236,21 +236,21 @@ pub fn fill_rounded_rect_blend(
     }
 }
 
-/// Whether the pixel (`px`, `py`) lies inside a rounded rectangle whose
-/// top-left is (`rx`, `ry`), size `w`x`h`, corner radius `r` — the same
-/// coverage test the `fill_rounded_rect*` family uses, but for a single
-/// point.
-fn rounded_rect_contains(px: u32, py: u32, rx: u32, ry: u32, w: u32, h: u32, r: u32) -> bool {
-    if px < rx || py < ry {
-        return false;
+/// For a rounded rectangle with top-left (`rx`, `ry`), size `w`x`h`,
+/// corner radius `r`, returns the closed x-range `[start, end)` that
+/// the rectangle covers on scanline `py` (empty when the scanline
+/// misses the rect entirely). Computing this once per row instead of
+/// testing every pixel keeps the window-shadow pass cheap.
+fn rounded_row_range(py: u32, rx: u32, ry: u32, w: u32, h: u32, r: u32) -> (u32, u32) {
+    if py < ry || py >= ry + h {
+        return (0, 0);
     }
-    let row = py - ry;
-    if row >= h {
-        return false;
-    }
-    let inset = rounded_inset(row, h, r);
+    let inset = rounded_inset(py - ry, h, r);
     let inner = w.saturating_sub(2 * inset);
-    px - rx >= inset && px - rx < inset + inner
+    if inner < 2 {
+        return (0, 0);
+    }
+    (rx + inset, rx + inset + inner)
 }
 
 /// The classic three-layer window drop shadow, drawn in one pass.
@@ -277,7 +277,11 @@ pub fn draw_window_shadow(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: 
     }
     // The window's border rect, drawn after the shadow, covers its own
     // area; the shadow is only visible outside it.
-    let border = (x.saturating_sub(1), y.saturating_sub(1), w + 2, h + 2, r + 1);
+    let bx = x.saturating_sub(1);
+    let by = y.saturating_sub(1);
+    let bw = w + 2;
+    let bh = h + 2;
+    let br = r + 1;
     let layers = [
         (7u32, r + 2, 70u32),
         (5, r + 1, 50),
@@ -287,26 +291,35 @@ pub fn draw_window_shadow(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: 
         if py >= surface.height() {
             break;
         }
+        // Precompute this scanline's coverage ranges once per row: the
+        // window's border (skip) and each shadow layer (darken), then
+        // the pixel loop is pure integer range checks.
+        let (b_start, b_end) = rounded_row_range(py, bx, by, bw, bh, br);
+        let mut layer_ranges = [(0u32, 0u32); 3];
+        for (i, (offset, radius, _)) in layers.iter().enumerate() {
+            layer_ranges[i] = rounded_row_range(py, x + offset, y + offset, w + 2, h + 2, *radius);
+        }
         for px in x0..x1 {
             if px >= surface.width() {
                 break;
             }
-            if rounded_rect_contains(px, py, border.0, border.1, border.2, border.3, border.4) {
+            if px >= b_start && px < b_end {
                 continue;
             }
-            let Some(base) = surface.get_pixel(px, py) else {
-                continue;
-            };
             // Darken by each covering layer's (255 - alpha) / 255.
             let mut scale = 255u32;
-            for (offset, radius, alpha) in &layers {
-                if rounded_rect_contains(px, py, x + offset, y + offset, w + 2, h + 2, *radius) {
+            for (i, (_, _, alpha)) in layers.iter().enumerate() {
+                let (ls, le) = layer_ranges[i];
+                if px >= ls && px < le {
                     scale = scale * (255 - alpha) / 255;
                 }
             }
             if scale == 255 {
                 continue;
             }
+            let Some(base) = surface.get_pixel(px, py) else {
+                continue;
+            };
             let mut out = 0u32;
             for shift in [16u32, 8, 0] {
                 let v = (((base >> shift) & 0xFF) * scale + 127) / 255;
