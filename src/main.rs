@@ -45,6 +45,7 @@ mod socket;
 mod sync;
 mod syscall;
 mod task;
+mod trash;
 mod user_prog;
 mod users;
 mod vfs;

@@ -87,6 +87,10 @@ pub enum ExplorerMenuAction {
     Open,
     Rename,
     Delete,
+    /// Restore the selected entry to its original location (trash only).
+    Restore,
+    /// Physically delete everything in the trash (trash only).
+    EmptyTrash,
     Refresh,
     NewFolder,
     NewFile,
@@ -533,7 +537,9 @@ impl FileExplorer {
     }
 
     /// Delete armed on the first press, executed on a second press while
-    /// still armed. Only removes regular files and empty directories.
+    /// still armed. Moves the entry to the trash (a temporary staging
+    /// area) rather than physically erasing it; the trash can restore
+    /// it later. Inside the trash itself, Delete physically erases.
     fn delete_selected(&mut self) {
         let Some(entry) = self.entries.get(self.selection).cloned() else {
             return;
@@ -543,9 +549,18 @@ impl FileExplorer {
             if arm_sel == self.selection && now.saturating_sub(arm_tick) <= DELETE_ARM_TICKS {
                 let path = join(&self.path, &entry.name);
                 self.pending_delete = None;
-                match fat::remove(&path) {
+                let result: Result<(), &'static str> = if self.in_trash() {
+                    fat::remove(&path).map_err(|_| "remove failed")
+                } else {
+                    crate::trash::trash_file(&path).map(|_| ())
+                };
+                match result {
                     Ok(()) => {
-                        self.status = format!("deleted {}", entry.name);
+                        self.status = if self.in_trash() {
+                            format!("permanently deleted {}", entry.name)
+                        } else {
+                            format!("moved {} to trash", entry.name)
+                        };
                         self.refresh();
                     }
                     Err(e) => {
@@ -557,8 +572,56 @@ impl FileExplorer {
             }
         }
         self.pending_delete = Some((self.selection, now));
-        self.status = format!("delete {}? press Del again to confirm", entry.name);
+        let prompt = if self.in_trash() {
+            format!("permanently delete {}? press Del again to confirm", entry.name)
+        } else {
+            format!("move {} to trash? press Del again to confirm", entry.name)
+        };
+        self.status = prompt;
         self.render();
+    }
+
+    /// Whether the explorer is currently showing the trash directory
+    /// (so Delete becomes permanent and Restore/Empty actions appear).
+    pub fn in_trash(&self) -> bool {
+        self.path == crate::trash::TRASH_PATH
+    }
+
+    /// Restores the selected trash entry to its original location.
+    fn restore_selected(&mut self) {
+        let Some(entry) = self.entries.get(self.selection).cloned() else {
+            return;
+        };
+        let names = crate::trash::list_names();
+        let Some(index) = names.iter().position(|n| *n == entry.name) else {
+            self.status = "cannot restore: entry not found in trash".to_string();
+            self.render();
+            return;
+        };
+        match crate::trash::restore(index) {
+            Ok(path) => {
+                self.status = format!("restored to {}", path);
+                self.refresh();
+            }
+            Err(e) => {
+                self.status = format!("restore failed: {}", e);
+                self.render();
+            }
+        }
+    }
+
+    /// Physically deletes everything in the trash.
+    fn empty_trash(&mut self) {
+        match crate::trash::empty_trash() {
+            Ok(()) => {
+                self.status = "trash emptied".to_string();
+                self.refresh();
+            }
+            Err(e) => {
+                self.status = format!("empty trash failed: {}", e);
+                self.render();
+            }
+        }
     }
 
     fn create_folder(&mut self) {
@@ -947,6 +1010,14 @@ impl FileExplorer {
             }
             ExplorerMenuAction::Delete => {
                 self.delete_selected();
+                None
+            }
+            ExplorerMenuAction::Restore => {
+                self.restore_selected();
+                None
+            }
+            ExplorerMenuAction::EmptyTrash => {
+                self.empty_trash();
                 None
             }
             ExplorerMenuAction::Refresh => {
@@ -1362,6 +1433,7 @@ fn build_sidebar() -> Vec<SidebarEntry> {
     out.push(SidebarEntry { label: "Music".to_string(), target: format!("{}/Music", home) });
     out.push(SidebarEntry { label: String::new(), target: String::new() });
     out.push(SidebarEntry { label: "SYSTEM".to_string(), target: String::new() });
+    out.push(SidebarEntry { label: "Trash".to_string(), target: crate::trash::TRASH_PATH.to_string() });
     out.push(SidebarEntry { label: "Applications".to_string(), target: "/bin".to_string() });
     out.push(SidebarEntry { label: "System".to_string(), target: "/system".to_string() });
     out.push(SidebarEntry { label: "Users".to_string(), target: "/users".to_string() });

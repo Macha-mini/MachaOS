@@ -1320,17 +1320,31 @@ impl WindowManager {
                 // target it.
                 let local_x = cx - self.windows[index].x;
                 let local_y = cy - self.windows[index].y - TITLE_BAR_HEIGHT as i32;
+                let in_trash = match &self.windows[index].kind {
+                    AppKind::FileExplorer(app) => app.in_trash(),
+                    _ => false,
+                };
                 if let AppKind::FileExplorer(app) = &mut self.windows[index].kind {
                     app.select_at(local_x, local_y);
                 }
-                vec![
-                    ContextItem { label: "Open", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Open) },
-                    ContextItem { label: "Rename", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Rename) },
-                    ContextItem { label: "Delete", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Delete) },
-                    ContextItem { label: "New Folder", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFolder) },
-                    ContextItem { label: "New File", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFile) },
-                    ContextItem { label: "Refresh", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Refresh) },
-                ]
+                if in_trash {
+                    // The trash has its own menu: restore the selected
+                    // entry or empty the whole trash.
+                    vec![
+                        ContextItem { label: "Restore", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Restore) },
+                        ContextItem { label: "Empty Trash", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::EmptyTrash) },
+                        ContextItem { label: "Refresh", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Refresh) },
+                    ]
+                } else {
+                    vec![
+                        ContextItem { label: "Open", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Open) },
+                        ContextItem { label: "Rename", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Rename) },
+                        ContextItem { label: "Delete", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Delete) },
+                        ContextItem { label: "New Folder", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFolder) },
+                        ContextItem { label: "New File", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFile) },
+                        ContextItem { label: "Refresh", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Refresh) },
+                    ]
+                }
             }
             None => vec![
                 ContextItem { label: "Terminal", action: ContextAction::Launch(LauncherAction::Terminal) },

@@ -853,6 +853,58 @@ pub fn selftest() -> ! {
         );
     }
 
+    // Trash: a file moved to the trash is gone from its original
+    // location, still readable from the trash, and can be restored to
+    // its exact original path (then emptied). The FAT test above
+    // deleted /selftest, so recreate it first.
+    if let Err(e) = fat::make_dir("/selftest") {
+        selftest_fail(&format!("trash: setup mkdir failed: {}", e));
+    }
+    if let Err(e) = fat::write_file("/selftest/to-trash.txt", b"trash payload") {
+        selftest_fail(&format!("trash setup write failed: {}", e));
+    }
+    match crate::trash::trash_file("/selftest/to-trash.txt") {
+        Ok(name) if name == "to-trash.txt" => println!("[OK] trash: moved file into trash"),
+        Ok(name) => selftest_fail(&format!("trash: unexpected name '{}'", name)),
+        Err(e) => selftest_fail(&format!("trash: move failed: {}", e)),
+    }
+    if fat::read_file("/selftest/to-trash.txt").is_ok() {
+        selftest_fail("trash: original path still exists after trashing");
+    }
+    match fat::read_file("/system/Trash/to-trash.txt") {
+        Ok(data) if data == b"trash payload" => println!("[OK] trash: payload preserved in trash"),
+        _ => selftest_fail("trash: payload not preserved"),
+    }
+    match crate::trash::list_original_paths().as_slice() {
+        [path] if path == "/selftest/to-trash.txt" => println!("[OK] trash: meta records original path"),
+        _ => selftest_fail("trash: meta missing original path"),
+    }
+    match crate::trash::restore(0) {
+        Ok(path) if path == "/selftest/to-trash.txt" => println!("[OK] trash: restored to original path"),
+        Ok(path) => selftest_fail(&format!("trash: restored to wrong path '{}'", path)),
+        Err(e) => selftest_fail(&format!("trash: restore failed: {}", e)),
+    }
+    match fat::read_file("/selftest/to-trash.txt") {
+        Ok(data) if data == b"trash payload" => println!("[OK] trash: restore round trip"),
+        _ => selftest_fail("trash: restore did not bring the payload back"),
+    }
+    if let Err(e) = crate::trash::trash_file("/selftest/to-trash.txt") {
+        selftest_fail(&format!("trash: re-trash failed: {}", e));
+    }
+    match crate::trash::empty_trash() {
+        Ok(()) => println!("[OK] trash: empty deletes entries"),
+        Err(e) => selftest_fail(&format!("trash: empty failed: {}", e)),
+    }
+    if fat::read_file("/system/Trash/to-trash.txt").is_ok() {
+        selftest_fail("trash: entry survived empty");
+    }
+    if fat::read_file("/selftest/to-trash.txt").is_ok() {
+        selftest_fail("trash: emptied entry reappeared at original path");
+    }
+    if let Err(e) = fat::remove("/selftest") {
+        selftest_fail(&format!("trash: selftest dir cleanup failed: {}", e));
+    }
+
     // Desktop session persistence: serialize a representative set of
     // open windows and remembered geometries, save it to the disk,
     // load it back and check every field survives the round trip.
