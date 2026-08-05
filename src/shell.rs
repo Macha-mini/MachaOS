@@ -109,7 +109,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
+    "tasks", "netinfo", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
 ];
 
 pub fn run() -> ! {
@@ -308,6 +308,7 @@ pub fn execute(line: &str) {
         "panic" => panic!("user-requested kernel panic"),
         "mousetest" => cmd_mousetest(),
         "tasks" => cmd_tasks(),
+        "netinfo" => cmd_netinfo(),
         "ls" => cmd_ls(&args),
         "cat" => cmd_cat(&args),
         "fatinfo" => cmd_fatinfo(),
@@ -552,6 +553,35 @@ fn cmd_runlinux(args: &[&str]) {
             }
         }
         Err(e) => println!("runlinux: {}: {}", abs, e),
+    }
+}
+
+/// Shows the state of the e1000 NIC and QEMU's user-mode network.
+fn cmd_netinfo() {
+    match crate::e1000::mac() {
+        Some(mac) => {
+            let mut buf = [0u8; 24];
+            let mac_str = crate::net::mac_to_str(&mac, &mut buf);
+            println!("e1000: MAC {}", mac_str);
+            println!(
+                "  link: {}",
+                if crate::e1000::link_up() { "up" } else { "down" }
+            );
+            let (rx, tx) = crate::e1000::stats();
+            println!("  rx: {} packets, tx: {} packets", rx, tx);
+            println!(
+                "  ip: {}.{}.{}.{} (gateway {}.{}.{}.{})",
+                crate::net::OUR_IP[0],
+                crate::net::OUR_IP[1],
+                crate::net::OUR_IP[2],
+                crate::net::OUR_IP[3],
+                crate::net::GATEWAY_IP[0],
+                crate::net::GATEWAY_IP[1],
+                crate::net::GATEWAY_IP[2],
+                crate::net::GATEWAY_IP[3],
+            );
+        }
+        None => println!("no e1000 NIC (driver not initialized)"),
     }
 }
 
@@ -1538,6 +1568,31 @@ pub fn selftest() -> ! {
         selftest_fail("ring3 syscall round trip: wrong write count");
     }
     println!("[OK] ring3 syscall round trip ({} sys_write calls via SYSCALL/SYSRET)", written);
+
+    // Network, part 1: the e1000 driver and an ARP round trip through
+    // QEMU's user-mode network (ask for the 10.0.2.2 gateway's MAC;
+    // slirp answers ARP itself).
+    match crate::e1000::init() {
+        Ok(()) => {
+            let mac = crate::e1000::mac().unwrap_or([0; 6]);
+            let mut buf = [0u8; 24];
+            println!(
+                "[OK] e1000 NIC up, MAC {}",
+                crate::net::mac_to_str(&mac, &mut buf)
+            );
+            match crate::net::resolve([10, 0, 2, 2], 300) {
+                Some(gw_mac) => {
+                    let mut gbuf = [0u8; 24];
+                    println!(
+                        "[OK] ARP resolved 10.0.2.2 -> {}",
+                        crate::net::mac_to_str(&gw_mac, &mut gbuf)
+                    );
+                }
+                None => selftest_fail("ARP request for 10.0.2.2 got no reply"),
+            }
+        }
+        Err(e) => selftest_fail(&format!("e1000 init failed: {}", e)),
+    }
 
     let before: Vec<u64> = task::COUNTERS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
     let deadline = interrupts::ticks() + 30; // spans several scheduler quanta (5 ticks each)

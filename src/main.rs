@@ -11,9 +11,10 @@ mod clipboard;
 mod console;
 mod cpuid;
 mod desktop;
+mod e1000;
 mod elf;
-mod fb;
 mod fat;
+mod fb;
 mod file_explorer;
 mod font;
 mod gdt;
@@ -30,8 +31,10 @@ mod keyboard;
 mod linux_abi;
 mod mouse;
 mod multiboot;
+mod net;
 mod paint;
 mod paging;
+mod pci;
 mod pic;
 mod pit;
 mod pmm;
@@ -295,6 +298,17 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
     println!("     features: {}", features.join(" "));
 
     interrupts::enable_interrupts();
+
+    match e1000::init() {
+        Ok(()) => {
+            let mac = e1000::mac().unwrap_or([0; 6]);
+            println!(
+                "[OK] e1000 NIC up, MAC {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            );
+        }
+        Err(e) => println!("[WARN] no network: {}", e),
+    }
 
     wayland::start();
 
