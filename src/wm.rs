@@ -280,93 +280,13 @@ pub struct WindowManager {
 }
 
 impl WindowManager {
+    /// Starts with an empty desktop: no apps are launched at boot — the
+    /// start menu opens whatever the user picks, and window geometry is
+    /// remembered per app across font-size changes.
     pub fn new(screen_w: u32, screen_h: u32) -> Self {
-        let margin = 40i32;
-        let max_x = screen_w as i32 - 100;
-        let max_y = screen_h as i32 - TASKBAR_HEIGHT as i32 - 100;
-        let clamp = |x: i32, y: i32| (x.clamp(0, max_x), y.clamp(0, max_y));
-
-        let sysinfo_window = Window {
-            title: "System Info",
-            x: clamp(880, margin).0,
-            y: margin,
-            open: true,
-            minimized: false,
-            maximized: false,
-            resizable: false,
-            app_id: Some(AppId::SysInfo),
-            restore_geometry: None,
-            kind: AppKind::SysInfo { console: build_sysinfo_console() },
-        };
-
-        let calculator_window = Window {
-            title: "Calculator",
-            x: clamp(1220, margin).0,
-            y: margin,
-            open: true,
-            minimized: false,
-            maximized: false,
-            resizable: false,
-            app_id: Some(AppId::Calculator),
-            restore_geometry: None,
-            kind: AppKind::Calculator(CalculatorApp::new()),
-        };
-
-        let mut editor_console = Console::new(
-            fit_console_cells(screen_w, screen_h, MAX_EDITOR_COLS, MAX_EDITOR_ROWS).0,
-            fit_console_cells(screen_w, screen_h, MAX_EDITOR_COLS, MAX_EDITOR_ROWS).1,
-            CONSOLE_FG,
-            CONSOLE_BG,
-        );
-        let editor_lines = vec![String::new()];
-        let mut editor_scroll = 0usize;
-        let mut editor_status = String::new();
-        editor_render(&mut editor_console, &editor_lines, 0, 0, &mut editor_scroll, &mut editor_status);
-        let (ex, ey) = clamp(margin, margin + 300);
-        let editor_window = Window {
-            title: "Notepad",
-            x: ex,
-            y: ey,
-            open: true,
-            minimized: false,
-            maximized: false,
-            resizable: true,
-            app_id: Some(AppId::Notepad),
-            restore_geometry: None,
-            kind: AppKind::Editor {
-                console: editor_console,
-                lines: editor_lines,
-                cursor_row: 0,
-                cursor_col: 0,
-                scroll_offset: editor_scroll,
-                status: editor_status,
-            },
-        };
-
-        let term_window = Window {
-            title: "Terminal",
-            x: margin,
-            y: margin,
-            open: true,
-            minimized: false,
-            maximized: false,
-            resizable: true,
-            app_id: Some(AppId::Terminal),
-            restore_geometry: None,
-            kind: AppKind::Terminal {
-                console: Console::new(
-                    fit_console_cells(screen_w, screen_h, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS).0,
-                    fit_console_cells(screen_w, screen_h, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS).1,
-                    CONSOLE_FG,
-                    CONSOLE_BG,
-                ),
-                editor: LineEditor::new(),
-            },
-        };
-
-        let mut manager = Self {
-            windows: vec![sysinfo_window, calculator_window, editor_window, term_window],
-            focused: 3,
+        Self {
+            windows: Vec::new(),
+            focused: 0,
             cursor_x: (screen_w / 2) as i32,
             cursor_y: (screen_h / 2) as i32,
             screen_w,
@@ -383,15 +303,7 @@ impl WindowManager {
             remembered: [None; APP_ID_COUNT],
             wallpaper: load_wallpaper(screen_w, screen_h),
             settings: Settings::load(),
-        };
-
-        if let AppKind::Terminal { console, .. } = &mut manager.windows[3].kind {
-            io::set_console_sink(Some(console));
-            print!("{}", shell::prompt());
-            io::set_console_sink(None);
         }
-
-        manager
     }
 
     pub fn clock_tick_due(&mut self) -> bool {
@@ -579,17 +491,42 @@ impl WindowManager {
         self.settings = Settings::load();
     }
 
-    pub     fn apply_font_scale(&mut self, scale: u8) {
+    /// Reflows the desktop to a new font scale in place, keeping every
+    /// open window (its contents, position, size and minimized/maximized
+    /// state) instead of rebuilding the whole desktop from scratch.
+    /// Cell-counted windows keep their cell dimensions scaled up by the
+    /// larger glyphs (Windows-style), clamped so they still fit on
+    /// screen; fixed-pixel apps are left untouched.
+    fn apply_font_scale(&mut self, scale: u8) {
         font::set_scale(scale);
-        let (w, h) = fb::virtual_dimensions();
-        // Free the old desktop's large buffers before building the
-        // replacement so the heap peak stays flat (the old wallpaper +
-        // back buffers are ~8 MB each at native resolution).
-        self.windows = Vec::new();
-        self.wallpaper = None;
-        self.launcher_items = Vec::new();
-        self.remembered = [None; APP_ID_COUNT];
-        *self = WindowManager::new(w, h);
+        let max_x = (self.screen_w as i32 - 40).max(0);
+        let max_y = (self.screen_h as i32 - TASKBAR_HEIGHT as i32 - TITLE_BAR_HEIGHT as i32).max(0);
+        let (max_cols, max_rows) = self.max_content_cells();
+        let max_cols = max_cols.max(1);
+        let max_rows = max_rows.max(1);
+        for window in &mut self.windows {
+            if !window.open {
+                continue;
+            }
+            window.x = window.x.clamp(0, max_x);
+            window.y = window.y.clamp(0, max_y);
+            let (cols, rows) = window.cols_rows();
+            if cols == 0 {
+                // Fixed-pixel apps (Calculator, Settings, ...): their
+                // own layouts already adapt to the glyph size.
+                continue;
+            }
+            let (target_cols, target_rows) = if window.maximized {
+                (max_cols, max_rows)
+            } else {
+                (cols.clamp(1, max_cols), rows.clamp(1, max_rows))
+            };
+            // Always rebuild: the console's pixel buffer is sized at the
+            // glyph metrics in effect when it was created, so every
+            // console-backed window must be re-rendered at the new size
+            // even when its cell count didn't change.
+            resize_window(window, target_cols, target_rows);
+        }
     }
 
     /// Records a window's current geometry as "where this app was last
@@ -600,7 +537,7 @@ impl WindowManager {
     /// instead (along with the fact that it was maximized), so reopening
     /// it maximizes it again rather than reopening at the stale
     /// full-screen bounds.
-    fn remember_geometry(&mut self, index: usize) {
+        fn remember_geometry(&mut self, index: usize) {
         let window = &self.windows[index];
         let Some(id) = window.app_id else { return };
         let remembered = if window.maximized {
@@ -1409,12 +1346,14 @@ fn resize_window(window: &mut Window, cols: usize, rows: usize) {
             console.resize(cols, rows);
             editor_render(console, lines, *cursor_row, *cursor_col, scroll_offset, status);
         }
-        AppKind::SysInfo { .. }
-        | AppKind::Calculator(_)
+        AppKind::SysInfo { console } => {
+            *console = build_sysinfo_console();
+        }
+        AppKind::Calculator(_)
         | AppKind::FileExplorer(_)
         | AppKind::Settings(_)
         | AppKind::Paint(_)
-        | AppKind::ImageViewer(_) => {} // not resizable
+        | AppKind::ImageViewer(_) => {} // fixed pixel size; not resizable
     }
 }
 
