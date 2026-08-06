@@ -1022,16 +1022,26 @@ impl WindowManager {
         );
     }
 
-    /// Spawns an Image Viewer window preloaded with a `.raw` file's bytes
-    /// (used by the file explorer — see `file_explorer::is_raw`). The raw
-    /// format (`tools/gen_wallpaper.py`) has no width/height header, so an
-    /// arbitrary file opened this way is guessed as square; a non-square
-    /// dump just shows `ImageViewerApp::load_image`'s existing "invalid
-    /// size" message instead of a wrong picture.
+    /// Spawns an Image Viewer window preloaded with a file's bytes (used
+    /// by the file explorer — see `file_explorer::is_raw`). PNG files are
+    /// decoded through `png::decode` (real dimensions, alpha); anything
+    /// else is treated as a raw 32-bit pixel dump (`tools/gen_wallpaper.py`
+    /// format), which has no width/height header and is guessed square.
     fn open_image_viewer_with(&mut self, path: String, content: Vec<u8>) {
-        let side = isqrt((content.len() / 4) as u32);
         let mut app = ImageViewerApp::new();
-        app.load_image(&path, &content, side, side);
+        let lower = path.to_lowercase();
+        if lower.ends_with(".png") {
+            match crate::png::decode(&content) {
+                Some((w, h, pixels)) => app.load_pixels(&path, pixels, w, h),
+                None => app.show_error(&format!(
+                    "{}: not a decodable PNG",
+                    path.rsplit('/').next().unwrap_or(&path)
+                )),
+            }
+        } else {
+            let side = isqrt((content.len() / 4) as u32);
+            app.load_image(&path, &content, side, side);
+        }
         let base = path.rsplit('/').next().unwrap_or(&path);
         let title: &'static str = alloc::boxed::Box::leak(format!("Image Viewer: {}", base).into_boxed_str());
         self.spawn_window(title, true, None, AppKind::ImageViewer(app));

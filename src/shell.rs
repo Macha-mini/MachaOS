@@ -2563,6 +2563,58 @@ pub fn selftest() -> ! {
                 ),
                 None => selftest_fail("ACPI S5 parameters not found (RSDP/FADT/_S5)"),
             }
+
+            // Phase D.9: the PNG decoder — a 4x4 RGBA fixture (pixel
+            // (x,y) = (x*85, y*85, 42, 255)) and a 2x2 palette fixture
+            // with a tRNS alpha, exercising the full inflate + filter +
+            // colour-conversion chain (tools/gen_test_pngs.py).
+            match crate::png::decode(include_bytes!("../target/test-png-rgba.png")) {
+                Some((4, 4, px)) if px.len() == 16 => {
+                    let ok = px[0] == 0xFF00_002A // (0,0): r0 g0 b42 a255
+                        && px[1] == 0xFF55_002A // (1,0): r85
+                        && px[4] == 0xFF00_552A // (0,1): g85
+                        && px[15] == 0xFF_FFFF_2A; // (3,3): r255 g255 b42
+                    if ok {
+                        println!("[OK] Phase D.9: PNG RGBA decode correct");
+                    } else {
+                        selftest_fail("PNG RGBA decode pixel mismatch");
+                    }
+                }
+                _ => selftest_fail("PNG RGBA decode failed (size/chunks/inflate)"),
+            }
+            match crate::png::decode(include_bytes!("../target/test-png-palette.png")) {
+                Some((2, 2, px)) if px.len() == 4 => {
+                    let ok = px[0] == 0xFF_FF_00_00 // index 0 = red, a=255
+                        && px[1] == 0xFF_00_FF_00 // index 1 = green
+                        && px[2] == 0xFF_00_FF_00 // index 1 again (Sub/Paeth rows)
+                        && px[3] == 0x80_00_00_FF; // index 2 = blue, tRNS a=0x80
+                    if ok {
+                        println!("[OK] Phase D.9: PNG palette + tRNS decode correct");
+                    } else {
+                        selftest_fail("PNG palette decode pixel mismatch");
+                    }
+                }
+                _ => selftest_fail("PNG palette decode failed"),
+            }
+            // A 64x64 RGB fixture cycling all five scanline filters per row
+            // (pixel (x,y) = ((x*2)%256, (y*3)%256, (x+y)%256)).
+            match crate::png::decode(include_bytes!("../target/test-png-filters.png")) {
+                Some((64, 64, px)) if px.len() == 64 * 64 => {
+                    let at = |x: u32, y: u32| px[(y * 64 + x) as usize];
+                    let ok = at(0, 0) == 0xFF00_0000 // (0,0,0)
+                        && at(63, 0) == 0xFF7E_003F // (126,0,63)
+                        && at(0, 63) == 0xFF00_BD3F // (0,189,63)
+                        && at(63, 63) == 0xFF7E_BD7E // (126,189,126)
+                        && at(10, 10) == 0xFF14_1E14 // (20,30,20)
+                        && at(33, 55) == 0xFF42_A558; // (66,165,88)
+                    if ok {
+                        println!("[OK] Phase D.9: PNG all-filter decode correct");
+                    } else {
+                        selftest_fail("PNG filter decode pixel mismatch");
+                    }
+                }
+                _ => selftest_fail("PNG filter decode failed"),
+            }
         }
         Err(e) => selftest_fail(&format!("e1000 init failed: {}", e)),
     }

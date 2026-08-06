@@ -44,6 +44,7 @@ mod pic;
 mod pit;
 mod pmm;
 mod pipe;
+mod png;
 mod port;
 mod power;
 mod process;

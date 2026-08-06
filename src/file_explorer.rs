@@ -195,10 +195,12 @@ fn is_text(name: &str) -> bool {
     lower.ends_with(".txt") || lower.ends_with(".md") || lower.ends_with(".log") || lower.ends_with(".cfg")
 }
 
-/// Raw 32-bit pixel dumps (see `tools/gen_wallpaper.py`'s format), openable
-/// in the Image Viewer.
+/// Raw 32-bit pixel dumps (see `tools/gen_wallpaper.py`'s format) and
+/// PNG files, both openable in the Image Viewer (the WM tries PNG
+/// decoding first and falls back to the raw square-size guess).
 fn is_raw(name: &str) -> bool {
-    name.to_lowercase().ends_with(".raw")
+    let lower = name.to_lowercase();
+    lower.ends_with(".raw") || lower.ends_with(".png")
 }
 
 fn file_type(name: &str) -> &'static str {

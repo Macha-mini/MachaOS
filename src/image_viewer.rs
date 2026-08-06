@@ -75,17 +75,31 @@ impl ImageViewerApp {
             return;
         }
 
-        // Parse pixels
+        // Parse pixels (BGRA little-endian — the wallpaper.raw layout).
         let mut pixels = Vec::with_capacity((width * height) as usize);
         for i in 0..(width * height) as usize {
             let offset = i * 4;
-            let pixel = u32::from_le_bytes([
+            pixels.push(u32::from_le_bytes([
                 data[offset],
                 data[offset + 1],
                 data[offset + 2],
                 data[offset + 3],
-            ]);
-            pixels.push(pixel);
+            ]));
+        }
+        self.load_pixels(path, pixels, width, height);
+    }
+
+    /// Loads already-decoded `(a<<24)|(r<<16)|(g<<8)|b` pixels (the PNG
+    /// decoder's output) with a known size.
+    pub fn load_pixels(&mut self, path: &str, pixels: Vec<u32>, width: u32, height: u32) {
+        if pixels.len() != (width * height) as usize {
+            self.status = format!(
+                "Invalid image size (expected {} px, got {})",
+                (width * height) as usize,
+                pixels.len()
+            );
+            self.render();
+            return;
         }
 
         self.image_data = Some(pixels);
@@ -103,6 +117,12 @@ impl ImageViewerApp {
             "{} ({}x{}, zoom {}x)",
             path, width, height, self.zoom
         );
+        self.render();
+    }
+
+    /// Shows an error status (used when a file fails to decode).
+    pub fn show_error(&mut self, msg: &str) {
+        self.status = msg.to_string();
         self.render();
     }
 
