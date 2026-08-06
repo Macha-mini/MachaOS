@@ -420,6 +420,9 @@ pub struct WindowManager {
     context_menu: Option<ContextMenu>,
     // Previous right-button state, for press/release edge detection.
     right_was_down: bool,
+    // Window index of an editor currently being drag-selected with the
+    // mouse; `None` when no text-selection drag is in progress.
+    editor_selecting: Option<usize>,
 }
 
 impl WindowManager {
@@ -453,6 +456,7 @@ impl WindowManager {
             drag_bg: None,
             context_menu: None,
             right_was_down: false,
+            editor_selecting: None,
         };
         manager.restore_session();
         manager
@@ -1237,6 +1241,31 @@ impl WindowManager {
             return true;
         }
 
+        // A text-selection drag in an editor owns the mouse until
+        // release, extending the selection as it travels.
+        if self.editor_selecting.is_some() {
+            let idx = self.editor_selecting.unwrap();
+            let (local_x, local_y) = match self.windows.get(idx) {
+                Some(w) if w.open => {
+                    (self.cursor_x - w.x, self.cursor_y - w.y - TITLE_BAR_HEIGHT as i32)
+                }
+                _ => {
+                    self.editor_selecting = None;
+                    return true;
+                }
+            };
+            if let Some(window) = self.windows.get_mut(idx) {
+                if let AppKind::Editor { console, editor, .. } = &mut window.kind {
+                    editor_mouse_drag(console, editor, local_x, local_y);
+                    editor_render(console, editor);
+                }
+            }
+            if just_released {
+                self.editor_selecting = None;
+            }
+            return true;
+        }
+
         // A normal list click becomes a file drag only after the cursor
         // moves a few pixels, preserving single- and double-click behavior.
         if let Some(press) = &self.press_state {
@@ -1730,9 +1759,10 @@ impl WindowManager {
                 let local_x = self.cursor_x - wx;
                 let local_y = self.cursor_y - wy - TITLE_BAR_HEIGHT as i32;
                 self.raise(i);
-                let (action, item, settings_change) = {
+                let (action, item, settings_change, editor_select) = {
                     let window = &mut self.windows[self.focused];
                     let mut settings_change = SettingsChange::None;
+                    let mut editor_select = false;
                     let (action, item) = match &mut window.kind {
                         AppKind::Calculator(app) => {
                             app.handle_click(local_x, local_y);
@@ -1756,10 +1786,21 @@ impl WindowManager {
                             app.handle_click(local_x, local_y);
                             (None, None)
                         }
+                        AppKind::Editor { console, editor, .. } => {
+                            editor_mouse_click(console, editor, local_x, local_y, keyboard::shift_down());
+                            editor_render(console, editor);
+                            editor_select = true;
+                            (None, None)
+                        }
                         _ => (None, None),
                     };
-                    (action, item, settings_change)
+                    (action, item, settings_change, editor_select)
                 };
+                if editor_select {
+                    // A click in an editor starts a drag-to-select: the
+                    // mouse owns the window until release.
+                    self.editor_selecting = Some(self.focused);
+                }
                 if let Some(action) = action {
                     self.press_state = None;
                     self.dispatch_action(action);
@@ -2188,6 +2229,13 @@ pub struct EditorState {
     // `replace` (true); Tab toggles.
     replace_target: bool,
     wrap: bool,
+    // Text selection: `sel_active` marks an in-progress selection whose
+    // anchor sits where it started; the cursor is the moving end. The
+    // selected span is always [min(anchor, cursor), max(anchor, cursor))
+    // in document order (see `selection_bounds`).
+    sel_active: bool,
+    sel_anchor_row: usize,
+    sel_anchor_col: usize,
 }
 
 impl EditorState {
@@ -2207,6 +2255,9 @@ impl EditorState {
             replace_mode: false,
             replace_target: false,
             wrap: false,
+            sel_active: false,
+            sel_anchor_row: 0,
+            sel_anchor_col: 0,
         }
     }
 
@@ -2246,6 +2297,10 @@ impl EditorState {
         }
         self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
         self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].chars().count());
+        // A stale anchor (undo/redo shrank the document) must not leave
+        // a selection pointing outside it.
+        self.sel_anchor_row = self.sel_anchor_row.min(self.lines.len() - 1);
+        self.sel_anchor_col = self.sel_anchor_col.min(self.lines[self.sel_anchor_row].chars().count());
     }
 
     /// Visual row layout: (logical line index, char offset of the row
@@ -2382,6 +2437,87 @@ impl EditorState {
         self.cursor_col = c + replacement.chars().count();
         self.status = format!("置換: {} -> {} ({} 行目)", self.find, self.replace, r + 1);
     }
+
+    // ---- selection model -------------------------------------------------
+
+    /// The selection as normalized (start, end) document positions
+    /// (each `(row, col)`, `end` exclusive); `None` when no selection is
+    /// live. Independent of which end is the anchor.
+    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        if !self.sel_active {
+            return None;
+        }
+        let a = (self.sel_anchor_row, self.sel_anchor_col);
+        let b = (self.cursor_row, self.cursor_col);
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// True when the selection spans at least one character.
+    fn has_selection(&self) -> bool {
+        self.selection_bounds().is_some_and(|(a, b)| a != b)
+    }
+
+    /// The selected text; a multi-line selection joins its lines with
+    /// '\n' (the trailing newline of each interior line is included).
+    fn selection_text(&self) -> String {
+        let Some(((sr, sc), (er, ec))) = self.selection_bounds() else {
+            return String::new();
+        };
+        if sr == er {
+            let s = byte_index(&self.lines[sr], sc);
+            let e = byte_index(&self.lines[sr], ec);
+            return self.lines[sr][s..e].to_string();
+        }
+        let mut out = String::new();
+        out.push_str(&self.lines[sr][byte_index(&self.lines[sr], sc)..]);
+        for r in (sr + 1)..er {
+            out.push('\n');
+            out.push_str(&self.lines[r]);
+        }
+        out.push('\n');
+        out.push_str(&self.lines[er][..byte_index(&self.lines[er], ec)]);
+        out
+    }
+
+    /// Deletes the selected span and moves the cursor to its start
+    /// (the selection becomes empty/inactive).
+    fn delete_selection(&mut self) {
+        let Some(((sr, sc), (er, ec))) = self.selection_bounds() else {
+            return;
+        };
+        self.sel_active = false;
+        if sr == er {
+            let s = byte_index(&self.lines[sr], sc);
+            let e = byte_index(&self.lines[sr], ec);
+            self.lines[sr].drain(s..e);
+        } else {
+            // Keep the prefix of the first line and the suffix of the
+            // last; everything between is deleted.
+            let idx = byte_index(&self.lines[sr], sc);
+            let last_tail = self.lines[er][byte_index(&self.lines[er], ec)..].to_string();
+            self.lines[sr].truncate(idx);
+            self.lines[sr].push_str(&last_tail);
+            self.lines.drain((sr + 1)..=er);
+        }
+        self.cursor_row = sr;
+        self.cursor_col = sc;
+        self.sel_anchor_row = sr;
+        self.sel_anchor_col = sc;
+    }
+
+    /// Starts a selection anchored at the cursor (keeps an existing
+    /// anchor, so Shift+arrow extends rather than restarting).
+    fn begin_selection(&mut self) {
+        if !self.sel_active {
+            self.sel_active = true;
+            self.sel_anchor_row = self.cursor_row;
+            self.sel_anchor_col = self.cursor_col;
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.sel_active = false;
+    }
 }
 
 /// Visual row index containing logical `(row, col)`.
@@ -2407,11 +2543,15 @@ fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboar
             ed.status = "検索を終了".to_string();
         }
         keyboard::Event::Ctrl('f') => {
+            // Leaving editing context: a live selection would otherwise
+            // linger as a phantom span when find moves the cursor.
+            ed.clear_selection();
             ed.find_mode = true;
             ed.replace_mode = false;
             ed.status = "検索モード: 入力して Enter / Esc で終了".to_string();
         }
         keyboard::Event::Ctrl('h') => {
+            ed.clear_selection();
             ed.replace_mode = true;
             ed.find_mode = false;
             ed.replace_target = false;
@@ -2471,35 +2611,81 @@ fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboar
                     }
                 }
                 keyboard::Event::Ctrl('c') => {
-                    // Copy the current line (there's no selection model yet).
-                    crate::clipboard::copy_text(ed.lines[ed.cursor_row].clone());
-                    ed.status = format!("copied {} chars", ed.lines[ed.cursor_row].chars().count());
+                    // Copy the selection when one is live; otherwise the
+                    // whole current line (the pre-selection behavior).
+                    if ed.has_selection() {
+                        let text = ed.selection_text();
+                        let n = text.chars().count();
+                        crate::clipboard::copy_text(text);
+                        ed.status = format!("copied {} chars", n);
+                    } else {
+                        crate::clipboard::copy_text(ed.lines[ed.cursor_row].clone());
+                        ed.status = format!("copied {} chars", ed.lines[ed.cursor_row].chars().count());
+                    }
                 }
                 keyboard::Event::Ctrl('v') => {
                     if let Some(text) = crate::clipboard::paste_text() {
                         ed.push_undo();
-                        let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
-                        ed.lines[ed.cursor_row].insert_str(idx, &text);
-                        ed.cursor_col += text.chars().count();
+                        // Pasting over a selection replaces it.
+                        if ed.has_selection() {
+                            ed.delete_selection();
+                        }
+                        // Multi-line text is split into real `lines`
+                        // entries — embedding '\n' inside one entry would
+                        // desync the line model (visual rows, cursor math,
+                        // Enter/Backspace splitting). The current line's
+                        // tail stays attached to the last pasted line.
+                        let col_byte = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
+                        let tail = ed.lines[ed.cursor_row][col_byte..].to_string();
+                        ed.lines[ed.cursor_row].truncate(col_byte);
+                        let parts: Vec<&str> = text.split('\n').collect();
+                        let n = parts.len();
+                        ed.lines[ed.cursor_row].push_str(parts[0]);
+                        // Each part goes on its own row, in order — the
+                        // insert index must advance with the part.
+                        for (i, part) in parts[1..].iter().enumerate() {
+                            ed.lines.insert(ed.cursor_row + 1 + i, part.to_string());
+                        }
+                        let last = ed.cursor_row + n - 1;
+                        ed.lines[last].push_str(&tail);
+                        // The cursor lands right after the pasted text, or
+                        // at the start of the fresh line when the text
+                        // ends with a newline.
+                        ed.cursor_row = last;
+                        ed.cursor_col = if text.ends_with('\n') {
+                            0
+                        } else {
+                            parts[n - 1].chars().count()
+                        };
                         ed.status = format!("pasted {} chars", text.chars().count());
                     } else {
                         ed.status = "clipboard is empty or holds an image".to_string();
                     }
                 }
                 keyboard::Event::Ctrl('x') => {
-                    // Cut the current line (no selection model yet).
-                    ed.push_undo();
-                    crate::clipboard::copy_text(ed.lines[ed.cursor_row].clone());
-                    if ed.lines.len() > 1 {
-                        ed.lines.remove(ed.cursor_row);
-                        if ed.cursor_row >= ed.lines.len() {
-                            ed.cursor_row = ed.lines.len() - 1;
-                        }
+                    // Cut the selection when one is live; otherwise the
+                    // whole current line (the pre-selection behavior).
+                    if ed.has_selection() {
+                        let text = ed.selection_text();
+                        let n = text.chars().count();
+                        ed.push_undo();
+                        crate::clipboard::copy_text(text);
+                        ed.delete_selection();
+                        ed.status = format!("cut {} chars", n);
                     } else {
-                        ed.lines[ed.cursor_row].clear();
+                        ed.push_undo();
+                        crate::clipboard::copy_text(ed.lines[ed.cursor_row].clone());
+                        if ed.lines.len() > 1 {
+                            ed.lines.remove(ed.cursor_row);
+                            if ed.cursor_row >= ed.lines.len() {
+                                ed.cursor_row = ed.lines.len() - 1;
+                            }
+                        } else {
+                            ed.lines[ed.cursor_row].clear();
+                        }
+                        ed.cursor_col = 0;
+                        ed.status = "cut current line".to_string();
                     }
-                    ed.cursor_col = 0;
-                    ed.status = "cut current line".to_string();
                 }
                 keyboard::Event::Ctrl('o') => {
                     match fat::read_file(&save_path) {
@@ -2513,27 +2699,40 @@ fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboar
                             }
                             ed.cursor_row = 0;
                             ed.cursor_col = 0;
+                            ed.clear_selection();
                             ed.status = format!("opened {} ({} bytes)", save_path, data.len());
                         }
                         Err(e) => ed.status = format!("open failed: {}", e),
                     }
                 }
-                keyboard::Event::Ctrl('z') => ed.undo(),
-                keyboard::Event::Ctrl('y') => ed.redo(),
+                keyboard::Event::Ctrl('z') => {
+                    ed.undo();
+                    ed.clear_selection();
+                }
+                keyboard::Event::Ctrl('y') => {
+                    ed.redo();
+                    ed.clear_selection();
+                }
                 keyboard::Event::Ctrl('w') => {
                     ed.wrap = !ed.wrap;
                     ed.status = format!("折り返し: {}", if ed.wrap { "オン" } else { "オフ" });
                 }
                 keyboard::Event::Ctrl(_) => {} // Ctrl+other letters: not bound
                 keyboard::Event::Char(c) => {
+                    // Typing over a selection replaces it.
                     ed.push_undo();
+                    if ed.has_selection() {
+                        ed.delete_selection();
+                    }
                     let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
                     ed.lines[ed.cursor_row].insert(idx, c);
                     ed.cursor_col += 1;
                 }
                 keyboard::Event::Backspace => {
                     ed.push_undo();
-                    if ed.cursor_col > 0 {
+                    if ed.has_selection() {
+                        ed.delete_selection();
+                    } else if ed.cursor_col > 0 {
                         let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col - 1);
                         ed.lines[ed.cursor_row].remove(idx);
                         ed.cursor_col -= 1;
@@ -2546,6 +2745,9 @@ fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboar
                 }
                 keyboard::Event::Enter => {
                     ed.push_undo();
+                    if ed.has_selection() {
+                        ed.delete_selection();
+                    }
                     let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
                     let rest = ed.lines[ed.cursor_row].split_off(idx);
                     ed.lines.insert(ed.cursor_row + 1, rest);
@@ -2554,11 +2756,22 @@ fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboar
                 }
                 keyboard::Event::Tab => {
                     ed.push_undo();
+                    if ed.has_selection() {
+                        ed.delete_selection();
+                    }
                     let idx = byte_index(&ed.lines[ed.cursor_row], ed.cursor_col);
                     ed.lines[ed.cursor_row].insert_str(idx, "    ");
                     ed.cursor_col += 4;
                 }
                 keyboard::Event::Left => {
+                    // Shift+arrow extends the selection from the anchor;
+                    // a plain arrow collapses it.
+                    let shift = keyboard::shift_down();
+                    if shift {
+                        ed.begin_selection();
+                    } else {
+                        ed.clear_selection();
+                    }
                     if ed.cursor_col > 0 {
                         ed.cursor_col -= 1;
                     } else if ed.cursor_row > 0 {
@@ -2567,6 +2780,12 @@ fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboar
                     }
                 }
                 keyboard::Event::Right => {
+                    let shift = keyboard::shift_down();
+                    if shift {
+                        ed.begin_selection();
+                    } else {
+                        ed.clear_selection();
+                    }
                     if ed.cursor_col < ed.lines[ed.cursor_row].chars().count() {
                         ed.cursor_col += 1;
                     } else if ed.cursor_row + 1 < ed.lines.len() {
@@ -2574,8 +2793,24 @@ fn editor_handle_key(console: &mut Console, ed: &mut EditorState, event: keyboar
                         ed.cursor_col = 0;
                     }
                 }
-                keyboard::Event::Up => ed.move_vertically(console.cols(), -1),
-                keyboard::Event::Down => ed.move_vertically(console.cols(), 1),
+                keyboard::Event::Up => {
+                    let shift = keyboard::shift_down();
+                    if shift {
+                        ed.begin_selection();
+                    } else {
+                        ed.clear_selection();
+                    }
+                    ed.move_vertically(console.cols(), -1);
+                }
+                keyboard::Event::Down => {
+                    let shift = keyboard::shift_down();
+                    if shift {
+                        ed.begin_selection();
+                    } else {
+                        ed.clear_selection();
+                    }
+                    ed.move_vertically(console.cols(), 1);
+                }
                 keyboard::Event::Escape
                 | keyboard::Event::F2
                 | keyboard::Event::F3
@@ -2628,6 +2863,64 @@ fn editor_render(console: &mut Console, ed: &mut EditorState) {
     for ch in status_text.chars() {
         tx += font::draw_console_cp(console, tx, sy, ch, EDITOR_STATUS_FG, None);
     }
+    // Selection highlight: an accent bar over every visible segment of
+    // the selection, with the covered glyphs redrawn in white on top.
+    if let Some(((sr, sc), (er, ec))) = ed.selection_bounds() {
+        let cols = console.cols();
+        let sel_bg = 0x00_2A5AA0;
+        let sel_fg = 0x00_FFFFFF;
+        for (vr, &(li, cs)) in vrows.iter().enumerate().skip(ed.scroll_offset).take(doc_rows) {
+            let line = &ed.lines[li];
+            let chars: Vec<char> = line.chars().collect();
+            // Char-offset range of this visual row within its logical
+            // line (with wrap on, rows break at `cols` cells).
+            let mut cells = 0usize;
+            let mut row_end = chars.len();
+            for (i, &ch) in chars.iter().enumerate().skip(cs) {
+                let w = font::char_cells(ch) as usize;
+                if ed.wrap && cells + w > cols {
+                    row_end = i;
+                    break;
+                }
+                cells += w;
+            }
+            // The selection's span inside this logical line.
+            let (sel_lo, sel_hi) = if li == sr && li == er {
+                (sc, ec)
+            } else if li == sr {
+                (sc, chars.len())
+            } else if li == er {
+                (0, ec)
+            } else if li > sr && li < er {
+                (0, chars.len())
+            } else {
+                continue;
+            };
+            let lo = sel_lo.max(cs);
+            let hi = sel_hi.min(row_end);
+            if lo >= hi {
+                continue;
+            }
+            let rel = vr.saturating_sub(ed.scroll_offset);
+            if rel >= doc_rows {
+                continue;
+            }
+            let y = rel as u32 * row_h;
+            let mut x0 = 0u32;
+            for &ch in chars.iter().skip(cs).take(lo - cs) {
+                x0 += font::char_width(ch);
+            }
+            let mut w = 0u32;
+            for &ch in chars.iter().skip(lo).take(hi - lo) {
+                w += font::char_width(ch);
+            }
+            gfx::fill_rect(console, x0, y, w, row_h, sel_bg);
+            let mut gx = x0;
+            for &ch in chars.iter().skip(lo).take(hi - lo) {
+                gx += font::draw_console_cp(console, gx, y, ch, sel_fg, Some(sel_bg));
+            }
+        }
+    }
     let visible = cursor_vr
         .saturating_sub(ed.scroll_offset)
         .min(doc_rows.saturating_sub(1));
@@ -2649,6 +2942,62 @@ fn editor_render(console: &mut Console, ed: &mut EditorState) {
         .map(font::char_width)
         .unwrap_or(font::glyph_w() as u32);
     gfx::fill_rect(console, cx, cy, cw_cursor, row_h, EDITOR_CURSOR_COLOR);
+}
+
+/// The logical (row, col) under a content-local pixel point, or `None`
+/// for the status bar / outside the document. Wide glyphs advance two
+/// cells; a click in the left half of a wide char selects it.
+fn editor_cell_at(console: &Console, ed: &EditorState, x: i32, y: i32) -> Option<(usize, usize)> {
+    if x < 0 || y < 0 {
+        return None;
+    }
+    // The last console row is the status bar — clicks there don't move
+    // the cursor.
+    let row_h = font::console_row_h() as u32;
+    if y as u32 >= (console.rows() as u32).saturating_sub(1) * row_h {
+        return None;
+    }
+    let vr = (y as u32 / row_h) as usize + ed.scroll_offset;
+    let vrows = ed.visual_rows(console.cols());
+    let (li, cs) = *vrows.get(vr)?;
+    let chars: Vec<char> = ed.lines[li].chars().collect();
+    let mut px = 0u32;
+    let mut col = cs;
+    for &ch in chars.iter().skip(cs) {
+        let w = font::char_width(ch);
+        if px + w / 2 >= x as u32 {
+            break;
+        }
+        px += w;
+        col += 1;
+    }
+    Some((li, col))
+}
+
+/// Click-to-position: moves the editor cursor (clearing any selection;
+/// Shift keeps it and extends from the current anchor).
+fn editor_mouse_click(console: &Console, ed: &mut EditorState, x: i32, y: i32, shift: bool) {
+    let Some((row, col)) = editor_cell_at(console, ed, x, y) else {
+        return;
+    };
+    if shift {
+        ed.begin_selection();
+    } else {
+        ed.clear_selection();
+    }
+    ed.cursor_row = row;
+    ed.cursor_col = col;
+}
+
+/// Drag-to-select: anchors the selection on the first move and extends
+/// it as the mouse travels (the WM owns the button until release).
+fn editor_mouse_drag(console: &Console, ed: &mut EditorState, x: i32, y: i32) {
+    let Some((row, col)) = editor_cell_at(console, ed, x, y) else {
+        return;
+    };
+    ed.begin_selection();
+    ed.cursor_row = row;
+    ed.cursor_col = col;
 }
 
 fn taskbar_label_width(title: &str) -> i32 {

@@ -2353,6 +2353,13 @@ impl LineEditor {
                 self.history_index = None;
                 Feed::Pending
             }
+            keyboard::Event::Ctrl('c') => {
+                // Copy the current input line. The terminal has no
+                // scrollback or selection model yet, so the line being
+                // typed is the one useful thing to grab.
+                crate::clipboard::copy_text(self.line.clone());
+                Feed::Pending
+            }
             keyboard::Event::Ctrl(_) => Feed::Pending,
         }
     }
