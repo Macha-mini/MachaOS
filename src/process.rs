@@ -365,6 +365,12 @@ impl Process {
         self.parent
     }
 
+    /// Re-points or clears the parent (task reaping shifts indices; an
+    /// orphaned process — its parent was reaped — gets `None`).
+    pub(crate) fn set_parent(&mut self, parent: Option<usize>) {
+        self.parent = parent;
+    }
+
     /// Immutable fd access (for `dup` — the entry is copied out).
     pub fn fd(&self, fd: usize) -> Option<&FdEntry> {
         self.fds.get(fd)?.as_ref()

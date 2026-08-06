@@ -731,22 +731,6 @@ pub fn process_is_exited(pid: usize) -> bool {
     }
 }
 
-/// Consumes a child's exit state after `wait4` reported it (the zombie
-/// is gone; the task itself stays until `process::reap` frees it).
-pub fn reap_exit_status(pid: usize) {
-    let tasks = tasks_mut();
-    if let Some(task) = tasks.get_mut(pid) {
-        if let Some(process) = task.process.as_mut() {
-            unsafe {
-                core::ptr::write_volatile(
-                    core::ptr::addr_of_mut!(process.exit_info),
-                    None,
-                );
-            }
-        }
-    }
-}
-
 /// The process's segment mappings, used by `process::read_result` to
 /// translate a virtual address to a physical frame.
 pub fn process_mappings(pid: usize) -> Option<&'static [crate::process::Mapping]> {
@@ -849,6 +833,19 @@ pub fn current_is_thread() -> bool {
 /// indices ("pids") stay stable — waitpid/child tracking and CLONE_VM
 /// `thread_of` references rely on that. Call with interrupts disabled
 /// (the caller owns the freed frames afterwards).
+///
+/// Removing a mid-table task shifts every later index down one; this
+/// keeps the rest of the table consistent:
+/// - the removed process's dead CLONE_VM threads are dropped first (from
+///   the highest index down, so nothing shifts underneath) — an exited
+///   owner's threads are flagged exited too (`mark_current_exited` /
+///   `mark_current_exited_group`), and their `thread_of` link would
+///   otherwise dangle onto the wrong task after the shift;
+/// - every remaining task's stored index reference (`Process::parent`,
+///   `Task::thread_of`) above the removed slot is decremented;
+/// - processes whose `parent` was exactly the removed process are
+///   orphaned (set to `None`) instead of left pointing at themselves or
+///   an unrelated task.
 pub fn remove_process(pid: usize) -> Option<Process> {
     let tasks = tasks_mut();
     if pid >= tasks.len() {
@@ -858,9 +855,45 @@ pub fn remove_process(pid: usize) -> Option<Process> {
     if current == pid {
         return None;
     }
+    // Drop the owner's dead threads first, highest index first, so each
+    // `remove` only shifts indices we've already passed. A live thread of
+    // an exited owner can't exist (exiting marks the whole group), so
+    // this is pure garbage collection.
+    let mut i = tasks.len();
+    let mut removed_below_current = 0usize;
+    while i > 0 {
+        i -= 1;
+        if i == pid {
+            continue;
+        }
+        if tasks[i].thread_of == Some(pid) && tasks[i].thread_exited {
+            tasks.remove(i);
+            if i < current {
+                removed_below_current += 1;
+            }
+        }
+    }
     let task = tasks.remove(pid);
     if pid < current {
-        CURRENT.store(current - 1, Ordering::Relaxed);
+        removed_below_current += 1;
+    }
+    if removed_below_current > 0 {
+        CURRENT.store(current - removed_below_current, Ordering::Relaxed);
+    }
+    // Re-point every remaining reference that crossed the removed slot.
+    for t in tasks.iter_mut() {
+        if let Some(process) = &mut t.process {
+            match process.parent() {
+                Some(par) if par == pid => process.set_parent(None),
+                Some(par) if par > pid => process.set_parent(Some(par - 1)),
+                _ => {}
+            }
+        }
+        match t.thread_of {
+            Some(own) if own == pid => t.thread_of = None, // defensive; threads of the owner were removed above
+            Some(own) if own > pid => t.thread_of = Some(own - 1),
+            _ => {}
+        }
     }
     task.process
 }

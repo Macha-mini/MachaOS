@@ -836,14 +836,19 @@ fn sys_wait4(pid: u64, wstatus: u64, options: u64, _rusage: u64) -> u64 {
         for cand in 0..count {
             // `-1`/`0` wait for any *child* of the caller (pid 0 also
             // means "same process group" — there are no groups, so it
-            // behaves like -1). Only the caller's own fork children
-            // count: an unrelated exited-but-unreaped process must not
-            // satisfy the wait, or a shell's `waitpid(-1)` loop would
-            // spin on a stale pid forever.
+            // behaves like -1). A specific pid is matched only if it is
+            // also the caller's own child (real `waitpid` on a
+            // non-child is ECHILD, and a wrong-parent match would now
+            // *free* the target's address space — this is no longer a
+            // read-only zombie peek). Only the caller's own fork
+            // children count: an unrelated exited-but-unreaped process
+            // must not satisfy the wait, or a shell's `waitpid(-1)`
+            // loop would spin on a stale pid forever.
             let is_match = if target == -1 || target == 0 {
                 crate::task::process_parent(cand) == Some(crate::task::current_pid())
             } else {
                 cand as i64 == target
+                    && crate::task::process_parent(cand) == Some(crate::task::current_pid())
             };
             if !is_match {
                 continue;
@@ -857,17 +862,15 @@ fn sys_wait4(pid: u64, wstatus: u64, options: u64, _rusage: u64) -> u64 {
                 break;
             }
         }
-        if found.is_none() && any_child && !any_alive {
-            // Every matching child is an already-reaped zombie (or
-            // never existed): `waitpid` reports ECHILD.
+        if found.is_none() && (!any_child || !any_alive) {
+            // `waitpid` reports ECHILD both when there are no matching
+            // children at all (the wait4-reaped ones below are removed
+            // from the table entirely, so a second `waitpid(-1)` finds
+            // nothing) and when every matching child is an already-reaped
+            // zombie. BusyBox's `waitpid(-1)` loop ends exactly there.
             return err(ECHILD);
         }
         if let Some((cand, info)) = found {
-            // Reap the exit state: like Linux, `wait4` consumes the
-            // child's zombie — a later `wait4` must not see the same
-            // child again (BusyBox's `waitpid(-1)` loop spun on the
-            // never-reaped first child of its pipeline).
-            crate::task::reap_exit_status(cand);
             let status = match info {
                 crate::process::ExitInfo::Normal => 0u64 << WIFEXITED_SHIFT,
                 crate::process::ExitInfo::PageFault { .. } => 11, // SIGSEGV
@@ -881,6 +884,18 @@ fn sys_wait4(pid: u64, wstatus: u64, options: u64, _rusage: u64) -> u64 {
                     }
                 }
             }
+            // Consume the whole zombie, not just its exit mark: like
+            // Linux, `wait4` reaps the child — the task-table slot and
+            // every frame it owned (page tables, segments, the whole
+            // 1 MiB stack region) are released. Previously only the
+            // exit state was cleared, so every internally-forked child
+            // (e.g. each command of a busybox sh pipeline) leaked its
+            // address space and its task slot forever, growing the
+            // table without bound. A later `wait4` must not see the
+            // same child again either — removal guarantees that
+            // (BusyBox's `waitpid(-1)` loop spun on the never-reaped
+            // first child of its pipeline).
+            crate::process::reap(cand);
             return cand as u64;
         }
         if options & WNOHANG != 0 {
