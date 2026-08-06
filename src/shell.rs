@@ -1517,6 +1517,45 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2h: Phase 7 integration against a real
+    // third-party binary — BusyBox ash running a pipeline
+    // (`echo … | /bin/cat.elf`), which needs fork + pipe2 + dup2 +
+    // execve (of a real dynamically-linked glibc binary) + wait4 all
+    // working together. The pipeline's stdout lands on the console.
+    // BusyBox is loaded from the disk (its ET_EXEC segments sit at
+    // 4 MiB — embedding it in the kernel image would collide with the
+    // kernel's own data there).
+    let busybox = match fat::read_file("/bin/busybox.elf") {
+        Ok(b) => b,
+        Err(e) => selftest_fail(&format!("busybox read failed: {e}")),
+    };
+    let pid = crate::process::spawn_linux(
+        &busybox,
+        "busybox-sh",
+        &[
+            "sh",
+            "-c",
+            "echo hello from pipeline | /bin/cat.elf > /users/macha/Documents/cat-test.txt",
+        ],
+        &[],
+    )
+    .unwrap_or_else(|e| selftest_fail(&format!("busybox spawn failed: {e}")));
+    match crate::process::wait(pid, 800) {
+        Some(process::ExitInfo::Normal) => println!("[OK] busybox sh exited normally"),
+        other => selftest_fail(&format!("busybox-sh process gave unexpected exit: {:?}", other)),
+    }
+    match fat::read_file("/users/macha/Documents/cat-test.txt") {
+        Ok(data) if data == b"hello from pipeline\n" => println!(
+            "[OK] busybox sh: fork + pipe + execve (dynamic) + redirect pipeline worked"
+        ),
+        Ok(data) => selftest_fail(&format!(
+            "cat-test output mismatch (got {:?})",
+            String::from_utf8_lossy(&data)
+        )),
+        Err(e) => selftest_fail(&format!("cat-test file read failed: {e}")),
+    }
+    crate::process::reap(pid);
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.

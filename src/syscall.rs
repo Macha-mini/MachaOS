@@ -81,6 +81,17 @@ static mut SYSCALL_STACK: [u8; SYSCALL_STACK_SIZE] = [0; SYSCALL_STACK_SIZE];
 static mut SYSCALL_KERNEL_RSP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut SAVED_USER_RSP: u64 = 0;
+/// Sysretq needs the dispatch's return value (rax) and the user's rflags
+/// (r11) to survive the `syscall_load_user_rsp` call — park them here
+/// while it runs.
+#[unsafe(no_mangle)]
+static mut SAVED_RETVAL_SCRATCH: u64 = 0;
+#[unsafe(no_mangle)]
+static mut SAVED_RFLAGS_SCRATCH: u64 = 0;
+/// rcx holds the user's rip for `sysretq`; the helper call clobbers it
+/// too, so it gets parked here alongside rax/r11.
+#[unsafe(no_mangle)]
+static mut SAVED_RIP_SCRATCH: u64 = 0;
 /// Set by `.Lsyscall_exit` when the exiting syscall was `exit_group`
 /// (231) rather than plain `exit` (60) — the thread exit stub uses it to
 /// decide whether to take the whole process down too.
@@ -127,6 +138,31 @@ extern "C" fn ring3_save_return_rsp(rsp: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn ring3_load_return_rsp() -> u64 {
     crate::task::current_ring3_return_rsp()
+}
+
+/// Asm bridge: store the ring-3 rsp of the syscall that just entered —
+/// per task, because the asm's global `SAVED_USER_RSP` is clobbered by
+/// other tasks' syscalls while this one is suspended in a blocking
+/// syscall (the `sysretq` return path must use this copy).
+#[unsafe(no_mangle)]
+extern "C" fn syscall_save_user_rsp(rsp: u64) {
+    crate::task::save_current_user_rsp(rsp);
+}
+
+/// Asm bridge: the current task's saved ring-3 rsp (see
+/// `syscall_save_user_rsp`).
+#[unsafe(no_mangle)]
+extern "C" fn syscall_load_user_rsp() -> u64 {
+    crate::task::current_user_rsp()
+}
+
+/// Copies the asm's global `SAVED_USER_RSP` into the current task's
+/// per-task slot. Called at the top of the generic dispatch (the
+/// forkish path does the same inline); the `sysretq` return path then
+/// reads the per-task copy, which survives other tasks' syscalls.
+pub(crate) fn snapshot_saved_user_rsp() {
+    let rsp = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SAVED_USER_RSP)) };
+    crate::task::save_current_user_rsp(rsp);
 }
 
 /// Whether `num` should take the "never returns to ring 3" unwind path
@@ -189,6 +225,7 @@ extern "C" fn sys_forkish(num: u64, block: *const u64) -> u64 {
     let a5 = read(7);
     let a6 = read(6);
     let user_rsp = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(SAVED_USER_RSP)) };
+    crate::task::save_current_user_rsp(user_rsp);
     crate::process::handle_forkish(
         num, user_rip, user_rflags, user_rsp, a1, a2, a3, a4, a5, a6, callee_saved,
     )
@@ -333,7 +370,19 @@ syscall_entry:
 
     pop r11
     pop rcx
-    mov rsp, [rip + SAVED_USER_RSP]
+    # The global SAVED_USER_RSP is clobbered by other tasks' syscalls
+    # while this one was suspended in a blocking syscall (wait4/pipe
+    # read/futex wait), so the return rsp comes from the task's own
+    # saved copy — and rax/r11/rcx (the result, rflags and rip sysretq
+    # needs) survive the helper call via the scratch slots.
+    mov [rip + SAVED_RFLAGS_SCRATCH], r11
+    mov [rip + SAVED_RETVAL_SCRATCH], rax
+    mov [rip + SAVED_RIP_SCRATCH], rcx
+    call syscall_load_user_rsp
+    mov rsp, rax
+    mov rax, [rip + SAVED_RETVAL_SCRATCH]
+    mov r11, [rip + SAVED_RFLAGS_SCRATCH]
+    mov rcx, [rip + SAVED_RIP_SCRATCH]
     sysretq
 .Lsyscall_exec_restart:
     # Iretq into the new program like enter_usermode does — the handler
@@ -409,7 +458,17 @@ syscall_entry:
     mov r8,  [rsp + 56]
     mov r9,  [rsp + 48]
     add rsp, 120
-    mov rsp, [rip + SAVED_USER_RSP]
+    # Same per-task rsp treatment as the normal return path (this path
+    # is synchronous so the global is still valid, but keeping one code
+    # shape for both is cheaper than explaining the difference).
+    mov [rip + SAVED_RFLAGS_SCRATCH], r11
+    mov [rip + SAVED_RETVAL_SCRATCH], rax
+    mov [rip + SAVED_RIP_SCRATCH], rcx
+    call syscall_load_user_rsp
+    mov rsp, rax
+    mov rax, [rip + SAVED_RETVAL_SCRATCH]
+    mov r11, [rip + SAVED_RFLAGS_SCRATCH]
+    mov rcx, [rip + SAVED_RIP_SCRATCH]
     sysretq
 
 # Resume point for a fork/clone child. The child task's fabricated
@@ -448,6 +507,10 @@ enter_usermode:
     sub rsp, 8
     call ring3_save_return_rsp
     add rsp, 8
+    # Re-park the exit chain below the syscall-stack region: the chain
+    # at this frame's depth gets overwritten by the deepest syscall
+    # frames (fork_copy), which corrupted the exit's ret slot.
+    call ring3_repark_chain
     mov rdi, rbx
     mov rsi, r12
 
@@ -582,6 +645,11 @@ fn sys_recv(ptr: u64, maxlen: u64) -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> u64 {
+    // Snapshot the ring-3 rsp into this task (see
+    // `snapshot_saved_user_rsp`) — the native ABI's sysretq return reads
+    // it back per task too, and the global `SAVED_USER_RSP` is
+    // clobbered by other tasks' syscalls while this one blocks.
+    snapshot_saved_user_rsp();
     // A Linux-ABI process (see `process::Abi`) dispatches through an
     // entirely separate syscall table/numbering/error convention
     // (`linux_abi.rs`) instead of the native one below. `run_demo`'s

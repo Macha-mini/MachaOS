@@ -177,6 +177,9 @@ use crate::vfs;
 // ---- errno -----------------------------------------------------------
 
 const EBADF: i32 = 9;
+/// No child processes (or all already reaped) — `waitpid`'s terminal
+/// condition; a shell's `waitpid(-1)` loop ends here.
+const ECHILD: i32 = 10;
 const EFAULT: i32 = 14;
 const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
@@ -257,9 +260,28 @@ const SYS_EXECVE: u64 = 59;
 const SYS_WAIT4: u64 = 61;
 const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
+/// x86_64's own `dup2` number (32/33 are the i386 numbers; musl uses 63
+/// on this arch).
+const SYS_DUP2_64: u64 = 63;
 const SYS_GETTID: u64 = 186;
 const SYS_DUP3: u64 = 292;
 const SYS_PIPE2: u64 = 293;
+/// Legacy `pipe(pipefd)` — BusyBox ash uses this instead of `pipe2`.
+const SYS_PIPE: u64 = 22;
+/// Legacy `open(path, flags, mode)` — static musl binaries call this
+/// instead of `openat` (musl's `open` wrapper uses SYS_open = 2).
+const SYS_OPEN: u64 = 2;
+/// Legacy `stat(path, buf)` / `lstat(path, buf)` — same layout as
+/// `newfstatat`, which is what the modern wrapper ends up calling.
+const SYS_STAT: u64 = 4;
+const SYS_LSTAT: u64 = 6;
+const SYS_GETPPID: u64 = 110;
+const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c; // -100
+/// `fcntl(2)` — BusyBox uses F_DUPFD/F_GETFD/F_SETFD/F_GETFL/F_SETFL.
+const SYS_FCNTL: u64 = 72;
+/// `fcntl64` — glibc's 64-bit-offset variant; the commands this kernel
+/// implements are identical to `fcntl`.
+const SYS_FCNTL64: u64 = 221;
 
 // ---- helpers ------------------------------------------------------------
 
@@ -334,39 +356,78 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
         return err(EFAULT);
     };
     let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, count as usize) };
+    // An fd-table entry wins over the stdio fallback: a shell redirect
+    // dup2's the target onto fd 1/2, and fd 1/2 only mean "the serial"
+    // when nothing is installed there.
+    let routed = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::File(h)) => Some(match h.write(bytes) {
+            Ok(n) => n as u64,
+            Err(e) => vfs_err(e),
+        }),
+        Some(FdEntry::Shm(id, cursor)) => Some(shm_write(*id, cursor, bytes) as u64),
+        Some(FdEntry::Socket(id)) => {
+            Some(socket::send(*id, bytes, &[]).map(|n| n as u64).unwrap_or(err(EPIPE)))
+        }
+        Some(FdEntry::Pipe(id, _)) => {
+            let n = crate::pipe::write(*id, bytes);
+            Some(if n == 0 { err(EPIPE) } else { n as u64 })
+        }
+        None => None,
+    });
+    let routed = routed.flatten();
+    if let Some(r) = routed {
+        return r;
+    }
     if fd == 1 || fd == 2 {
         for &b in bytes {
             crate::io::print(core::format_args!("{}", b as char));
         }
         return bytes.len() as u64;
     }
-    if fd < 3 {
-        return err(EBADF); // fd 0 (stdin) isn't writable
-    }
-    with_process(|p| match p.fd_mut(fd as usize) {
-        Some(FdEntry::File(h)) => match h.write(bytes) {
-            Ok(n) => n as u64,
-            Err(e) => vfs_err(e),
-        },
-        Some(FdEntry::Shm(id, cursor)) => shm_write(*id, cursor, bytes) as u64,
-        Some(FdEntry::Socket(id)) => socket::send(*id, bytes, &[]).map(|n| n as u64).unwrap_or(err(EPIPE)),
-        Some(FdEntry::Pipe(id, _)) => {
-            let n = crate::pipe::write(*id, bytes);
-            if n == 0 {
-                err(EPIPE)
-            } else {
-                n as u64
-            }
-        }
-        None => err(EBADF),
-    })
-    .unwrap_or(err(EBADF))
+    err(EBADF) // fd 0 (stdin) isn't writable, and nothing else exists
 }
 
 fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
     let Some(phys) = resolve(buf, count) else {
         return err(EFAULT);
     };
+    // An fd-table entry wins over the stdio fallback (same rule as
+    // `sys_write`): `cat < file` / `echo x | cat` install a file or
+    // pipe onto fd 0, and fd 0 only means "the keyboard" when nothing
+    // is installed there.
+    let routed = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::File(h)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            Some(h.read(out) as u64)
+        }
+        Some(FdEntry::Shm(id, cursor)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            Some(shm_read(*id, cursor, out) as u64)
+        }
+        Some(FdEntry::Pipe(id, _)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            Some(crate::pipe::read(*id, out) as u64)
+        }
+        Some(FdEntry::Socket(id)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            let (n, fds) = socket::recv(*id, out);
+            // A plain `read()` can't carry `SCM_RIGHTS` — any fds that
+            // happened to be queued on this message are lost, same as
+            // real Linux. Nothing in this kernel's own protocol
+            // (`wayland.rs`) ever mixes a data-only `read()` with an
+            // fd-bearing message, so this path is a defensive fallback,
+            // not a real one.
+            for fid in fds {
+                shm::close(fid);
+            }
+            Some(n as u64)
+        }
+        None => None,
+    });
+    let routed = routed.flatten();
+    if let Some(r) = routed {
+        return r;
+    }
     if fd == 0 {
         let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
         let mut n = 0usize;
@@ -382,40 +443,7 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
         }
         return n as u64;
     }
-    if fd < 3 {
-        return err(EBADF); // fd 1/2 (stdout/stderr) aren't readable
-    }
-    with_process(|p| match p.fd_mut(fd as usize) {
-        Some(FdEntry::File(h)) => {
-            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
-            let n = h.read(out);
-            n as u64
-        }
-        Some(FdEntry::Shm(id, cursor)) => {
-            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
-            shm_read(*id, cursor, out) as u64
-        }
-        Some(FdEntry::Pipe(id, _)) => {
-            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
-            crate::pipe::read(*id, out) as u64
-        }
-        Some(FdEntry::Socket(id)) => {
-            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
-            let (n, fds) = socket::recv(*id, out);
-            // A plain `read()` can't carry `SCM_RIGHTS` — any fds that
-            // happened to be queued on this message are lost, same as
-            // real Linux. Nothing in this kernel's own protocol
-            // (`wayland.rs`) ever mixes a data-only `read()` with an
-            // fd-bearing message, so this path is a defensive fallback,
-            // not a real one.
-            for fid in fds {
-                shm::close(fid);
-            }
-            n as u64
-        }
-        None => err(EBADF),
-    })
-    .unwrap_or(err(EBADF))
+    err(EBADF) // fd 1/2 (stdout/stderr) aren't readable
 }
 
 fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
@@ -570,24 +598,49 @@ fn sys_wait4(pid: u64, wstatus: u64, options: u64, _rusage: u64) -> u64 {
     let status_ptr = wstatus;
     let target = pid as i64;
     loop {
-        // Find an exited process matching the request.
+        // Find an exited process matching the request, and remember
+        // whether *any* child matches at all (so "all my children are
+        // reaped zombies" can return ECHILD like Linux instead of
+        // spinning — BusyBox's `waitpid(-1)` loop ends exactly there).
         let mut found: Option<(usize, crate::process::ExitInfo)> = None;
+        let mut any_child = false;
+        let mut any_alive = false;
         let count = crate::task::task_count();
         for cand in 0..count {
+            // `-1`/`0` wait for any *child* of the caller (pid 0 also
+            // means "same process group" — there are no groups, so it
+            // behaves like -1). Only the caller's own fork children
+            // count: an unrelated exited-but-unreaped process must not
+            // satisfy the wait, or a shell's `waitpid(-1)` loop would
+            // spin on a stale pid forever.
             let is_match = if target == -1 || target == 0 {
-                true
+                crate::task::process_parent(cand) == Some(crate::task::current_pid())
             } else {
                 cand as i64 == target
             };
             if !is_match {
                 continue;
             }
+            any_child = true;
+            if !crate::task::process_is_exited(cand) {
+                any_alive = true;
+            }
             if let Some(info) = crate::task::process_exit_status(cand) {
                 found = Some((cand, info));
                 break;
             }
         }
+        if found.is_none() && any_child && !any_alive {
+            // Every matching child is an already-reaped zombie (or
+            // never existed): `waitpid` reports ECHILD.
+            return err(ECHILD);
+        }
         if let Some((cand, info)) = found {
+            // Reap the exit state: like Linux, `wait4` consumes the
+            // child's zombie — a later `wait4` must not see the same
+            // child again (BusyBox's `waitpid(-1)` loop spun on the
+            // never-reaped first child of its pipeline).
+            crate::task::reap_exit_status(cand);
             let status = match info {
                 crate::process::ExitInfo::Normal => 0u64 << WIFEXITED_SHIFT,
                 crate::process::ExitInfo::PageFault { .. } => 11, // SIGSEGV
@@ -635,6 +688,72 @@ fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     })
     .flatten()
     .unwrap_or(err(EBADF))
+}
+
+/// `fcntl(fd, cmd, arg)` — the subset a shell needs: fd duplication
+/// (F_DUPFD), the close-on-exec flag (F_GETFD/F_SETFD), and the file
+/// status flags (F_GETFL/F_SETFL — only the access mode and O_APPEND
+/// are tracked; the rest are accepted and ignored).
+fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+    const F_DUPFD: u64 = 0;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETFL: u64 = 3;
+    const F_SETFL: u64 = 4;
+    const FD_CLOEXEC: u64 = 1;
+    const O_ACCMODE: u64 = 0b11;
+    const O_APPEND: u64 = 0o2000;
+    match cmd {
+        F_DUPFD => {
+            let min = arg as usize;
+            with_process(|p| {
+                let entry = p.fd(fd as usize)?;
+                let dup = entry.dup()?;
+                let mut slot = min;
+                while p.fd(slot).is_some() {
+                    slot += 1;
+                }
+                let clo = p.cloexec(fd as usize);
+                let new = p.alloc_fd(dup);
+                p.set_cloexec(new, clo);
+                Some(new as u64)
+            })
+            .flatten()
+            .unwrap_or(err(EBADF))
+        }
+        F_GETFD => with_process(|p| {
+            if p.fd(fd as usize).is_some() {
+                Some(if p.cloexec(fd as usize) { FD_CLOEXEC } else { 0 })
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .unwrap_or(err(EBADF)),
+        F_SETFD => with_process(|p| {
+            if p.set_cloexec(fd as usize, arg & FD_CLOEXEC != 0) {
+                Some(0)
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .unwrap_or(err(EBADF)),
+        F_GETFL => with_process(|p| {
+            // Only the access mode is reported; O_APPEND/O_NONBLOCK are
+            // not tracked per-fd yet, so 2 (O_RDWR) is the safe answer
+            // for anything callers are likely to probe.
+            if p.fd(fd as usize).is_some() {
+                Some(2u64)
+            } else {
+                None
+            }
+        })
+        .flatten()
+        .unwrap_or(err(EBADF)),
+        F_SETFL => 0, // O_NONBLOCK etc.: accepted, not implemented
+        _ => err(EINVAL),
+    }
 }
 
 /// `pipe2(pipefd, flags)`: creates a pipe and writes the read-end fd to
@@ -1366,6 +1485,9 @@ fn sys_sysinfo(info_ptr: u64) -> u64 {
 
 /// Dispatches one Linux-numbered syscall.
 pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64, arg6: u64) -> u64 {
+    // Snapshot the ring-3 rsp into this task (see `syscall_save_user_rsp`
+    // in syscall.rs) — the asm's sysretq return reads it back per task.
+    crate::syscall::snapshot_saved_user_rsp();
     let ret = match num {
         SYS_READ => sys_read(arg1, arg2, arg3),
         SYS_WRITE => sys_write(arg1, arg2, arg3),
@@ -1389,7 +1511,10 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_SET_TID_ADDRESS => crate::task::current_pid() as u64,
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg1, arg2),
         SYS_OPENAT => sys_openat(arg1, arg2, arg3, arg4),
+        SYS_OPEN => sys_openat(AT_FDCWD, arg1, arg2, arg3),
         SYS_NEWFSTATAT => sys_newfstatat(arg1, arg2, arg3, arg4),
+        SYS_STAT => sys_newfstatat(AT_FDCWD, arg1, arg2, 0),
+        SYS_LSTAT => sys_newfstatat(AT_FDCWD, arg1, arg2, 0),
         SYS_SET_ROBUST_LIST => 0,
         SYS_GETRANDOM => sys_getrandom(arg1, arg2, arg3),
         SYS_FUTEX => sys_futex(arg1, arg2, arg3, arg4),
@@ -1409,12 +1534,17 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_WAIT4 => sys_wait4(arg1, arg2, arg3, arg4),
         SYS_DUP => sys_dup(arg1),
         SYS_DUP2 => sys_dup2(arg1, arg2),
+        SYS_DUP2_64 => sys_dup2(arg1, arg2),
         SYS_DUP3 => {
             // dup3(oldfd, newfd, flags): flags are all O_CLOEXEC-ish,
             // which this kernel doesn't track — behave like dup2.
             sys_dup2(arg1, arg2)
         }
         SYS_PIPE2 => sys_pipe2(arg1, arg2),
+        SYS_PIPE => sys_pipe2(arg1, 0),
+        SYS_FCNTL => sys_fcntl(arg1, arg2, arg3),
+        SYS_FCNTL64 => sys_fcntl(arg1, arg2, arg3),
+        SYS_GETPPID => 0, // no parent tracking yet — 0 is a valid "no parent"
         _ => {
             let mut buf = [0u8; 64];
             let msg = crate::io::sprint(&mut buf, format_args!("[UNKSYSCALL] num={}\n", num));

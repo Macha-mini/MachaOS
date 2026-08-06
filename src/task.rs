@@ -132,6 +132,12 @@ struct Task {
     // `Some(futex address)` while the task is blocked in FUTEX_WAIT;
     // the scheduler skips blocked tasks and `futex_wake` clears it.
     block_key: Option<u64>,
+    /// The ring-3 rsp this task had when it entered its most recent
+    /// syscall — the asm's global `SAVED_USER_RSP` is overwritten by
+    /// every other task's syscalls while this one is suspended in a
+    /// blocking syscall (wait4/pipe read/futex wait), so the return
+    /// path must read this per-task copy instead.
+    saved_user_rsp: u64,
 }
 
 impl Task {
@@ -153,28 +159,12 @@ const QUANTUM_TICKS: u64 = 5; // 50ms at the 100Hz PIT rate
 
 /// Bytes of headroom kept below `kernel_stack_top` when programming
 /// TSS.RSP0 for a task (see `scheduler_tick`'s `set_kernel_stack` call).
-///
-/// A process's `enter_usermode` (syscall.rs) "parks" a return chain —
-/// `process_entry_trampoline` -> `run_ring3` -> `enter_usermode`'s own
-/// 6 pushed registers, plus each frame's own return address — on this
-/// same 16 KiB buffer, at whatever depth that short call chain reaches,
-/// then does its `iretq` into ring 3. That parked chain isn't touched
-/// again until the process's `exit` syscall unwinds it (`.Lsyscall_exit`
-/// in syscall.rs). But every *other* trip through ring 0 while the
-/// process runs — any interrupt or exception, not just ones that kill
-/// the process — gets its stack frame from TSS.RSP0, which if pointed
-/// at the literal top would land *above* the parked chain and grow
-/// straight through it. A shallow handler (the timer tick) or one that
-/// never returns to ring 3 (`kill_current`, which redirects rip to
-/// `exit_self` instead of resuming) never surfaced this. A #PF that
-/// resolves and resumes ring 3 — `process::handle_fault`'s stack-growth
-/// path — calls deep enough (`pmm::alloc_contiguous`, `paging::map_range_in`)
-/// to overwrite it, corrupting the very state `exit` later needs,
-/// which showed up as `exit`'s `ret` landing on garbage. This reserve
-/// keeps every such trip through ring 0 confined below the parked chain
-/// instead. Comfortably covers that chain's actual depth (a handful of
-/// stack frames, well under 100 bytes) with room to spare.
-const RING3_PARK_RESERVE: u64 = 1024;
+/// Interrupt and syscall frames live in `[top - RESERVE, top)`. The
+/// deepest syscall (the fork/clone path's `fork_copy`) reaches ~1 KiB
+/// below the syscall entry, so 4 KiB gives it plenty of room, and the
+/// exit chains re-parked *below* the reserve (see `repark_exit_chain`)
+/// are never touched by any ring-0 trip.
+const RING3_PARK_RESERVE: u64 = 4096;
 
 /// IA32_FS_BASE — see `scheduler_tick`'s save/restore of
 /// `process::Process::fs_base` around a task switch.
@@ -214,6 +204,7 @@ pub fn init() {
         child_tid: None,
         thread_exited: false,
         block_key: None,
+        saved_user_rsp: 0,
     });
     spawn(counter_task_0, "bg-0");
     spawn(counter_task_1, "bg-1");
@@ -279,6 +270,7 @@ fn push_task(entry: usize, name: &'static str, cr3: u64, process: Option<Process
         child_tid: None,
         thread_exited: false,
         block_key: None,
+        saved_user_rsp: 0,
     });
     let pid = tasks().len() - 1;
     interrupts::enable_interrupts();
@@ -434,11 +426,14 @@ pub fn spawn_child(
         *chain_p.add(6) = exit_stub;
     }
     // Resume frame: [rbx rbp r12 r13 r14 r15] [child_resume] [r9 r8 r10
-    // rdx rsi rdi] [0] [rcx=rip] [r11=rflags] [rsp].
+    // rdx rsi rdi] [0] [rcx=rip] [r11=rflags] [rsp]. `context_switch`
+    // pops r15 r14 r13 r12 rbp rbx (in that order, from the frame's
+    // lowest address), so the callee-saved slots must be written
+    // *reversed*: [0]=r15 .. [5]=rbx.
     let frame = chain - 136;
     unsafe {
         let f = frame as *mut usize;
-        for (i, &v) in callee_saved.iter().enumerate() {
+        for (i, &v) in callee_saved.iter().rev().enumerate() {
             *f.add(i) = v as usize;
         }
         *f.add(6) = child_resume as usize;
@@ -469,6 +464,7 @@ pub fn spawn_child(
         child_tid,
         thread_exited: false,
         block_key: None,
+        saved_user_rsp: 0,
     });
     let pid = tasks().len() - 1;
     interrupts::enable_interrupts();
@@ -573,6 +569,52 @@ pub fn current_process_cr3() -> Option<u64> {
     }
 }
 
+/// The current task's name (diagnostics).
+pub fn current_name() -> &'static str {
+    tasks()[CURRENT.load(Ordering::Relaxed)].name
+}
+
+/// Re-parks the current task's exit chain at a fixed, safe location
+/// *below* the syscall-stack region (`[top - RESERVE, top)`): the
+/// original chain `enter_usermode` leaves at its own frame depth gets
+/// overwritten by the deepest syscall frames (the fork path's
+/// `fork_copy` reaches ~1 KiB below the syscall entry), which corrupted
+/// the chain's ret slot and made exits jump into user-stack garbage.
+/// Writing a fresh self-contained chain — 6 zero slots + the exit stub —
+/// and pointing `ring3_kernel_rsp` at it keeps exits deterministic no
+/// matter how deep the syscalls got.
+pub fn repark_exit_chain(exit_stub: usize) {
+    let current = CURRENT.load(Ordering::Relaxed);
+    let top = tasks()[current].kernel_stack_top;
+    let chain = (top - RING3_PARK_RESERVE - 4096) as usize;
+    unsafe {
+        let chain_p = chain as *mut usize;
+        for i in 0..6 {
+            *chain_p.add(i) = 0;
+        }
+        *chain_p.add(6) = exit_stub;
+    }
+    tasks_mut()[current].ring3_kernel_rsp = chain as u64;
+}
+
+/// The current task's kernel stack top (diagnostics).
+pub fn current_kernel_stack_top() -> u64 {
+    tasks()[CURRENT.load(Ordering::Relaxed)].kernel_stack_top
+}
+
+/// Saves the current task's ring-3 rsp at syscall entry; the asm's
+/// `sysretq`/exec-restart paths read it back via `current_user_rsp`
+/// (the global `SAVED_USER_RSP` can't be trusted after a blocking
+/// syscall — other tasks overwrite it).
+pub fn save_current_user_rsp(rsp: u64) {
+    tasks_mut()[CURRENT.load(Ordering::Relaxed)].saved_user_rsp = rsp;
+}
+
+/// The current task's saved ring-3 rsp (see `save_current_user_rsp`).
+pub fn current_user_rsp() -> u64 {
+    tasks()[CURRENT.load(Ordering::Relaxed)].saved_user_rsp
+}
+
 /// Runs `f` on the current task's process — its own, or the CLONE_VM
 /// owner's for a thread task. Used by `process::handle_fault` to grow the
 /// ring-3 stack from inside the #PF handler, where the fault could
@@ -648,7 +690,44 @@ pub fn process_exit_status(pid: usize) -> Option<ExitInfo> {
         if core::ptr::read_volatile(core::ptr::addr_of!(process.state)) != crate::process::ProcessState::Exited {
             return None;
         }
-        Some(core::ptr::read_volatile(core::ptr::addr_of!(process.exit_info)).unwrap())
+        // None once `wait4` reaped the zombie (see `reap_exit_status`).
+        core::ptr::read_volatile(core::ptr::addr_of!(process.exit_info))
+    }
+}
+
+/// The forking parent of the process at `pid` (see `Process::parent`).
+pub fn process_parent(pid: usize) -> Option<usize> {
+    tasks().get(pid)?.process.as_ref()?.parent()
+}
+
+/// True once the process at `pid` has exited (whether or not `wait4`
+/// already reaped the zombie).
+pub fn process_is_exited(pid: usize) -> bool {
+    let tasks = tasks();
+    let Some(task) = tasks.get(pid) else {
+        return false;
+    };
+    let Some(process) = task.process.as_ref() else {
+        return false;
+    };
+    unsafe {
+        core::ptr::read_volatile(core::ptr::addr_of!(process.state)) == crate::process::ProcessState::Exited
+    }
+}
+
+/// Consumes a child's exit state after `wait4` reported it (the zombie
+/// is gone; the task itself stays until `process::reap` frees it).
+pub fn reap_exit_status(pid: usize) {
+    let tasks = tasks_mut();
+    if let Some(task) = tasks.get_mut(pid) {
+        if let Some(process) = task.process.as_mut() {
+            unsafe {
+                core::ptr::write_volatile(
+                    core::ptr::addr_of_mut!(process.exit_info),
+                    None,
+                );
+            }
+        }
     }
 }
 

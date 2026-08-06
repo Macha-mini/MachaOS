@@ -70,7 +70,7 @@ wallpaper: $(WALLPAPER)
 fixtures:
 	@./tools/fetch-linux-fixtures.sh
 
-disk: wallpaper fixtures
+disk: wallpaper fixtures $(BUSYBOX)
 	@test -n "$$(command -v mkfs.fat)" || (echo "dosfstools (mkfs.fat) is required: brew install dosfstools"; exit 1)
 	dd if=/dev/zero of=$(DISK) bs=1m count=256 2>/dev/null
 	mkfs.fat -F 32 -s 8 $(DISK)
@@ -85,6 +85,10 @@ disk: wallpaper fixtures
 	mcopy -i $(DISK) target/hello ::/bin/hello.elf
 	mcopy -i $(DISK) target/coreutils-true ::/bin/true.elf
 	mcopy -i $(DISK) target/coreutils-cat ::/bin/cat.elf
+	# Phase 7: real BusyBox (static musl) for the sh-pipeline selftest.
+	# Not embedded in the kernel: busybox's ET_EXEC segments load at
+	# 4 MiB, which would collide with the kernel image's own data.
+	mcopy -i $(DISK) $(BUSYBOX) ::/bin/busybox.elf
 	mmd -i $(DISK) ::/lib64
 	mmd -i $(DISK) ::/lib
 	mmd -i $(DISK) ::/lib/x86_64-linux-gnu

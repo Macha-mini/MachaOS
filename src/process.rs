@@ -249,6 +249,13 @@ pub struct Process {
     /// Next address `Process::mmap_anon` hands out for a non-`MAP_FIXED`
     /// request.
     mmap_next: u64,
+    /// Parallel to `fds`: close-on-exec flag per fd (fcntl F_SETFD).
+    cloexec: Vec<bool>,
+    /// The task index of the process that forked this one — `wait4(-1)`
+    /// must only see *this* process's children, not unrelated exited
+    /// processes (a stale, never-reaped child from an earlier test made
+    /// BusyBox's `waitpid(-1)` loop forever).
+    parent: Option<usize>,
 }
 
 impl Process {
@@ -287,9 +294,44 @@ impl Process {
         self.fds.get_mut(fd)?.as_mut()
     }
 
+    /// The task index of the process that forked this one (`wait4(-1)`
+    /// child matching).
+    pub(crate) fn parent(&self) -> Option<usize> {
+        self.parent
+    }
+
     /// Immutable fd access (for `dup` — the entry is copied out).
     pub fn fd(&self, fd: usize) -> Option<&FdEntry> {
         self.fds.get(fd)?.as_ref()
+    }
+
+    /// Close-on-exec flag for `fd` (fcntl F_GETFD/F_SETFD). `execve`
+    /// drops any fd with this set, as real Linux does — without it a
+    /// pipeline's original pipe ends leak into the exec'd program and
+    /// the reader never sees EOF.
+    pub fn cloexec(&self, fd: usize) -> bool {
+        self.cloexec.get(fd).copied().unwrap_or(false)
+    }
+
+    /// Sets/clears the close-on-exec flag (`fcntl(F_SETFD)`).
+    pub fn set_cloexec(&mut self, fd: usize, on: bool) -> bool {
+        if fd >= self.fds.len() || self.fds[fd].is_none() {
+            return false;
+        }
+        while self.cloexec.len() <= fd {
+            self.cloexec.push(false);
+        }
+        self.cloexec[fd] = on;
+        true
+    }
+
+    /// Closes every fd with the close-on-exec flag (execve).
+    pub fn close_cloexec_fds(&mut self) {
+        for (i, slot) in self.fds.iter_mut().enumerate() {
+            if self.cloexec.get(i).copied().unwrap_or(false) && slot.is_some() {
+                *slot = None;
+            }
+        }
     }
 
     /// Places `entry` at exactly `fd` (the caller closed any previous
@@ -299,6 +341,9 @@ impl Process {
             while self.fds.len() <= fd {
                 self.fds.push(None);
             }
+        }
+        while self.cloexec.len() <= fd {
+            self.cloexec.push(false);
         }
         self.fds[fd] = Some(entry);
         fd
@@ -706,6 +751,8 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         heap_start: 0,
         heap_end: 0,
         mmap_next: MMAP_BASE,
+        cloexec: Vec::new(),
+        parent: None,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -753,7 +800,6 @@ fn load_linux_process(
     let mut program = elf::parse(elf_bytes)?;
     apply_pie_bias(&mut program);
     validate_segments(&program)?;
-
     // brk(0) starts just past the highest loaded segment, page-aligned,
     // with a one-page gap so the heap can never be mistaken for part of
     // the last segment.
@@ -779,6 +825,8 @@ fn load_linux_process(
         heap_start,
         heap_end: heap_start,
         mmap_next: MMAP_BASE,
+        cloexec: Vec::new(),
+        parent: None,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -862,11 +910,20 @@ pub fn execve_into_current(
 ) -> Result<(u64, u64), &'static str> {
     // Take the current fd table (the new process inherits it), build the
     // new process, then swap it in and free the old address space.
-    let (new_process, new_cr3) = {
+    let old_parent = task::with_current_process_mut(|p| p.parent()).flatten();
+    let (mut new_process, new_cr3) = {
         let taken = task::with_current_process_mut(|p| core::mem::take(&mut p.fds))
             .ok_or("not a process")?;
         load_linux_process(elf_bytes, argv, envp, taken)?
     };
+    // `execve` keeps the process identity — including who forked it, so
+    // the parent's `wait4(-1)` still matches this process after the exec
+    // (an exec'd pipeline child whose parent vanished would never be
+    // reaped, and the shell's wait loop would spin forever).
+    new_process.parent = old_parent;
+    // Close-on-exec: drop the fds the old program flagged with
+    // FD_CLOEXEC (pipeline pipe ends, etc.) before the new image runs.
+    new_process.close_cloexec_fds();
     let entry = new_process.entry;
     let user_rsp = new_process.user_rsp;
     let current = task::current_pid();
@@ -874,20 +931,19 @@ pub fn execve_into_current(
         free_process(old);
     }
     task::set_current_cr3(current, new_cr3);
-    // Park the exit chain *below* the current syscall's frames: 6 slots
-    // `.Lsyscall_exit` pops into r15..rbx, then `exit_self`. (A local's
-    // address is inside the handler's own frame; 128 bytes below it is
-    // safely clear of everything the rest of this syscall touches.)
-    let local = 0u8;
-    let chain = (&local as *const u8 as usize) - 128;
-    unsafe {
-        let chain_p = chain as *mut usize;
-        for i in 0..6 {
-            *chain_p.add(i) = 0;
-        }
-        *chain_p.add(6) = exit_self as usize;
-    }
-    task::set_current_ring3_kernel_rsp(current, chain as u64);
+    // Load the new page tables *now*: the exec-restart path iretq's into
+    // the new program immediately (no context switch in between), and
+    // the CPU would otherwise keep running against the old — freed —
+    // address space until the next scheduler tick (reading the old
+    // stack's garbage argv and looping). The kernel's identity map is
+    // deep-copied into every address space, so switching mid-syscall is
+    // safe.
+    paging::write_cr3(new_cr3);
+    // Park the exit chain at the task's fixed safe location (below the
+    // syscall-stack region — see `task::repark_exit_chain`): the old
+    // local-relative spot sat inside the deepest syscall frames' reach
+    // and got overwritten whenever the exec'd program made deep calls.
+    crate::task::repark_exit_chain(exit_self as extern "C" fn() -> ! as usize);
     crate::syscall::set_exec_restart(entry as u64, user_rsp);
     Ok((entry as u64, user_rsp))
 }
@@ -1409,6 +1465,20 @@ extern "C" fn exit_self() -> ! {
     }
 }
 
+/// Asm bridge (`enter_usermode`): re-park the exit chain at the task's
+/// fixed safe location, below the syscall-stack region — but only for
+/// real process tasks. A plain `run_demo` (the selftest's ring-3 smoke
+/// test, running in the kernel's own main task) must keep its natural
+/// chain — the ret through the caller's frame back into `run_demo`'s
+/// continuation — or its demo's `exit` would jump straight to
+/// `exit_self` and kill the main task.
+#[unsafe(no_mangle)]
+extern "C" fn ring3_repark_chain() {
+    if crate::task::current_is_process() {
+        task::repark_exit_chain(exit_self as extern "C" fn() -> ! as usize);
+    }
+}
+
 /// Drops the current process's fd table *at exit* (not at reap), the way
 /// real Linux closes fds when a process dies: a pipe's write end closing
 /// is what makes a reader see EOF, and an exited-but-unreaped child must
@@ -1501,6 +1571,8 @@ fn fork_copy(parent: &Process) -> Result<(Process, u64), &'static str> {
         heap_start: parent.heap_start,
         heap_end: parent.heap_end,
         mmap_next: parent.mmap_next,
+        cloexec: parent.cloexec.clone(),
+        parent: parent.parent,
     };
     let pml4 = build_address_space(&mut child)?;
     let parent_cr3 = paging::read_cr3();
@@ -1523,29 +1595,32 @@ fn fork_copy(parent: &Process) -> Result<(Process, u64), &'static str> {
         unsafe {
             core::ptr::copy_nonoverlapping(m.phys as *const u8, phys as *mut u8, m.len as usize);
         }
-        // Use the attributes of the first *user-mapped* page in this
-        // mapping: the stack mapping's region below the initial stack
-        // was created when the kernel's 2 MiB identity entry got split,
-        // so those PTEs are the split's supervisor copies (P|W only) —
-        // taking the first *present* page's flags would map the child's
-        // whole stack supervisor-only and every user access would fault
-        // with P=1,U=1. The demand-grown region between them is
-        // user-mapped, so skipping non-user pages lands on the real
-        // stack attributes.
-        let mut flags = 0u64;
+        // Map *per page* with each page's own attributes: a single
+        // Mapping can span text (exec, no W) and data (RW, NX) — the
+        // uniform first-page flags would make the child's data pages
+        // read-only (a write then faults P=1,W=1,U=1) or its text pages
+        // writable. The stack mapping's demand-grown region below the
+        // initial stack is the kernel 2 MiB split's supervisor copies
+        // (P|W only) — those pages stay supervisor and untouched, and
+        // the first user page supplies the real stack attributes.
         let mut page = m.vaddr;
+        let mut page_idx = 0usize;
         while page < m.vaddr + m.len {
-            flags = read_pte_flags(parent_cr3, page);
-            if flags & paging::PAGE_USER != 0 {
-                break;
+            let flags = read_pte_flags(parent_cr3, page);
+            if flags & paging::PAGE_PRESENT != 0 {
+                if !paging::map_range_in(
+                    pml4,
+                    page,
+                    phys as u64 + (page_idx as u64) * paging::PAGE_SIZE,
+                    paging::PAGE_SIZE,
+                    flags,
+                    &mut child.frames,
+                ) {
+                    return Err("fork: mapping copy failed");
+                }
             }
             page += paging::PAGE_SIZE;
-        }
-        if flags & paging::PAGE_USER == 0 {
-            continue; // no user page in this mapping — leave it unmapped
-        }
-        if !paging::map_range_in(pml4, m.vaddr, phys as u64, m.len, flags, &mut child.frames) {
-            return Err("fork: mapping copy failed");
+            page_idx += 1;
         }
         child.mappings.push(Mapping {
             vaddr: m.vaddr,
@@ -1635,8 +1710,9 @@ pub fn handle_forkish(
             Ok(pid)
         }
         crate::linux_abi::SYS_FORK | crate::linux_abi::SYS_VFORK => {
-            let (child_process, child_cr3) =
+            let (mut child_process, child_cr3) =
                 task::with_current_process_mut(|p| fork_copy(p)).ok_or("not a process")??;
+            child_process.parent = Some(task::current_pid());
             let child_pid = task::spawn_child(
                 "fork-child",
                 child_cr3,
@@ -1686,8 +1762,8 @@ pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
     let msg = io::sprint(
         &mut buf,
         format_args!(
-            "[PROC] killed by page fault at {:#x} (error {:#x}, rip={:#x}, r8={:#x}, r9={:#x}, r10={:#x}, r11={:#x}, r12={:#x}, r13={:#x}, r14={:#x}, r15={:#x}, rbx={:#x}, rbp={:#x}, rdx={:#x}, rcx={:#x}, rdi={:#x}, rsi={:#x}, rsp={:#x})\n",
-            cr2, frame.error_code, rip, frame.r8, frame.r9, frame.r10, frame.r11,
+            "[PROC] {} killed by page fault at {:#x} (error {:#x}, rip={:#x}, r8={:#x}, r9={:#x}, r10={:#x}, r11={:#x}, r12={:#x}, r13={:#x}, r14={:#x}, r15={:#x}, rbx={:#x}, rbp={:#x}, rdx={:#x}, rcx={:#x}, rdi={:#x}, rsi={:#x}, rsp={:#x})\n",
+            crate::task::current_name(), cr2, frame.error_code, rip, frame.r8, frame.r9, frame.r10, frame.r11,
             frame.r12, frame.r13, frame.r14, frame.r15, frame.rbx, frame.rbp,
             frame.rdx, frame.rcx, frame.rdi, frame.rsi, frame.rsp
         ),
