@@ -140,6 +140,39 @@ impl FileHandle {
         self.is_dir
     }
 
+    /// The path this handle was opened from — used by `getdents64` to
+    /// enumerate a directory fd (the FAT layer has no cursor-based
+    /// directory reads; the path is the key).
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Absolute byte position the cursor is at (for `sendfile`'s offset
+    /// reporting).
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// Positions the cursor for a `sendfile` starting offset. The VFS
+    /// keeps the whole file in memory, so an offset beyond EOF just
+    /// makes the next read return 0.
+    pub fn set_cursor(&mut self, offset: usize) {
+        self.cursor = offset;
+    }
+
+    /// A directory handle for a pseudo-filesystem path (e.g. `/proc`, `/dev`)
+    /// that the FAT VFS doesn't know about but `getdents64` still lists.
+    pub fn pseudo_dir(path: &str) -> FileHandle {
+        FileHandle {
+            path: path.to_string(),
+            data: Vec::new(),
+            cursor: 0,
+            dirty: false,
+            writable: false,
+            is_dir: true,
+        }
+    }
+
     /// Deep copy for `fork`: same file, same position, independent
     /// handle (a real fork shares the open-file description, but the
     /// VFS layer keeps the whole file in memory so a copy is equivalent

@@ -544,9 +544,6 @@ impl Process {
             for i in 0..pages {
                 self.frames.push(phys + i * pmm::FRAME_SIZE);
             }
-            unsafe {
-                core::ptr::write_bytes(phys as *mut u8, 0, grow_len as usize);
-            }
             let map_at = self.heap_start + old_mapped;
             if !paging::map_range_in(
                 pml4,
@@ -557,6 +554,11 @@ impl Process {
                 &mut self.frames,
             ) {
                 return self.heap_end;
+            }
+            // Zero through the freshly-mapped `map_at`, not `phys` — see
+            // `mmap_with_content` for the identity-map collision.
+            unsafe {
+                core::ptr::write_bytes(map_at as *mut u8, 0, grow_len as usize);
             }
             self.mappings.push(Mapping {
                 vaddr: map_at,
@@ -616,13 +618,6 @@ impl Process {
         for i in 0..pages {
             self.frames.push(phys + i * pmm::FRAME_SIZE);
         }
-        unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, len as usize);
-            if let Some(data) = content {
-                let n = data.len().min(len as usize);
-                core::ptr::copy_nonoverlapping(data.as_ptr(), phys as *mut u8, n);
-            }
-        }
         let mut flags = paging::PAGE_PRESENT | paging::PAGE_USER;
         if writable {
             flags |= paging::PAGE_WRITABLE;
@@ -632,6 +627,32 @@ impl Process {
         }
         if !paging::map_range_in(pml4, addr, phys as u64, len, flags, &mut self.frames) {
             return None;
+        }
+        // Zero (and copy any content) through the freshly-mapped `addr`,
+        // never through `phys` as a virtual address: physical frame
+        // numbers collide with user VAs in the shared identity-mapped
+        // address space, so writing to `phys` clobbers whatever user
+        // mapping currently occupies that VA — the same class of bug as
+        // the `ls /bin` DIR corruption (the DIR's frame stayed
+        // user-reachable at its own identity address).
+        unsafe {
+            core::ptr::write_bytes(addr as *mut u8, 0, len as usize);
+            if let Some(data) = content {
+                let n = data.len().min(len as usize);
+                core::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, n);
+            }
+        }
+        // TEMP PROBE: dump small anon mmaps after zeroing
+        if content.is_none() && len <= 0x4000 && at.is_none() {
+            let mut h = alloc::string::String::new();
+            for i in 0..32u64 {
+                let b = unsafe { core::ptr::read_volatile((addr + i) as *const u8) };
+                h.push_str(&alloc::format!("{b:02x}"));
+            }
+            crate::io::exception_print(crate::io::sprint(
+                &mut [0u8; 256],
+                format_args!("[MMZ] addr={addr:#x} phys={phys:#x} b0..32={h}\n"),
+            ));
         }
         self.mappings.push(Mapping {
             vaddr: addr,
@@ -1137,14 +1158,40 @@ fn build_address_space(process: &mut Process) -> Result<u64, &'static str> {
                     // nothing.
                     *pd_ptr.add(j) = pde & !paging::PAGE_USER;
                 } else {
-                    // 4 KiB page table: deep copy it.
-                    let pt = alloc_frame(process)?;
+                    // 4 KiB page table: deep copy it — stripping the
+                    // USER bit from every present PTE, exactly like the
+                    // 2 MiB entries above. Inherited USER identity
+                    // pages let ring-3 read/write whatever physical
+                    // frame the kernel later hands out whose *number*
+                    // coincides with that VA — the `ls /bin` DIR
+                    // corruption: the DIR's frame (0x694f000) stayed
+                    // reachable at its own address through a
+                    // user-writable identity PTE, and a heap write
+                    // landing there mutated dir->fd from 3 to 6.
+                    let pt = alloc_frame(process)? as *mut u64;
                     let kernel_pt = (pde & !0xFFF) as *const u64;
-                    core::ptr::copy_nonoverlapping(kernel_pt, pt as *mut u64, 512);
-                    *pd_ptr.add(j) = pt as u64 | (pde & 0xFFF);
+                    // TEMP PROBE: the 0x680000 4K table — PTE at 0x694f000
+                    let idx_694 = ((0x694f000 >> 12) & 0x1FF) as usize;
+                    crate::io::exception_print(crate::io::sprint(
+                        &mut [0u8; 256],
+                        format_args!(
+                            "[BAP] 0x680000 kernel_pte(0x694f000)={:#x} copied={:#x}\n",
+                            *kernel_pt.add(idx_694),
+                            *kernel_pt.add(idx_694) & !paging::PAGE_USER
+                        ),
+                    ));
+                    for i in 0..512 {
+                        let e = *kernel_pt.add(i);
+                        *pt.add(i) = if e & paging::PAGE_PRESENT != 0 {
+                            e & !paging::PAGE_USER
+                        } else {
+                            e
+                        };
+                    }
+                    *pd_ptr.add(j) = (pt as u64) | ((pde & 0xFFF) & !paging::PAGE_USER);
                 }
             }
-            *pdpt_ptr.add(i) = pd as u64 | (entry & 0xFFF);
+            *pdpt_ptr.add(i) = (pd as u64) | ((entry & 0xFFF) & !paging::PAGE_USER);
         }
     }
     Ok(pml4 as u64)

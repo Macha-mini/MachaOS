@@ -2561,6 +2561,14 @@ pub fn selftest() -> ! {
             // the serial log. See `phase10_server_selftest`.
             phase10_server_selftest();
 
+            // Phase 12: Linux-app porting — a battery of real BusyBox
+            // applets (echo/seq/cat/grep/head/wc/uname/basename/ls/pwd/
+            // df/free/date/cp/rm/mkdir/rmdir/sleep), exercising the
+            // Phase 12 syscalls getdents64/getcwd/statfs/clock_nanosleep
+            // plus /proc/meminfo, with every output verified from the
+            // kernel. See `phase12_app_selftest`.
+            phase12_app_selftest();
+
             // Phase D.8: the ACPI S5 parameters must be discoverable on
             // the VM targets — RSDP/FADT chain plus the `\_S5` sleep type.
             match crate::acpi::s5_params() {
@@ -2749,6 +2757,157 @@ fn phase10_server_selftest() {
         other => selftest_fail(&format!("tcp-server gave unexpected exit: {:?}", other)),
     }
     crate::process::reap(pid);
+}
+
+/// Phase 12 selftest — Linux-app porting. Runs a battery of real
+/// third-party BusyBox (static musl) applets through the Linux ABI,
+/// each with stdout captured to a FAT file via one `sh -c` script and
+/// the file verified from the kernel: echo/seq/cat/grep/head/wc/uname/
+/// basename (pure output), ls/pwd/df/free (the Phase 12 syscalls
+/// getdents64/getcwd/statfs + /proc/meminfo), cp/mkdir/rmdir/rm (fs
+/// mutations) and date. A directly-spawned `sleep 1` additionally
+/// proves clock_nanosleep blocks for the real wall-clock duration.
+fn phase12_app_selftest() {
+    let busybox_elf = match fat::read_file("/bin/busybox.elf") {
+        Ok(b) => b,
+        Err(e) => selftest_fail(&format!("busybox read failed: {e}")),
+    };
+    // Stale files from a prior boot (the test disk is normally rebuilt,
+    // but `make test` without `rm target/disk.img` would reuse them).
+    let stale = [
+        "p12-echo.txt", "p12-seq.txt", "p12-cat.txt", "p12-grep.txt",
+        "p12-head.txt", "p12-wc.txt", "p12-uname.txt", "p12-base.txt",
+        "p12-ls.txt", "p12-pwd.txt", "p12-df.txt", "p12-free.txt",
+        "p12-date.txt", "p12-cp.txt", "p12-rm.txt", "p12-dir",
+    ];
+    for name in stale {
+        let _ = fat::remove(&format!("/users/macha/Documents/{name}"));
+    }
+
+    let script = concat!(
+        "/bin/busybox.elf echo hello from echo > /users/macha/Documents/p12-echo.txt; ",
+        "/bin/busybox.elf seq 1 3 > /users/macha/Documents/p12-seq.txt; ",
+        "/bin/busybox.elf cat /users/macha/Documents/readme.txt > /users/macha/Documents/p12-cat.txt; ",
+        "/bin/busybox.elf grep hello /users/macha/Documents/readme.txt > /users/macha/Documents/p12-grep.txt; ",
+        "/bin/busybox.elf head -n 1 /users/macha/Documents/readme.txt > /users/macha/Documents/p12-head.txt; ",
+        "/bin/busybox.elf wc -c /users/macha/Documents/readme.txt > /users/macha/Documents/p12-wc.txt; ",
+        "/bin/busybox.elf uname -s > /users/macha/Documents/p12-uname.txt; ",
+        "/bin/busybox.elf basename /a/b/c > /users/macha/Documents/p12-base.txt; ",
+        "/bin/busybox.elf ls /bin > /users/macha/Documents/p12-ls.txt; ",
+        "/bin/busybox.elf pwd > /users/macha/Documents/p12-pwd.txt; ",
+        "/bin/busybox.elf df / > /users/macha/Documents/p12-df.txt; ",
+        "/bin/busybox.elf free > /users/macha/Documents/p12-free.txt; ",
+        "/bin/busybox.elf date > /users/macha/Documents/p12-date.txt; ",
+        "/bin/busybox.elf cp /users/macha/Documents/readme.txt /users/macha/Documents/p12-cp.txt; ",
+        "/bin/busybox.elf cp /users/macha/Documents/readme.txt /users/macha/Documents/p12-rm.txt; ",
+        "/bin/busybox.elf rm /users/macha/Documents/p12-rm.txt; ",
+        "/bin/busybox.elf mkdir /users/macha/Documents/p12-dir; ",
+        "/bin/busybox.elf rmdir /users/macha/Documents/p12-dir",
+    );
+    let pid = crate::process::spawn_linux(&busybox_elf, "busybox-sh", &["sh", "-c", script], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("busybox sh spawn failed: {e}")));
+    // The pipeline-exit timing flake (PHASE7D_HANDOFF.md) can stall the
+    // shell's exit; the file checks below are the real verification and
+    // stay gating, so a stall only costs the INFO line.
+    let exited = match crate::process::wait(pid, 2500) {
+        Some(process::ExitInfo::Normal) => {
+            println!("[OK] Phase 12: busybox applet script ran to completion");
+            true
+        }
+        other => {
+            println!(
+                "[INFO] Phase 12: applet script exit flaked ({:?}) — outputs checked below",
+                other
+            );
+            false
+        }
+    };
+
+    let doc = |name: &str| format!("/users/macha/Documents/{name}");
+    // Reads a captured output file and checks it against `want`.
+    let check = |name: &str, want: &[u8], what: &str| {
+        match fat::read_file(&doc(name)) {
+            Ok(data) if data == want => println!("[OK] Phase 12: busybox {what}"),
+            Ok(data) => selftest_fail(&format!(
+                "busybox {what}: output mismatch (got {:?}, want {:?})",
+                String::from_utf8_lossy(&data),
+                String::from_utf8_lossy(want)
+            )),
+            Err(e) => selftest_fail(&format!("busybox {what}: output file read failed: {e}")),
+        }
+    };
+    // Reads a captured output file and checks it contains `needle`.
+    let check_contains = |name: &str, needle: &str, what: &str| {
+        match fat::read_file(&doc(name)) {
+            Ok(data) => {
+                let s = String::from_utf8_lossy(&data);
+                if s.contains(needle) {
+                    println!("[OK] Phase 12: busybox {what}");
+                } else {
+                    selftest_fail(&format!("busybox {what}: output {s:?} lacks {needle:?}"));
+                }
+            }
+            Err(e) => selftest_fail(&format!("busybox {what}: output file read failed: {e}")),
+        }
+    };
+
+    check("p12-echo.txt", b"hello from echo\n", "echo");
+    check("p12-seq.txt", b"1\n2\n3\n", "seq");
+    check("p12-cat.txt", b"hello from the host\n", "cat");
+    check("p12-grep.txt", b"hello from the host\n", "grep");
+    check("p12-head.txt", b"hello from the host\n", "head");
+    check_contains("p12-wc.txt", "20", "wc -c");
+    check("p12-uname.txt", b"Linux\n", "uname -s");
+    check("p12-base.txt", b"c\n", "basename");
+    // TEMP PROBE: direct ls spawn, status + file existence
+    {
+        let pid = crate::process::spawn_linux(&busybox_elf, "ls", &["ls", "/bin"], &[])
+            .unwrap();
+        match crate::process::wait(pid, 500) {
+            Some(info) => println!("[LSPROBE] ls /bin exit: {:?}", info),
+            None => println!("[LSPROBE] ls /bin timed out"),
+        }
+        crate::process::reap(pid);
+        println!(
+            "[LSPROBE] p12-ls.txt exists: {}",
+            fat::exists("/users/macha/Documents/p12-ls.txt")
+        );
+    }
+    check_contains("p12-ls.txt", "busybox.elf", "ls /bin (getdents64)");
+    check("p12-pwd.txt", b"/\n", "pwd (getcwd)");
+    check_contains("p12-df.txt", "Filesystem", "df (statfs)");
+    check_contains("p12-free.txt", "Mem", "free (/proc/meminfo)");
+    check_contains("p12-date.txt", ":", "date");
+    check("p12-cp.txt", b"hello from the host\n", "cp");
+    // rm: the copied file must be gone; rmdir: the created dir must no
+    // longer resolve (is_dir errors with NotFound on a missing path).
+    let rm_ok = !fat::exists("/users/macha/Documents/p12-rm.txt")
+        && fat::is_dir("/users/macha/Documents/p12-dir").is_err();
+    if rm_ok {
+        println!("[OK] Phase 12: busybox rm + rmdir");
+    } else {
+        selftest_fail("busybox rm/rmdir: file/dir still present after removal");
+    }
+
+    // clock_nanosleep must block for the real duration: a directly
+    // spawned `sleep 1` must take at least ~0.8 s of wall time.
+    let t0 = crate::interrupts::ticks();
+    let pid = crate::process::spawn_linux(&busybox_elf, "busybox-sleep", &["sleep", "1"], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("busybox sleep spawn failed: {e}")));
+    match crate::process::wait(pid, 600) {
+        Some(process::ExitInfo::Normal) => {
+            let elapsed = crate::interrupts::ticks() - t0;
+            if elapsed >= 80 {
+                println!("[OK] Phase 12: busybox sleep 1 blocked for {elapsed} ticks (nanosleep)");
+            } else {
+                selftest_fail(&format!("busybox sleep returned after only {elapsed} ticks"));
+            }
+        }
+        other => selftest_fail(&format!("busybox sleep gave unexpected exit: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    let _ = exited; // a flaked sh is left as a harmless zombie, like the Phase 7 test
 }
 
 fn selftest_fail(reason: &str) -> ! {

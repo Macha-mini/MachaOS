@@ -622,24 +622,49 @@ impl Fat32 {
 
     /// Locates a run of `slots` free (0x00/0xE5) directory slots inside a
     /// single sector of `parent`'s chain, returning (cluster, byte offset).
+    /// Finds `slots` consecutive free directory-entry slots in `parent`'s
+    /// directory, walking the whole cluster chain. Returns the run's
+    /// start as `(cluster, absolute byte offset within that cluster)`.
+    ///
+    /// Two related bugs were fixed here, both caught by the Phase 12 app
+    /// battery (the first workload to fill a directory past one sector):
+    /// (1) the returned offset used to be relative to whichever sector the
+    /// run landed in, so a run starting past sector 0 was addressed as if
+    /// it were at the front of sector 0 — silently overwriting `.`/`..`
+    /// and the earliest entries; (2) the run counter reset at every sector
+    /// boundary, so a run spanning sectors was split into two, leaving a
+    /// free slot behind as a hole — and `read_dir` stops at the first
+    /// `0x00`, so everything after the hole was invisible. The counter now
+    /// persists across sectors and clusters, and the run's start is
+    /// tracked explicitly (not recomputed from the current position).
     fn find_free_run(&self, parent: u32, slots: usize) -> Result<Option<(u32, usize)>, FatError> {
-        let mut sector = [0u8; 512];
         let mut current = parent;
+        // Where the in-progress run started (cluster + offset within it)
+        // and how long it currently is. `run_len` is deliberately *not*
+        // reset at sector/cluster boundaries — a run may span them, and
+        // `write_dir_entries` writes entries one at a time at arbitrary
+        // positions to match.
+        let mut run_start: Option<(u32, usize)> = None;
+        let mut run_len = 0usize;
         let mut guard = 0u32;
         loop {
             for s in 0..self.sectors_per_cluster as u32 {
+                let mut sector = [0u8; 512];
                 self.device
                     .read_sectors(self.cluster_to_sector(current) + s as u64, 1, &mut sector)
                     .map_err(FatError::Io)?;
-                let mut run = 0usize;
                 for offset in (0..512).step_by(32) {
-                    run = if sector[offset] == 0x00 || sector[offset] == 0xE5 {
-                        run + 1
+                    if sector[offset] == 0x00 || sector[offset] == 0xE5 {
+                        if run_len == 0 {
+                            run_start = Some((current, s as usize * 512 + offset));
+                        }
+                        run_len += 1;
+                        if run_len == slots {
+                            return Ok(run_start);
+                        }
                     } else {
-                        0
-                    };
-                    if run == slots {
-                        return Ok(Some((current, offset + 32 - slots * 32)));
+                        run_len = 0;
+                        run_start = None;
                     }
                 }
             }
@@ -743,19 +768,37 @@ impl Fat32 {
             Some(place) => place,
             None => (self.extend_dir(parent)?, 0),
         };
-        let (cluster, offset) = place;
-        let sector_idx = (offset / 512) as u64;
-        let slot_offset = offset % 512;
-        let mut sector = [0u8; 512];
-        self.device
-            .read_sectors(self.cluster_to_sector(cluster) + sector_idx, 1, &mut sector)
-            .map_err(FatError::Io)?;
-        for (i, entry) in entries.iter().enumerate() {
-            sector[slot_offset + i * 32..slot_offset + (i + 1) * 32].copy_from_slice(entry);
+        let (mut cluster, mut pos) = place;
+        // Write the entries one at a time at their absolute positions.
+        // A run can span sector (and, after `extend_dir` on a chained
+        // directory, cluster) boundaries, so each entry is addressed as
+        // `cluster_to_sector(cluster) + (pos / 512)` with the slot at
+        // `pos % 512`, walking the cluster chain when pos runs past a
+        // cluster's end. Directories are small, so a read-modify-write
+        // per entry costs nothing.
+        let cluster_bytes = self.cluster_bytes();
+        for entry in entries.iter() {
+            while pos >= cluster_bytes {
+                let next = self.next_cluster(cluster);
+                if Fat32::is_eof(next) {
+                    return Err(FatError::Corrupt);
+                }
+                cluster = next;
+                pos -= cluster_bytes;
+            }
+            let sector_idx = (pos / 512) as u64;
+            let slot_offset = pos % 512;
+            let mut sector = [0u8; 512];
+            self.device
+                .read_sectors(self.cluster_to_sector(cluster) + sector_idx, 1, &mut sector)
+                .map_err(FatError::Io)?;
+            sector[slot_offset..slot_offset + 32].copy_from_slice(entry);
+            self.device
+                .write_sectors(self.cluster_to_sector(cluster) + sector_idx, 1, &sector)
+                .map_err(FatError::Io)?;
+            pos += 32;
         }
-        self.device
-            .write_sectors(self.cluster_to_sector(cluster) + sector_idx, 1, &sector)
-            .map_err(FatError::Io)
+        Ok(())
     }
 }
 

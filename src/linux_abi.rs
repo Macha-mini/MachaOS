@@ -193,6 +193,7 @@ const EAGAIN: i32 = 11;
 const EIO: i32 = 5;
 const ENOMEM: i32 = 12;
 const ENOEXEC: i32 = 8;
+const ERANGE: i32 = 34;
 
 /// Negates and sign-extends `errno` into the raw `u64` a syscall returns
 /// on failure, matching the real Linux convention (small negative values
@@ -293,6 +294,23 @@ const SYS_GETITIMER: u64 = 36;
 const SYS_ALARM: u64 = 37;
 const SYS_FTRUNCATE: u64 = 77;
 const SYS_MEMFD_CREATE: u64 = 319;
+// Phase 12 Linux-app porting: getcwd, nanosleep/clock_nanosleep,
+// statfs/fstatfs and getdents64 unlock busybox `pwd`, `sleep`, `df`,
+// `ls` (and everything that lists directories: `du`, `ps`, ...).
+const SYS_GETCWD: u64 = 79;
+const SYS_NANOSLEEP: u64 = 35;
+const SYS_CLOCK_NANOSLEEP: u64 = 230;
+const SYS_STATFS: u64 = 137;
+const SYS_FSTATFS: u64 = 138;
+const SYS_GETDENTS64: u64 = 217;
+/// Legacy `getdents` — musl's `readdir` uses this (not getdents64): the
+/// record layout differs (d_ino/d_off/reclen header, name at 18, and the
+/// d_type byte lives at the *end* of each padded record, not at a fixed
+/// offset).
+const SYS_GETDENTS: u64 = 141;
+/// `sendfile(out, in, offset, count)` — BusyBox `cat` uses this instead
+/// of read/write to dump a file to stdout.
+const SYS_SENDFILE: u64 = 40;
 // Phase 7: clone/fork/vfork are intercepted by the asm special path (see
 // syscall.rs is_forkish_syscall / sys_forkish) before syscall_dispatch;
 // the numbers are still declared here for the dispatch table and the
@@ -310,6 +328,7 @@ const SYS_DUP2_64: u64 = 63;
 const SYS_GETTID: u64 = 186;
 const SYS_DUP3: u64 = 292;
 const SYS_PIPE2: u64 = 293;
+
 /// Legacy `pipe(pipefd)` — BusyBox ash uses this instead of `pipe2`.
 const SYS_PIPE: u64 = 22;
 /// Legacy `open(path, flags, mode)` — static musl binaries call this
@@ -447,6 +466,91 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
         return bytes.len() as u64;
     }
     err(EBADF) // fd 0 (stdin) isn't writable, and nothing else exists
+}
+
+/// `sendfile(out_fd, in_fd, offset_ptr, count)`: copies up to `count`
+/// bytes from `in_fd`'s backing to `out_fd` through a kernel buffer
+/// (user memory can't hold it — `resolve` rejects kernel-stack
+/// addresses). `offset_ptr` (when nonzero) is a pointer to a starting
+/// file offset, honored like real sendfile: the in-file cursor is set
+/// there before the copy and the new position is written back.
+fn sys_sendfile(out_fd: u64, in_fd: u64, offset_ptr: u64, count: u64) -> u64 {
+    // Apply the starting offset to a File in-fd before copying.
+    if offset_ptr != 0 {
+        if let Some(phys) = resolve(offset_ptr, 8) {
+            let off = unsafe { core::ptr::read_unaligned(phys as *const u64) };
+            let _ = with_process(|p| match p.fd_mut(in_fd as usize) {
+                Some(FdEntry::File(h)) => h.set_cursor(off as usize),
+                _ => {}
+            });
+        }
+    }
+    let mut total: u64 = 0;
+    let mut remaining = count;
+    while remaining > 0 {
+        let n = core::cmp::min(remaining, 4096) as usize;
+        let chunk: alloc::vec::Vec<u8> = with_process(|p| match p.fd_mut(in_fd as usize) {
+            Some(FdEntry::File(h)) => {
+                let mut b = alloc::vec![0u8; n];
+                let got = h.read(&mut b);
+                b.truncate(got);
+                Some(b)
+            }
+            Some(FdEntry::Shm(id, cursor)) => {
+                let mut b = alloc::vec![0u8; n];
+                let got = shm_read(*id, cursor, &mut b);
+                b.truncate(got);
+                Some(b)
+            }
+            Some(FdEntry::Pipe(id, _)) => {
+                let mut b = alloc::vec![0u8; n];
+                let got = crate::pipe::read(*id, &mut b);
+                b.truncate(got);
+                Some(b)
+            }
+            _ => None,
+        })
+        .flatten()
+        .unwrap_or_default();
+        if chunk.is_empty() {
+            break; // EOF
+        }
+        let written = with_process(|p| match p.fd_mut(out_fd as usize) {
+            Some(FdEntry::File(h)) => Some(h.write(&chunk).map(|n| n as u64).unwrap_or(0)),
+            Some(FdEntry::Shm(id, cursor)) => Some(shm_write(*id, cursor, &chunk) as u64),
+            Some(FdEntry::Pipe(id, is_read)) => Some(crate::pipe::write(*id, &chunk) as u64),
+            Some(FdEntry::Socket(id)) => Some(socket::send(*id, &chunk, &[]).map(|n| n as u64).unwrap_or(0)),
+            Some(FdEntry::Net(id)) => Some(crate::inet::send(*id, &chunk).map(|n| n as u64).unwrap_or(0)),
+            Some(FdEntry::Dev(_)) => Some(chunk.len() as u64), // /dev/null etc. discard
+            _ => None,
+        })
+        .flatten();
+        let written = match written {
+            Some(w) if w > 0 => w,
+            // fd 1/2 with nothing installed = the console.
+            None if out_fd == 1 || out_fd == 2 => {
+                for &b in &chunk {
+                    crate::io::print(core::format_args!("{}", b as char));
+                }
+                chunk.len() as u64
+            }
+            _ => return if total == 0 { err(EIO) } else { total },
+        };
+        total += written;
+        remaining -= written;
+    }
+    if offset_ptr != 0 {
+        if let Some(phys) = resolve(offset_ptr, 8) {
+            let new_off = with_process(|p| match p.fd_mut(in_fd as usize) {
+                Some(FdEntry::File(h)) => Some(h.cursor()),
+                _ => None,
+            })
+            .flatten()
+            .unwrap_or(0);
+            unsafe { core::ptr::write_unaligned(phys as *mut u64, new_off as u64) };
+        }
+    }
+    total
 }
 
 fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
@@ -629,13 +733,15 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
             .unwrap_or(err(EBADF));
         return fd;
     }
-    if path == "/proc/self/stat" {
-        let content = alloc::format!(
-            "{} (machaos) S 0 0 0 0 -1 4194304 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-            crate::task::current_pid()
-        )
-        .into_bytes();
+    if let Some(content) = pseudo_proc(&path) {
         let fd = with_process(|p| p.alloc_fd(crate::process::FdEntry::Proc(content)) as u64)
+            .unwrap_or(err(EBADF));
+        return fd;
+    }
+    // `/proc` and `/dev` themselves open as (pseudo-)directories so
+    // `getdents64`/`ls` can list them.
+    if path == "/proc" || path == "/dev" {
+        let fd = with_process(|p| p.alloc_fd(FdEntry::File(vfs::FileHandle::pseudo_dir(&path))) as u64)
             .unwrap_or(err(EBADF));
         return fd;
     }
@@ -652,6 +758,11 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
     match vfs::FileHandle::open(&path, vfs_flags) {
         Ok(handle) => {
             let fd = with_process(|p| p.alloc_fd(FdEntry::File(handle)) as u64).unwrap_or(err(EBADF));
+            // TEMP PROBE: openat result
+            crate::io::exception_print(crate::io::sprint(
+                &mut [0u8; 512],
+                format_args!("[OAT] path={path} fd={fd}\n"),
+            ));
             fd
         }
         Err(e) => vfs_err(e),
@@ -664,6 +775,61 @@ fn pseudo_dev(path: &str) -> Option<u8> {
         "/dev/null" => Some(0),
         "/dev/zero" => Some(1),
         "/dev/urandom" | "/dev/random" => Some(2),
+        _ => None,
+    }
+}
+
+/// The `/proc` pseudo-file contents, if any: `/proc/self/stat` (the
+/// Phase 9b original), plus `/proc/cpuinfo` and `/proc/meminfo` (added
+/// for the Phase 12 Linux-app porting — busybox `free` parses meminfo,
+/// and `cat /proc/cpuinfo` is a classic demo).
+fn pseudo_proc(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match path {
+        "/proc/self/stat" => Some(
+            alloc::format!(
+                "{} (machaos) S 0 0 0 0 -1 4194304 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+                crate::task::current_pid()
+            )
+            .into_bytes(),
+        ),
+        "/proc/cpuinfo" => {
+            let brand = crate::cpuid::brand_string()
+                .map(|b| core::str::from_utf8(&b).unwrap_or("unknown").trim_end().to_string())
+                .unwrap_or_else(|| "MachaOS CPU".to_string());
+            let mut out = alloc::format!(
+                "processor\t: 0\nmodel name\t: {}\nvendor_id\t: {}\n",
+                brand,
+                core::str::from_utf8(&crate::cpuid::vendor_id()).unwrap_or("unknown")
+            );
+            let flags = crate::cpuid::features();
+            if !flags.is_empty() {
+                out.push_str("flags\t\t: ");
+                for (i, f) in flags.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(f);
+                }
+                out.push('\n');
+            }
+            Some(out.into_bytes())
+        }
+        "/proc/meminfo" => {
+            let total_kb = (crate::pmm::total_frames() * crate::pmm::FRAME_SIZE) as u64 / 1024;
+            let free_kb = (crate::pmm::free_frames() * crate::pmm::FRAME_SIZE) as u64 / 1024;
+            Some(
+                alloc::format!(
+                    "MemTotal:       {:>8} kB\nMemFree:        {:>8} kB\nMemAvailable:   {:>8} kB\n",
+                    total_kb, free_kb, free_kb
+                )
+                .into_bytes(),
+            )
+        }
+        // BusyBox `df` maps each path to a device by scanning /proc/mounts
+        // (it needs the mount table even to print a single argument).
+        "/proc/mounts" | "/proc/self/mounts" => Some(
+            b"rootfs / rootfs rw 0 0\n/dev/root / ext4 rw 0 0\n".to_vec(),
+        ),
         _ => None,
     }
 }
@@ -686,8 +852,11 @@ fn pseudo_stat(path: &str) -> Option<(u32, u64)> {
     if pseudo_dev(path).is_some() {
         return Some((S_IFCHR | 0o666, 0));
     }
-    if path == "/proc/self/stat" {
-        return Some((S_IFREG | 0o444, 0));
+    if path == "/proc" || path == "/dev" {
+        return Some((S_IFDIR | 0o555, 0));
+    }
+    if let Some(content) = pseudo_proc(path) {
+        return Some((S_IFREG | 0o444, content.len() as u64));
     }
     pseudo_etc(path).map(|c| (S_IFREG | 0o444, c.len() as u64))
 }
@@ -1745,6 +1914,369 @@ fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         Some(Some((mode, size, ino))) => write_stat(statbuf, mode, size, ino),
         _ => err(EBADF),
     }
+}
+
+/// `getcwd(buf, size)`: there's no per-process cwd (no chdir exists), so
+/// every process lives at `/` — the honest answer is `"/"`.
+fn sys_getcwd(buf: u64, size: u64) -> u64 {
+    if size < 2 {
+        return err(ERANGE);
+    }
+    let Some(phys) = resolve(buf, 2) else {
+        return err(EFAULT);
+    };
+    unsafe {
+        core::ptr::write_unaligned(phys as *mut u8, b'/');
+        core::ptr::write_unaligned((phys as *mut u8).add(1), 0);
+    }
+    1
+}
+
+/// `clock_nanosleep`/`nanosleep` share this: spin on the PIT tick count
+/// (which advances from the timer ISR while other tasks run in user
+/// mode), yielding round-robin each iteration so the whole desktop isn't
+/// frozen for the duration. This is the same cooperative pattern as
+/// `sys_wait4`/`sys_poll`'s blocking loops.
+fn sleep_until(deadline: u64) -> u64 {
+    while crate::interrupts::ticks() < deadline {
+        crate::task::yield_rr();
+    }
+    0
+}
+
+/// `clock_nanosleep(clockid, flags, req, rem)`: absolute mode (bit 0 of
+/// `flags`, TIMER_ABSTIME) treats `req` as a deadline in ticks; relative
+/// mode computes the deadline from now. Only one timespec field
+/// (tv_sec/tv_nsec) is read; the remainder pointer is left untouched.
+fn sys_clock_nanosleep(clockid: u64, flags: u64, req: u64, _rem: u64) -> u64 {
+    const TIMER_ABSTIME: u64 = 1;
+    let Some(phys) = resolve(req, 16) else {
+        return err(EFAULT);
+    };
+    let (sec, nsec) = unsafe {
+        let p = phys as *const u8;
+        (
+            core::ptr::read_unaligned(p as *const i64),
+            core::ptr::read_unaligned(p.add(8) as *const i64),
+        )
+    };
+    if sec < 0 || (sec == 0 && nsec < 0) {
+        return err(EINVAL);
+    }
+    let ticks = sec as u64 * 100 + (nsec as u64) / 10_000_000;
+    if flags & TIMER_ABSTIME != 0 {
+        sleep_until(ticks)
+    } else {
+        sleep_until(crate::interrupts::ticks() + ticks.max(1))
+    }
+}
+
+/// `nanosleep(req, rem)`: relative sleep; same encoding as above.
+fn sys_nanosleep(req: u64, rem: u64) -> u64 {
+    sys_clock_nanosleep(0, 0, req, rem)
+}
+
+/// The x86_64 `struct statfs` (the kernel's statfs is 64-bit native on
+/// this arch): f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files,
+/// f_ffree, f_fsid[2], f_namelen, f_frsize, f_flags, f_spare[4] —
+/// 15 u64s / 120 bytes.
+fn fill_statfs(buf_ptr: u64) -> u64 {
+    let Some(phys) = resolve(buf_ptr, 120) else {
+        return err(EFAULT);
+    };
+    unsafe {
+        let p = phys as *mut u8;
+        core::ptr::write_bytes(p, 0, 120);
+        core::ptr::write_unaligned(p as *mut u32, 0x4d44); // f_type = "MD" (FAT)
+        core::ptr::write_unaligned(p.add(8) as *mut u64, 512); // f_bsize
+        if let Some(info) = crate::fat::info() {
+            let blocks = info.total_sectors as u64;
+            let free = info.free_clusters as u64 * info.sectors_per_cluster as u64;
+            core::ptr::write_unaligned(p.add(16) as *mut u64, blocks); // f_blocks
+            core::ptr::write_unaligned(p.add(24) as *mut u64, free); // f_bfree
+            core::ptr::write_unaligned(p.add(32) as *mut u64, free); // f_bavail
+            core::ptr::write_unaligned(p.add(48) as *mut u64, 512); // f_frsize
+        }
+        core::ptr::write_unaligned(p.add(64) as *mut u64, 255); // f_namelen
+    }
+    0
+}
+
+fn sys_statfs(path_ptr: u64, buf: u64) -> u64 {
+    let Some(path) = read_cstr(path_ptr, 256) else {
+        return err(EFAULT);
+    };
+    // Any existing path is a mount point here — there's one volume, the
+    // root, so a statfs on anything that exists succeeds.
+    let path = normalize_path(&path);
+    if pseudo_stat(&path).is_none() && !crate::fat::exists(&path) {
+        return err(ENOENT);
+    }
+    fill_statfs(buf)
+}
+
+fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
+    if fd < 3 {
+        return fill_statfs(buf); // stdio = the console, on the root volume
+    }
+    let ok = with_process(|p| {
+        matches!(
+            p.fd_mut(fd as usize),
+            Some(FdEntry::File(_)) | Some(FdEntry::Dev(_)) | Some(FdEntry::Proc(_))
+        )
+    });
+    if ok != Some(true) {
+        return err(EBADF);
+    }
+    fill_statfs(buf)
+}
+
+/// `getdents64(fd, buf, count)`: serializes the directory fd's entries as
+/// `struct linux_dirent64` records (d_ino, d_off, d_reclen, d_type,
+/// name\0, padded to 8). Directory fds are FAT handles carrying the path
+/// (`FdEntry::File` with `is_dir`), or pseudo-dirs (`/proc`, `/dev`).
+fn sys_getdents64(fd: u64, buf: u64, count: u64) -> u64 {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    let Some(phys) = resolve(buf, count) else {
+        return err(EFAULT);
+    };
+    let Some(phys_max) = phys.checked_add(count) else {
+        return err(EFAULT);
+    };
+    // Snapshot the directory contents once: the FD's backing store isn't
+    // cursor-based, so a second getdents would return the same entries
+    // (acceptable — real clients read a directory in one shot).
+    let entries: alloc::vec::Vec<(String, u8, u64)> = with_process(|p| {
+        match p.fd_mut(fd as usize) {
+            Some(FdEntry::File(h)) if h.is_dir() => Some(h.path().to_string()),
+            _ => None,
+        }
+    })
+    .flatten()
+    .map(|path| pseudo_dir_entries(&path).unwrap_or_else(|| {
+        crate::fat::list_dir(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| {
+                let d_type = if e.is_dir { DT_DIR } else { DT_REG };
+                (e.name.clone(), d_type, e.first_cluster as u64 + 1)
+            })
+            .collect()
+    }))
+    .unwrap_or_default();
+    // TEMP PROBE: DIR struct + PTE/PDE state around the alias VA
+    if let Some(cr3) = crate::task::current_process_cr3() {
+        let mask = 0x000F_FFFF_FFFF_F000u64;
+        let pte_of = |va: u64| -> u64 {
+            let mut e = unsafe { *(cr3 as *const u64).add(((va >> 39) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e = unsafe { *((e & mask) as *const u64).add(((va >> 30) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e = unsafe { *((e & mask) as *const u64).add(((va >> 21) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e = unsafe { *((e & mask) as *const u64).add(((va >> 12) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e
+        };
+        let pde_of = |va: u64| -> u64 {
+            let mut e = unsafe { *(cr3 as *const u64).add(((va >> 39) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e = unsafe { *((e & mask) as *const u64).add(((va >> 30) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            unsafe { *((e & mask) as *const u64).add(((va >> 21) & 0x1FF) as usize) }
+        };
+        let dir_va = buf.wrapping_sub(0x18);
+        let dir_phys = resolve(dir_va, 64).unwrap_or(0);
+        let mut hex = alloc::string::String::new();
+        for i in 0..20u64 {
+            let b = unsafe { core::ptr::read_volatile((dir_phys + i) as *const u8) };
+            hex.push_str(&alloc::format!("{b:02x}"));
+        }
+        let kern = crate::paging::kernel_pml4() as *const u64;
+        let kern_pte_of = |va: u64| -> u64 {
+            let mask = 0x000F_FFFF_FFFF_F000u64;
+            let mut e = unsafe { *(kern).add(((va >> 39) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e = unsafe { *((e & mask) as *const u64).add(((va >> 30) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e = unsafe { *((e & mask) as *const u64).add(((va >> 21) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            if e & (1 << 7) != 0 {
+                return e; // 2 MiB entry — return the PDE itself
+            }
+            e = unsafe { *((e & mask) as *const u64).add(((va >> 12) & 0x1FF) as usize) };
+            if e & 1 == 0 {
+                return 0;
+            }
+            e
+        };
+        // TEMP PROBE: full DIR-region dump (malloc header + chunk)
+        if let Some(p2) = resolve(0x40001000u64, 64) {
+            let mut h1 = alloc::string::String::new();
+            let mut h2 = alloc::string::String::new();
+            for i in 0..64u64 {
+                let b = unsafe { core::ptr::read_volatile((p2 + i) as *const u8) };
+                h1.push_str(&alloc::format!("{b:02x}"));
+                h2.push_str(&alloc::format!("{:02x}", (0x694f038u64 & 0xff) as u8)); // placeholder
+            }
+            let mut h3 = alloc::string::String::new();
+            for i in 0..64u64 {
+                let b = unsafe { core::ptr::read_volatile((0x694f000u64 + i) as *const u8) };
+                h3.push_str(&alloc::format!("{b:02x}"));
+            }
+            crate::io::exception_print(crate::io::sprint(
+                &mut [0u8; 512],
+                format_args!("[FRM] p(0x40001000)={p2:#x} hdr={h1} phys0x694f000={h3}\n"),
+            ));
+        }
+        let tbl = with_process(|p| {
+            let mut s = alloc::string::String::new();
+            for i in 0..12usize {
+                match p.fd(i) {
+                    Some(crate::process::FdEntry::File(h)) => {
+                        s.push_str(&alloc::format!("{i}:F({},d={})", h.path(), h.is_dir()))
+                    }
+                    Some(_) => s.push_str(&alloc::format!("{i}:O")),
+                    None => s.push_str(&alloc::format!("{i}:-")),
+                }
+                s.push(' ');
+            }
+            s
+        })
+        .unwrap_or_default();
+        crate::io::exception_print(crate::io::sprint(
+            &mut [0u8; 1024],
+            format_args!(
+                "[GDBG] fd={fd} tbl=[{tbl}] dir_phys={dir_phys:#x} dir[0..20]={hex} pte(0x694f000)={:#x} pde(0x680000)={:#x} kern_pte(0x694f000)={:#x}\n",
+                pte_of(0x694f000),
+                pde_of(0x680000),
+                kern_pte_of(0x694f000)
+            ),
+        ));
+    }
+    let mut off: u64 = 0;
+    let mut written = 0u64;
+    let mut w = phys;
+    for (name, d_type, ino) in entries {
+        let name_bytes = name.as_bytes();
+        let reclen = 19 + name_bytes.len() + ((8 - (name_bytes.len() + 1) % 8) % 8);
+        if w + reclen as u64 > phys_max {
+            break; // out of room — real getdents stops at the buffer edge
+        }
+        off += reclen as u64;
+        unsafe {
+            core::ptr::write_unaligned(w as *mut u64, ino); // d_ino
+            core::ptr::write_unaligned((w + 8) as *mut u64, off); // d_off
+            core::ptr::write_unaligned((w + 16) as *mut u16, reclen as u16); // d_reclen
+            core::ptr::write_unaligned((w + 18) as *mut u8, d_type); // d_type
+            for (i, b) in name_bytes.iter().enumerate() {
+                core::ptr::write_unaligned((w + 19 + i as u64) as *mut u8, *b);
+            }
+            core::ptr::write_unaligned((w + 19 + name_bytes.len() as u64) as *mut u8, 0);
+        }
+        w += reclen as u64;
+        written += reclen as u64;
+    }
+    written
+}
+
+/// `getdents(fd, buf, count)` — the legacy format musl's `readdir` calls.
+/// Header is d_ino(8) d_off(8) d_reclen(2) + name\0, the record is padded
+/// to a multiple of 8, and the d_type byte is the record's *last* byte.
+fn sys_getdents(fd: u64, buf: u64, count: u64) -> u64 {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    let Some(phys) = resolve(buf, count) else {
+        return err(EFAULT);
+    };
+    let Some(phys_max) = phys.checked_add(count) else {
+        return err(EFAULT);
+    };
+    // Same directory snapshot as getdents64 (see sys_getdents64).
+    let entries: alloc::vec::Vec<(String, u8, u64)> = with_process(|p| {
+        match p.fd_mut(fd as usize) {
+            Some(FdEntry::File(h)) if h.is_dir() => Some(h.path().to_string()),
+            _ => None,
+        }
+    })
+    .flatten()
+    .map(|path| pseudo_dir_entries(&path).unwrap_or_else(|| {
+        crate::fat::list_dir(&path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| {
+                let d_type = if e.is_dir { DT_DIR } else { DT_REG };
+                (e.name.clone(), d_type, e.first_cluster as u64 + 1)
+            })
+            .collect()
+    }))
+    .unwrap_or_default();
+
+    let mut written = 0u64;
+    let mut w = phys;
+    for (name, d_type, ino) in entries {
+        let name_bytes = name.as_bytes();
+        // 18-byte header + NUL + padding to a multiple of 8; the final
+        // byte of the record carries d_type.
+        let reclen = 19 + name_bytes.len() + ((8 - (name_bytes.len() + 2) % 8) % 8);
+        if w + reclen as u64 > phys_max {
+            break;
+        }
+        unsafe {
+            core::ptr::write_unaligned(w as *mut u64, ino); // d_ino
+            core::ptr::write_unaligned((w + 8) as *mut u64, 0); // d_off
+            core::ptr::write_unaligned((w + 16) as *mut u16, reclen as u16); // d_reclen
+            for (i, b) in name_bytes.iter().enumerate() {
+                core::ptr::write_unaligned((w + 18 + i as u64) as *mut u8, *b);
+            }
+            core::ptr::write_unaligned((w + 18 + name_bytes.len() as u64) as *mut u8, 0);
+            core::ptr::write_unaligned((w + reclen as u64 - 1) as *mut u8, d_type);
+        }
+        w += reclen as u64;
+        written += reclen as u64;
+    }
+    written
+}
+
+/// Synthetic directory listings for the pseudo-filesystems, so `ls /proc`
+/// and `ls /dev` show what `openat` can actually give you.
+fn pseudo_dir_entries(path: &str) -> Option<alloc::vec::Vec<(String, u8, u64)>> {
+    const DT_DIR: u8 = 4;
+    const DT_REG: u8 = 8;
+    let entries: alloc::vec::Vec<(&str, u8, u64)> = match path {
+        "/proc" => alloc::vec![
+            ("self", DT_DIR, 2),
+            ("cpuinfo", DT_REG, 3),
+            ("meminfo", DT_REG, 4)
+        ],
+        "/dev" => alloc::vec![
+            ("null", DT_REG, 5),
+            ("zero", DT_REG, 6),
+            ("urandom", DT_REG, 7),
+            ("random", DT_REG, 8)
+        ],
+        _ => return None,
+    };
+    Some(entries.into_iter().map(|(n, t, i)| (n.to_string(), t, i)).collect())
 }
 
 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -2888,6 +3420,15 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_SYSINFO => sys_sysinfo(arg1),
         SYS_MEMFD_CREATE => sys_memfd_create(arg1, arg2),
         SYS_FTRUNCATE => sys_ftruncate(arg1, arg2),
+        // Phase 12 Linux-app porting: getcwd/nanosleep/statfs/getdents64.
+        SYS_GETCWD => sys_getcwd(arg1, arg2),
+        SYS_NANOSLEEP => sys_nanosleep(arg1, arg2),
+        SYS_CLOCK_NANOSLEEP => sys_clock_nanosleep(arg1, arg2, arg3, arg4),
+        SYS_STATFS => sys_statfs(arg1, arg2),
+        SYS_FSTATFS => sys_fstatfs(arg1, arg2),
+        SYS_GETDENTS64 => sys_getdents64(arg1, arg2, arg3),
+        SYS_GETDENTS => sys_getdents(arg1, arg2, arg3),
+        SYS_SENDFILE => sys_sendfile(arg1, arg2, arg3, arg4),
         SYS_SOCKET => sys_socket(arg1, arg2, arg3),
         SYS_CONNECT => sys_connect(arg1, arg2, arg3),
         SYS_SENDMSG => sys_sendmsg(arg1, arg2, arg3),
