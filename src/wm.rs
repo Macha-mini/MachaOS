@@ -32,7 +32,7 @@ use crate::task;
 
 const TITLE_BAR_HEIGHT: u32 = 32;
 const TASKBAR_HEIGHT: u32 = 48;
-const WINDOW_RADIUS: u32 = 8;
+const WINDOW_RADIUS: u32 = 10;
 const TITLE_BTN_W: u32 = 40;
 const TITLE_BTN_H: u32 = 28;
 const TITLE_BTN_GAP: u32 = 2;
@@ -75,9 +75,15 @@ const BTN_GLYPH: u32 = 0x00_FFFFFF;
 const BTN_GLYPH_DIM: u32 = 0x00_9A9A9A;
 const RESIZE_GRIP_COLOR: u32 = 0x00_4A4A4A;
 
+// Blur radius shared by every acrylic panel (taskbar, launcher, context
+// menu, window title bar): how far `gfx::blur_backdrop` softens the
+// desktop content showing through before the panel's translucent tint
+// is blended on top.
+const ACRYLIC_BLUR_RADIUS: u32 = 6;
+
 // Taskbar: translucent acrylic bar, centered icon group.
 const TASKBAR_BG: u32 = 0x00_1F1F1F;
-const TASKBAR_BG_ALPHA: u32 = 235;
+const TASKBAR_BG_ALPHA: u32 = 190;
 const TASKBAR_TOP_LINE: u32 = 0x00_2E2E2E;
 const TASKBAR_TEXT: u32 = 0x00_FFFFFF;
 const TASKBAR_TEXT_DIM: u32 = 0x00_8A8A8A;
@@ -94,7 +100,7 @@ const START_LOGO_COLOR: u32 = 0x00_FFB900;
 
 // Start-menu popup (Win11 style: search box + pinned tile grid).
 const LAUNCHER_BG: u32 = 0x00_262626;
-const LAUNCHER_BG_ALPHA: u32 = 235;
+const LAUNCHER_BG_ALPHA: u32 = 190;
 const LAUNCHER_BORDER: u32 = 0x00_3F3F3F;
 const LAUNCHER_SEARCH_BG: u32 = 0x00_3A3A3A;
 const LAUNCHER_TEXT: u32 = 0x00_FFFFFF;
@@ -112,6 +118,7 @@ const MENU_ITEM_H: u32 = 26;
 const MENU_PAD: u32 = 6;
 const MENU_W: u32 = 170;
 const MENU_BG: u32 = 0x00_252525;
+const MENU_BG_ALPHA: u32 = 210;
 const MENU_BORDER: u32 = 0x00_3F3F3F;
 const MENU_HOVER: u32 = 0x00_2C2C2C;
 const MENU_TEXT: u32 = 0x00_FFFFFF;
@@ -303,9 +310,11 @@ struct DragState {
     last_y: i32,
 }
 
-/// Pixels of the desktop (with the dragged window absent) captured at
-/// the drag's start, covering the window's rect plus its shadow. Each
-/// drag frame restores this over the window's previous position.
+/// Pixels of the desktop (with the dragged window absent) at the
+/// window's current position, covering its rect plus its shadow. Each
+/// drag frame restores this over the window's previous position to
+/// erase it, then re-snapshots the (now correctly restored) desktop at
+/// the window's new position for the following frame's erase.
 struct DragBg {
     w: u32,
     h: u32,
@@ -1041,6 +1050,7 @@ impl WindowManager {
 
         gfx::fill_rounded_rect_blend(surface, px + 6, py + 6, pw, ph, 12, 0x00_000000, 90);
         gfx::fill_rounded_rect(surface, px - 1, py - 1, pw + 2, ph + 2, 13, LAUNCHER_BORDER);
+        gfx::blur_backdrop(surface, px, py, pw, ph, ACRYLIC_BLUR_RADIUS);
         gfx::fill_rounded_rect_blend(surface, px, py, pw, ph, 12, LAUNCHER_BG, LAUNCHER_BG_ALPHA);
 
         // Search box (decorative for now).
@@ -1899,9 +1909,11 @@ impl WindowManager {
 
     /// Partial composite while a window is being dragged: erase the
     /// window's previous position from the back buffer (restoring the
-    /// desktop-without-it snapshot), draw it at its new position, and
-    /// push only the union of the old and new regions — instead of
-    /// recompositing the whole desktop on every mouse move.
+    /// desktop-without-it snapshot), re-snapshot the desktop at the
+    /// window's *new* position for the next frame's erase, draw it at
+    /// its new position, and push only the union of the old and new
+    /// regions — instead of recompositing the whole desktop on every
+    /// mouse move.
     pub fn composite_drag(&mut self) {
         let Some((idx, last_x, last_y)) = self
             .dragging
@@ -1910,19 +1922,27 @@ impl WindowManager {
         else {
             return self.composite();
         };
-        let Some(bg) = self.drag_bg.as_ref() else {
+        let Some((bg_w, bg_h)) = self.drag_bg.as_ref().map(|bg| (bg.w, bg.h)) else {
             return self.composite();
         };
         let (wx, wy) = (self.windows[idx].x, self.windows[idx].y);
         let m = SHADOW_MARGIN;
         if (wx, wy) != (last_x, last_y) {
-            fb::restore_region(
-                (last_x - m).max(0) as u32,
-                (last_y - m).max(0) as u32,
-                bg.w,
-                bg.h,
-                &bg.pixels,
-            );
+            let old_x = (last_x - m).max(0) as u32;
+            let old_y = (last_y - m).max(0) as u32;
+            if let Some(bg) = self.drag_bg.as_ref() {
+                fb::restore_region(old_x, old_y, bg_w, bg_h, &bg.pixels);
+            }
+            // The old position now shows the real static desktop again,
+            // so snapshot the *new* position before drawing over it —
+            // reusing the snapshot from drag start (as this used to)
+            // pastes whatever was originally behind the window's
+            // starting point wherever it's dragged to since, leaving a
+            // trail of stale wallpaper behind it.
+            let new_x = (wx - m).max(0) as u32;
+            let new_y = (wy - m).max(0) as u32;
+            let pixels = fb::snapshot_region(new_x, new_y, bg_w, bg_h);
+            self.drag_bg = Some(DragBg { w: bg_w, h: bg_h, pixels });
         }
         fb::with_surface(|surface| {
             draw_window(surface, &self.windows[idx], idx == self.focused, self.cursor_x, self.cursor_y);
@@ -1932,11 +1952,11 @@ impl WindowManager {
         // clamped to the screen.
         let min_x = ((last_x - m).min(wx - m)).max(0) as u32;
         let min_y = ((last_y - m).min(wy - m)).max(0) as u32;
-        let max_x = ((last_x + bg.w as i32 - m)
-            .max(wx + bg.w as i32 - m))
+        let max_x = ((last_x + bg_w as i32 - m)
+            .max(wx + bg_w as i32 - m))
             .min(self.screen_w as i32) as u32;
-        let max_y = ((last_y + bg.h as i32 - m)
-            .max(wy + bg.h as i32 - m))
+        let max_y = ((last_y + bg_h as i32 - m)
+            .max(wy + bg_h as i32 - m))
             .min(self.screen_h as i32) as u32;
         if let Some(d) = self.dragging.as_mut() {
             d.last_x = wx;
@@ -1994,6 +2014,7 @@ impl WindowManager {
     /// group, and the clock in a tray on the right.
     fn draw_taskbar(&self, surface: &mut dyn Surface) {
         let y = self.screen_h - TASKBAR_HEIGHT;
+        gfx::blur_backdrop(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, ACRYLIC_BLUR_RADIUS);
         gfx::fill_rect_blend(surface, 0, y, self.screen_w, TASKBAR_HEIGHT, TASKBAR_BG, TASKBAR_BG_ALPHA);
         gfx::fill_rect(surface, 0, y, self.screen_w, 1, TASKBAR_TOP_LINE);
 
@@ -2087,7 +2108,8 @@ fn draw_context_menu(surface: &mut dyn Surface, menu: &ContextMenu, cx: i32, cy:
     // Soft drop shadow, then the border + surface.
     gfx::fill_rounded_rect_blend(surface, x + 3, y + 3, menu.w, menu.h, 8, 0x00_000000, 70);
     gfx::fill_rounded_rect(surface, x - 1, y - 1, menu.w + 2, menu.h + 2, 9, MENU_BORDER);
-    gfx::fill_rounded_rect(surface, x, y, menu.w, menu.h, 8, MENU_BG);
+    gfx::blur_backdrop(surface, x, y, menu.w, menu.h, ACRYLIC_BLUR_RADIUS);
+    gfx::fill_rounded_rect_blend(surface, x, y, menu.w, menu.h, 8, MENU_BG, MENU_BG_ALPHA);
     for (i, item) in menu.items.iter().enumerate() {
         let iy = y + MENU_PAD + i as u32 * MENU_ITEM_H;
         let hovered = cx >= x as i32

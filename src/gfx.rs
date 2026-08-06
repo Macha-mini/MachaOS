@@ -100,19 +100,42 @@ fn fill_span_clipped(surface: &mut dyn Surface, x: u32, y: u32, w: u32, color: u
     surface.fill_span(x, y, x_end - x, color);
 }
 
+/// Integer square root (floor) via Newton's method. `r` is always small
+/// here (window/panel corner radii, at most a few dozen px), so this
+/// converges in a handful of iterations — cheap enough to call per row
+/// in `rounded_inset` with no FPU involved.
+fn isqrt(n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let mut x = n;
+    let mut y = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    x
+}
+
 /// Horizontal inset for a given scanline of a rectangle with rounded
 /// corners of radius `r`: `0` in the middle rows, growing toward the
-/// corners so the painted width narrows to an arc there.
+/// corners along a true quarter-circle arc (not a linear chamfer) so
+/// the painted width narrows smoothly there instead of faceting into
+/// an octagon.
 fn rounded_inset(row: u32, h: u32, r: u32) -> u32 {
     if r == 0 {
-        0
-    } else if row < r {
+        return 0;
+    }
+    // Vertical distance from the corner's outer edge, 0..r.
+    let dy = if row < r {
         r - 1 - row
     } else if row >= h - r {
         row - (h - r)
     } else {
-        0
-    }
+        return 0;
+    };
+    let dx = isqrt(r * r - dy * dy);
+    r - dx.min(r)
 }
 
 /// Like `fill_rect`, but with the four corners clipped to a circular arc
@@ -232,6 +255,86 @@ pub fn fill_rounded_rect_blend(
         let inner = w.saturating_sub(2 * inset);
         if inner >= 2 {
             blend_span_clipped(surface, x + inset, y + row, inner, color, alpha);
+        }
+    }
+}
+
+/// Softens whatever is already composited under a translucent panel
+/// (taskbar, launcher, context menu) so the panel's alpha tint reads as
+/// frosted glass instead of a flat dark rectangle over a sharp
+/// backdrop. Cheap approximation rather than a true per-pixel blur:
+/// reads the backdrop back at a coarse stride (`DOWNSAMPLE`), box-blurs
+/// that small buffer, then bilinear-upsamples it back to full size with
+/// `scale_pixels` (the same scaler the desktop compositor already uses
+/// for wallpaper/present scaling) — a full-resolution box blur over,
+/// say, the whole taskbar width was measurably heavier, and this panel
+/// redraws on most desktop events (mouse move, blink, clock tick), so
+/// it has to stay cheap. Call this immediately before the panel's own
+/// `fill_rect_blend`/`fill_rounded_rect_blend` tint pass, over the same
+/// footprint. Requires the surface's `get_pixel` to return real data
+/// (the desktop back buffer does); on a surface that can't read back,
+/// this is a no-op since there's nothing to blur.
+pub fn blur_backdrop(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32, radius: u32) {
+    if radius == 0 {
+        return;
+    }
+    let x_end = (x + w).min(surface.width());
+    let y_end = (y + h).min(surface.height());
+    if x_end <= x || y_end <= y {
+        return;
+    }
+    let w = x_end - x;
+    let h = y_end - y;
+    if w < 2 || h < 2 {
+        return;
+    }
+
+    const DOWNSAMPLE: u32 = 4;
+    let dw = (w / DOWNSAMPLE).max(1);
+    let dh = (h / DOWNSAMPLE).max(1);
+    let mut small = vec![0u32; (dw * dh) as usize];
+    for sy in 0..dh {
+        let src_y = y + (sy * h) / dh;
+        for sx in 0..dw {
+            let src_x = x + (sx * w) / dw;
+            small[(sy * dw + sx) as usize] = surface.get_pixel(src_x, src_y).unwrap_or(0);
+        }
+    }
+    let radius_small = radius.div_ceil(DOWNSAMPLE).max(1);
+    let mut tmp = vec![0u32; (dw * dh) as usize];
+    box_blur_pass(&small, &mut tmp, dw, dh, radius_small, true);
+    let mut blurred = vec![0u32; (dw * dh) as usize];
+    box_blur_pass(&tmp, &mut blurred, dw, dh, radius_small, false);
+
+    let mut out = vec![0u32; (w * h) as usize];
+    scale_pixels(|sx, sy| blurred[(sy * dw + sx) as usize], dw, dh, &mut out, w, h, None);
+    for row in 0..h {
+        for col in 0..w {
+            surface.put_pixel(x + col, y + row, out[(row * w + col) as usize]);
+        }
+    }
+}
+
+/// One pass of `blur_backdrop`'s separable box blur: averages a
+/// `2*radius+1`-wide window of neighbors along one axis (rows when
+/// `horizontal`, columns otherwise), clamped at the buffer edges.
+fn box_blur_pass(src: &[u32], dst: &mut [u32], w: u32, h: u32, radius: u32, horizontal: bool) {
+    let (outer, inner) = if horizontal { (h, w) } else { (w, h) };
+    for o in 0..outer {
+        for i in 0..inner {
+            let lo = i.saturating_sub(radius);
+            let hi = (i + radius).min(inner - 1);
+            let mut sum = [0u32; 3];
+            for j in lo..=hi {
+                let (row, col) = if horizontal { (o, j) } else { (j, o) };
+                let p = src[(row * w + col) as usize];
+                sum[0] += (p >> 16) & 0xFF;
+                sum[1] += (p >> 8) & 0xFF;
+                sum[2] += p & 0xFF;
+            }
+            let n = hi - lo + 1;
+            let (row, col) = if horizontal { (o, i) } else { (i, o) };
+            dst[(row * w + col) as usize] = ((sum[0] / n) << 16) | ((sum[1] / n) << 8) | (sum[2] / n);
         }
     }
 }
