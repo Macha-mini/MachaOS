@@ -109,7 +109,7 @@ fn tokenize(line: &str) -> Vec<String> {
 pub const COMMANDS: &[&str] = &[
     "help", "clear", "cls", "echo", "time", "date", "uptime", "meminfo", "heap", "cpuinfo",
     "version", "ver", "reboot", "shutdown", "crash", "breakpoint", "fault", "panic", "mousetest",
-    "tasks", "netinfo", "netudp", "nettcp", "wget", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "run", "runlinux",
+    "tasks", "netinfo", "netudp", "nettcp", "wget", "ls", "cat", "fatinfo", "write", "mkdir", "rm", "mv", "cp", "run", "runlinux",
 ];
 
 pub fn run() -> ! {
@@ -319,6 +319,7 @@ pub fn execute(line: &str) {
         "mkdir" => cmd_mkdir(&args),
         "rm" => cmd_rm(&args),
         "mv" => cmd_mv(&args),
+        "cp" => cmd_cp(&args),
         "run" => cmd_run(&args),
         "runlinux" => cmd_runlinux(&args),
         "cd" => cmd_cd(&args),
@@ -357,6 +358,8 @@ fn cmd_help() {
     println!("  rm <path>   remove a file or empty directory");
     println!("  mv <path> <new-name>");
     println!("               rename a file or directory in place");
+    println!("  cp <src> <dst>");
+    println!("               copy a file or directory tree (source stays)");
     println!("  run <path>  load and run an ELF program as a process");
     println!("  runlinux <path> [args...]");
     println!("               load and run a Linux ELF binary (Linux ABI, see linux_abi.rs)");
@@ -471,6 +474,25 @@ fn cmd_mv(args: &[&str]) {
     match fat::rename(&path, &new_name) {
         Ok(()) => println!("renamed {} to {}", path, new_name),
         Err(e) => println!("mv: {}: {}", path, e),
+    }
+}
+
+fn cmd_cp(args: &[&str]) {
+    if args.len() != 2 {
+        println!("usage: cp <src> <dst>");
+        return;
+    }
+    let src = abs_path(args[0]);
+    let mut dst = abs_path(args[1]);
+    // Copying into an existing directory lands inside it (Unix `cp`
+    // semantics): `cp file dir/` copies to `dir/file`.
+    if fat::is_dir(&dst).unwrap_or(false) {
+        let name = src.rsplit('/').next().unwrap_or(&src).to_string();
+        dst = format!("{}/{}", dst.trim_end_matches('/'), name);
+    }
+    match fat::copy_file(&src, &dst) {
+        Ok(()) => println!("copied {} to {}", src, dst),
+        Err(e) => println!("cp: {} -> {}: {}", src, dst, e),
     }
 }
 
@@ -1290,6 +1312,78 @@ pub fn selftest() -> ! {
     }
     if let Err(_e) = fat::remove("/selftest") {
         selftest_fail("rename test cleanup root failed");
+    }
+
+    // `cp` (Phase B): copy_file duplicates a file's bytes under a new
+    // name with the original left intact, overwrites an existing file,
+    // recursively copies a directory tree, and refuses to copy a
+    // directory into itself. The shell `cp` command then drives the
+    // same path end to end.
+    if let Err(e) = fat::make_dir("/selftest") {
+        selftest_fail(&format!("cp test mkdir failed: {}", e));
+    }
+    if let Err(e) = fat::write_file("/selftest/original.txt", b"copy payload") {
+        selftest_fail(&format!("cp source write failed: {}", e));
+    }
+    if let Err(e) = fat::copy_file("/selftest/original.txt", "/selftest/copy.txt") {
+        selftest_fail(&format!("cp file copy failed: {}", e));
+    }
+    match fat::read_file("/selftest/copy.txt") {
+        Ok(data) if data == b"copy payload" && fat::read_file("/selftest/original.txt").is_ok() => {
+            println!("[OK] FAT32 copy_file duplicates a file (original intact)")
+        }
+        _ => selftest_fail("cp copy result mismatch"),
+    }
+    if let Err(e) = fat::write_file("/selftest/copy.txt", b"old content") {
+        selftest_fail(&format!("cp overwrite setup failed: {}", e));
+    }
+    if let Err(e) = fat::copy_file("/selftest/original.txt", "/selftest/copy.txt") {
+        selftest_fail(&format!("cp overwrite failed: {}", e));
+    }
+    match fat::read_file("/selftest/copy.txt") {
+        Ok(data) if data == b"copy payload" => println!("[OK] FAT32 copy_file overwrites an existing file"),
+        _ => selftest_fail("cp overwrite result mismatch"),
+    }
+    if let Err(e) = fat::make_dir("/selftest/tree") {
+        selftest_fail(&format!("cp dir setup mkdir failed: {}", e));
+    }
+    if let Err(e) = fat::write_file("/selftest/tree/nested.txt", b"nested") {
+        selftest_fail(&format!("cp dir child write failed: {}", e));
+    }
+    if let Err(e) = fat::copy_file("/selftest/tree", "/selftest/tree-copy") {
+        selftest_fail(&format!("cp directory copy failed: {}", e));
+    }
+    match fat::read_file("/selftest/tree-copy/nested.txt") {
+        Ok(data) if data == b"nested" => println!("[OK] FAT32 copy_file copies a directory tree recursively"),
+        _ => selftest_fail("cp directory copy result mismatch"),
+    }
+    match fat::copy_file("/selftest/tree", "/selftest/tree/tree-copy") {
+        Err(_) => println!("[OK] FAT32 copy_file refuses a directory copy into itself"),
+        _ => selftest_fail("cp into itself was not rejected"),
+    }
+    if let Err(e) = fat::write_file("/selftest/sh-src.txt", b"shell cp") {
+        selftest_fail(&format!("shell cp setup failed: {}", e));
+    }
+    execute("cp /selftest/sh-src.txt /selftest/sh-dst.txt");
+    if fat::read_file("/selftest/sh-dst.txt").map(|d| d == b"shell cp").unwrap_or(false) {
+        println!("[OK] shell cp command copies files");
+    } else {
+        selftest_fail("shell cp did not copy the file");
+    }
+    for leftover in [
+        "/selftest/original.txt",
+        "/selftest/copy.txt",
+        "/selftest/sh-src.txt",
+        "/selftest/sh-dst.txt",
+        "/selftest/tree/nested.txt",
+        "/selftest/tree",
+        "/selftest/tree-copy/nested.txt",
+        "/selftest/tree-copy",
+    ] {
+        let _ = fat::remove(leftover);
+    }
+    if let Err(e) = fat::remove("/selftest") {
+        selftest_fail(&format!("cp test cleanup failed: {}", e));
     }
 
     // Shell path handling: cd/pwd, `..`, home expansion, and relative access.

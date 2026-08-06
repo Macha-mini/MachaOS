@@ -87,6 +87,11 @@ pub enum ExplorerMenuAction {
     Open,
     Rename,
     Delete,
+    /// Copy the selected entries (paths only — the actual bytes are read
+    /// when Paste runs, so copied files may be edited meanwhile).
+    Copy,
+    /// Paste every copied entry into the current directory.
+    Paste,
     /// Restore the selected entry to its original location (trash only).
     Restore,
     /// Physically delete everything in the trash (trash only).
@@ -175,6 +180,10 @@ pub struct FileExplorer {
     free_bytes: u64,
     sidebar: Vec<SidebarEntry>,
     drag: Option<DragInfo>,
+    // The explorer's own clipboard: absolute source paths of the copied
+    // entries (with their directory flags), kept across navigation so
+    // the user can copy in one folder and paste in another.
+    clip: Vec<(String, bool)>,
 }
 
 fn is_elf(name: &str) -> bool {
@@ -245,6 +254,32 @@ fn char_index(s: &str, char_index: usize) -> usize {
     s.char_indices().nth(char_index).map(|(i, _)| i).unwrap_or(s.len())
 }
 
+/// A name that collides with nothing in `taken` (lowercase names): the
+/// original, or one with a ` (n)` suffix before the extension, like the
+/// New-Folder/New-File dedup (`file.txt` -> `file (2).txt`).
+fn unique_name(name: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|t| *t == name.to_lowercase()) {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    // Bounded like the New-Folder/New-File dedup: a directory could in
+    // theory hold many "name (n)" variants; beyond the cap the last
+    // candidate is used as-is (the copy then fails loudly instead of
+    // hanging the desktop).
+    let mut i = 2;
+    while i < 100 {
+        let candidate = format!("{} ({}){}", stem, i, ext);
+        if !taken.iter().any(|t| *t == candidate.to_lowercase()) {
+            return candidate;
+        }
+        i += 1;
+    }
+    format!("{} ({}){}", stem, i, ext)
+}
+
 /// Compares two entries: directories first, then by the active sort key.
 fn entry_less(a: &DirEntry, b: &DirEntry, key: SortKey, asc: bool) -> bool {
     if a.is_dir != b.is_dir {
@@ -306,6 +341,7 @@ impl FileExplorer {
             free_bytes: 0,
             sidebar: Vec::new(),
             drag: None,
+            clip: Vec::new(),
         };
         app.navigate(users::home());
         app
@@ -511,6 +547,67 @@ impl FileExplorer {
         self.anchor = new;
         self.ensure_selection_visible();
         self.render();
+    }
+
+    /// Copies the selected entries' absolute paths (with their directory
+    /// flags) into the explorer's clipboard. The actual data stays on
+    /// disk until a Paste reads it, so a file edited between Copy and
+    /// Paste is copied with its newer contents.
+    fn copy_selected(&mut self) {
+        let copied: Vec<(String, bool)> = self
+            .selected_indices()
+            .iter()
+            .filter_map(|&i| self.entry_path(i))
+            .collect();
+        if copied.is_empty() {
+            return;
+        }
+        self.clip = copied;
+        let n = self.clip.len();
+        self.status = format!("copied {} item{}", n, if n == 1 { "" } else { "s" });
+        self.render();
+    }
+
+    /// Whether the clipboard holds entries (so the context menu can show
+    /// a Paste item only when there is something to paste).
+    pub fn has_clipboard(&self) -> bool {
+        !self.clip.is_empty()
+    }
+
+    /// Pastes every entry in the clipboard into the current directory,
+    /// deduplicating names against what is already here (`file.txt`
+    /// becomes `file (2).txt`). Files are copied with their current
+    /// on-disk contents; directory trees copy recursively.
+    fn paste_clipboard(&mut self) {
+        if self.clip.is_empty() {
+            self.status = "clipboard is empty — copy a file first".to_string();
+            self.render();
+            return;
+        }
+        let mut taken: Vec<String> = self.entries.iter().map(|e| e.name.to_lowercase()).collect();
+        let mut pasted = 0usize;
+        let mut failed: Option<String> = None;
+        for (src, _is_dir) in self.clip.clone() {
+            let base = src.rsplit('/').next().unwrap_or(&src).to_string();
+            let name = unique_name(&base, &taken);
+            let dst = join(&self.path, &name);
+            match fat::copy_file(&src, &dst) {
+                Ok(()) => {
+                    pasted += 1;
+                    taken.push(name.to_lowercase());
+                }
+                Err(e) => {
+                    if failed.is_none() {
+                        failed = Some(format!("{}: {}", base, e));
+                    }
+                }
+            }
+        }
+        self.status = match failed {
+            Some(err) => format!("pasted {} item{}, {} failed ({})", pasted, if pasted == 1 { "" } else { "s" }, self.clip.len().saturating_sub(pasted), err),
+            None => format!("pasted {} item{}", pasted, if pasted == 1 { "" } else { "s" }),
+        };
+        self.refresh();
     }
 
     /// Whether `index` is part of the current selection (primary or
@@ -1076,6 +1173,8 @@ impl FileExplorer {
             keyboard::Event::Char('n') => self.create_folder(),
             keyboard::Event::Char('f') => self.create_file(),
             keyboard::Event::Char('v') => self.toggle_view(),
+            keyboard::Event::Ctrl('c') => self.copy_selected(),
+            keyboard::Event::Ctrl('v') => self.paste_clipboard(),
             keyboard::Event::Ctrl('f') => {
                 self.search_mode = true;
                 self.status = "検索モード: 名前の一部を入力 / Esc で終了".to_string();
@@ -1142,6 +1241,14 @@ impl FileExplorer {
             }
             ExplorerMenuAction::Delete => {
                 self.delete_selected();
+                None
+            }
+            ExplorerMenuAction::Copy => {
+                self.copy_selected();
+                None
+            }
+            ExplorerMenuAction::Paste => {
+                self.paste_clipboard();
                 None
             }
             ExplorerMenuAction::Restore => {

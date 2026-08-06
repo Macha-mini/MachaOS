@@ -1377,6 +1377,10 @@ impl WindowManager {
                     AppKind::FileExplorer(app) => app.in_trash(),
                     _ => false,
                 };
+                let can_paste = match &self.windows[index].kind {
+                    AppKind::FileExplorer(app) => app.has_clipboard(),
+                    _ => false,
+                };
                 if let AppKind::FileExplorer(app) = &mut self.windows[index].kind {
                     app.select_at(local_x, local_y);
                 }
@@ -1389,14 +1393,22 @@ impl WindowManager {
                         ContextItem { label: "Refresh", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Refresh) },
                     ]
                 } else {
-                    vec![
+                    let mut items = vec![
                         ContextItem { label: "Open", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Open) },
+                        ContextItem { label: "Copy", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Copy) },
                         ContextItem { label: "Rename", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Rename) },
                         ContextItem { label: "Delete", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Delete) },
                         ContextItem { label: "New Folder", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFolder) },
                         ContextItem { label: "New File", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::NewFile) },
                         ContextItem { label: "Refresh", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Refresh) },
-                    ]
+                    ];
+                    if can_paste {
+                        items.insert(
+                            2,
+                            ContextItem { label: "Paste", action: ContextAction::Explorer(crate::file_explorer::ExplorerMenuAction::Paste) },
+                        );
+                    }
+                    items
                 }
             }
             None => vec![

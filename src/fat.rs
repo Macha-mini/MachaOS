@@ -6,6 +6,7 @@
 //! operations keep a per-sector dirty map for the FAT and flush it back
 //! to disk before returning.
 
+use alloc::format;
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec;
@@ -1106,5 +1107,39 @@ pub fn move_file(src: &str, dst: &str) -> Result<(), FatError> {
         let data = read_file(src)?;
         write_file(dst, &data)?;
         remove(src)
+    }
+}
+
+/// Copies `src` to `dst` — a file, or a whole directory tree
+/// (recursively). The source is left in place (unlike `move_file`).
+///
+/// An existing file at `dst` is overwritten; an existing directory makes
+/// `make_dir` fail with `AlreadyExists` (the copy aborts rather than
+/// merging into it). Copying a directory into itself — or into one of
+/// its own subdirectories — fails with `Io` instead of recursing until
+/// the stack dies.
+pub fn copy_file(src: &str, dst: &str) -> Result<(), FatError> {
+    if src == dst {
+        return Ok(());
+    }
+    // Copying the whole root would walk the entire volume; refuse it
+    // rather than letting a stray command recurse through everything.
+    if src == "/" {
+        return Err(FatError::Io("cannot copy the root directory"));
+    }
+    if is_dir(src)? {
+        let prefix = format!("{}/", src);
+        if dst == src || dst.starts_with(&prefix) {
+            return Err(FatError::Io("cannot copy a directory into itself"));
+        }
+        make_dir(dst)?;
+        let entries = list_dir(src)?;
+        for entry in entries {
+            copy_file(&format!("{}/{}", src, entry.name), &format!("{}/{}", dst, entry.name))?;
+        }
+        Ok(())
+    } else {
+        let data = read_file(src)?;
+        write_file(dst, &data)
     }
 }
