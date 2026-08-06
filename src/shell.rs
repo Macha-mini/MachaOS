@@ -15,6 +15,120 @@ pub const PROMPT: &str = "machaos> ";
 // Empty means "not set yet": the shell starts in the user's home.
 static CWD: SpinLock<String> = SpinLock::new(String::new());
 
+// ---- Phase B.4: pipes, redirection, variables, simple control flow ----
+
+/// Shell variables (`VAR=value`, read with `$VAR`/`${VAR}`).
+static VARS: SpinLock<Vec<(String, String)>> = SpinLock::new(Vec::new());
+
+/// Standard input handed to the current command (pipe stage or `<` file).
+static CURRENT_STDIN: SpinLock<Option<String>> = SpinLock::new(None);
+
+/// Whether the most recent command succeeded (`if` conditions).
+static LAST_STATUS: SpinLock<bool> = SpinLock::new(false);
+
+fn get_var(name: &str) -> String {
+    let vars = VARS.lock();
+    for (k, v) in vars.iter() {
+        if k == name {
+            return v.clone();
+        }
+    }
+    String::new()
+}
+
+fn set_var(name: &str, value: &str) {
+    let mut vars = VARS.lock();
+    for (k, v) in vars.iter_mut() {
+        if k == name {
+            *v = value.to_string();
+            return;
+        }
+    }
+    vars.push((name.to_string(), value.to_string()));
+}
+
+/// Expands `$VAR` and `${VAR}` in a command line (unknown variables
+/// expand to the empty string, like POSIX).
+fn expand_vars_in_line(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(idx) = rest.find('$') {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 1..];
+        if let Some(stripped) = after.strip_prefix('{') {
+            if let Some(end) = stripped.find('}') {
+                out.push_str(&get_var(&stripped[..end]));
+                rest = &stripped[end + 1..];
+                continue;
+            }
+        }
+        let name_len = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .count();
+        if name_len > 0 {
+            out.push_str(&get_var(&after[..name_len]));
+            rest = &after[name_len..];
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Splits a command line into pipeline stages on `|` (quotes respected).
+fn split_pipe(line: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in line.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push(c);
+            }
+            '|' if !in_quotes => {
+                segments.push(core::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    segments.push(cur);
+    segments.retain(|s| !s.trim().is_empty());
+    segments
+}
+
+/// Pulls `> file` / `< file` redirections out of a token list. `>>` is
+/// treated the same as `>` (no append mode; the FAT layer overwrites).
+fn parse_redirects(
+    tokens: Vec<String>,
+) -> (Vec<String>, Option<String>, Option<String>) {
+    let mut args = Vec::new();
+    let mut out: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut iter = tokens.into_iter();
+    while let Some(tok) = iter.next() {
+        match tok.as_str() {
+            ">" | ">>" => out = iter.next(),
+            "<" => input = iter.next(),
+            _ => args.push(tok),
+        }
+    }
+    (args, out, input)
+}
+
+/// Runs `f` with `print!` output captured into a `String`, restoring any
+/// outer capture afterwards (a stage may itself contain `>`).
+fn capture_output<F: FnOnce()>(f: F) -> String {
+    let mut buf = String::new();
+    let prev = io::set_output_capture(Some(&mut buf));
+    f();
+    io::restore_output_capture(prev);
+    buf
+}
+
 /// Returns the current working directory (always starts with `/`).
 pub fn cwd() -> String {
     let dir = CWD.lock().clone();
@@ -246,22 +360,26 @@ fn read_line() -> String {
     }
 }
 
-pub fn execute(line: &str) {
-    let line = line.trim();
-    if line.is_empty() {
-        return;
+/// Dispatches a single command with the given standard input. Returns
+/// whether it succeeded; the result is also recorded in `LAST_STATUS`
+/// for `if` conditions.
+fn run_command(args: &[String], input: Option<String>) -> Result<(), ()> {
+    *CURRENT_STDIN.lock() = input;
+    // A redirection-only line (`> file`, `< file`) has no command after
+    // stripping; treat it as a no-op rather than indexing past the end.
+    if args.is_empty() {
+        *LAST_STATUS.lock() = true;
+        return Ok(());
     }
+    let command = args[0].as_str();
+    let args: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
 
-    let words = tokenize(line);
-    if words.is_empty() {
-        return;
-    }
-    let command = words[0].as_str();
-    let args: Vec<&str> = words.iter().skip(1).map(String::as_str).collect();
-
-    match command {
+    let result = match command {
         "help" => cmd_help(),
-        "clear" | "cls" => io::clear_active(),
+        "clear" | "cls" => {
+            io::clear_active();
+            Ok(())
+        }
         "echo" => {
             for (i, arg) in args.iter().enumerate() {
                 if i > 0 {
@@ -270,20 +388,26 @@ pub fn execute(line: &str) {
                 print!("{}", arg);
             }
             println!();
+            Ok(())
         }
         "time" => {
             let ticks = interrupts::ticks();
             println!("system ticks: {}", ticks);
+            Ok(())
         }
         "date" => cmd_date(),
         "uptime" => {
             let ticks = interrupts::ticks();
             println!("uptime: {} seconds ({} ticks)", ticks / 100, ticks);
+            Ok(())
         }
         "meminfo" => cmd_meminfo(),
         "heap" => cmd_heap(),
         "cpuinfo" => cmd_cpuinfo(),
-        "version" | "ver" => println!("{}", BANNER),
+        "version" | "ver" => {
+            println!("{}", BANNER);
+            Ok(())
+        }
         "reboot" => {
             println!("rebooting...");
             reboot();
@@ -300,6 +424,7 @@ pub fn execute(line: &str) {
             println!("triggering an int3 breakpoint (#BP)...");
             breakpoint_demo();
             println!("...returned from the breakpoint");
+            Ok(())
         }
         "fault" => {
             println!("triggering a page fault (#PF)...");
@@ -323,13 +448,192 @@ pub fn execute(line: &str) {
         "run" => cmd_run(&args),
         "runlinux" => cmd_runlinux(&args),
         "cd" => cmd_cd(&args),
-        "pwd" => println!("{}", cwd()),
-        "whoami" => println!("{}", crate::users::USER),
-        _ => println!("unknown command: '{}' (type 'help')", command),
+        "pwd" => {
+            println!("{}", cwd());
+            Ok(())
+        }
+        "whoami" => {
+            println!("{}", crate::users::USER);
+            Ok(())
+        }
+        _ => {
+            println!("unknown command: '{}' (type 'help')", command);
+            Err(())
+        }
+    };
+    *LAST_STATUS.lock() = result.is_ok();
+    result
+}
+
+/// Executes one pipeline stage: resolves `<` input and `>` output, then
+/// runs the command. `>` output is written to the file after capture.
+fn execute_simple(seg: &str, input: Option<String>) {
+    let tokens = tokenize(seg);
+    if tokens.is_empty() {
+        return;
+    }
+    let (args, redir_out, redir_in) = parse_redirects(tokens);
+    let stdin = match redir_in {
+        Some(path) => {
+            let p = abs_path(&path);
+            fat::read_file(&p).ok().map(|data| {
+                data.iter()
+                    .map(|&b| if b.is_ascii() { b as char } else { '?' })
+                    .collect()
+            })
+        }
+        None => input,
+    };
+    if let Some(path) = redir_out {
+        let p = abs_path(&path);
+        let out = capture_output(|| {
+            let _ = run_command(&args, stdin);
+        });
+        let _ = fat::write_file(&p, out.as_bytes());
+    } else {
+        let _ = run_command(&args, stdin);
     }
 }
 
-fn cmd_help() {
+/// Runs a command whose success decides an `if` branch. Its output is
+/// discarded (conditions behave like POSIX: only the exit status
+/// matters), and `$VAR`s are expanded first.
+fn run_condition(cond: &str) -> bool {
+    let expanded = expand_vars_in_line(cond);
+    let _ = capture_output(|| execute_simple(&expanded, None));
+    *LAST_STATUS.lock()
+}
+
+/// Handles the one-line control constructs:
+///   `if <cmd>; then <cmd>; else <cmd>; fi`
+///   `for <var> in <items>; do <cmd>; done`
+/// Returns true when the line was a control construct (already consumed).
+fn try_control(line: &str) -> bool {
+    if line.starts_with("if ") {
+        let body = &line[3..];
+        let Some(then_idx) = body.find("; then ") else {
+            return false;
+        };
+        let cond = body[..then_idx].trim();
+        let after_then = &body[then_idx + 7..];
+        let (then_cmd, else_cmd) =
+            if let Some(else_idx) = after_then.find("; else ") {
+                let then_cmd = after_then[..else_idx].trim();
+                let after_else = &after_then[else_idx + 7..];
+                let else_cmd = after_else
+                    .strip_suffix("; fi")
+                    .unwrap_or(after_else)
+                    .trim();
+                (then_cmd, Some(else_cmd))
+            } else {
+                let then_cmd = after_then
+                    .strip_suffix("; fi")
+                    .unwrap_or(after_then)
+                    .trim();
+                (then_cmd, None)
+            };
+        if run_condition(cond) {
+            execute(then_cmd);
+        } else if let Some(else_cmd) = else_cmd {
+            execute(else_cmd);
+        }
+        return true;
+    }
+    if line.starts_with("for ") {
+        let body = &line[4..];
+        let Some(space) = body.find(' ') else {
+            return false;
+        };
+        let var = body[..space].trim();
+        let rest = body[space..].trim();
+        let Some(in_rest) = rest.strip_prefix("in ") else {
+            return false;
+        };
+        let Some(do_idx) = in_rest.find("; do ") else {
+            return false;
+        };
+        let items = expand_vars_in_line(in_rest[..do_idx].trim());
+        let cmd = in_rest[do_idx + 5..]
+            .strip_suffix("; done")
+            .unwrap_or(&in_rest[do_idx + 5..])
+            .trim();
+        let item_list = tokenize(&items);
+        if var.is_empty() || item_list.is_empty() || cmd.is_empty() {
+            return false;
+        }
+        for item in item_list {
+            set_var(var, &item);
+            execute(cmd);
+        }
+        return true;
+    }
+    false
+}
+
+/// Detects a `VAR=value` assignment (the whole line, no command). Only
+/// fires when the `=` sits inside the first whitespace token, so a
+/// command like `ls =x` is not misread as setting a variable.
+fn parse_assignment(line: &str) -> Option<(String, String)> {
+    let first = line.split_whitespace().next()?;
+    let eq = first.find('=')?;
+    let name = &first[..eq];
+    if name.is_empty() || !name.chars().all(|c| c.is_alphabetic() || c == '_') {
+        return None;
+    }
+    let value = line[line.find('=')? + 1..].trim();
+    let value = if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    };
+    Some((name.to_string(), value))
+}
+
+pub fn execute(line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+
+    // One-line if / for constructs. Handled before variable expansion so
+    // a `for` loop variable is expanded per-iteration inside its body
+    // (each body run goes through `execute` again).
+    if try_control(line) {
+        return;
+    }
+
+    // Variable expansion ($VAR / ${VAR}).
+    let expanded = expand_vars_in_line(line);
+
+    // VAR=value assignment (an assignment is a success, for `if`).
+    if let Some((name, value)) = parse_assignment(&expanded) {
+        set_var(&name, &value);
+        *LAST_STATUS.lock() = true;
+        return;
+    }
+
+    // Pipeline: each stage's captured stdout feeds the next stage's stdin.
+    let segments = split_pipe(&expanded);
+    if segments.is_empty() {
+        return; // a lone `|` etc. has no command to run
+    }
+    if segments.len() > 1 {
+        let mut input: Option<String> = None;
+        for (i, seg) in segments.iter().enumerate() {
+            let is_last = i + 1 == segments.len();
+            let out = capture_output(|| execute_simple(seg, input.take()));
+            if is_last {
+                print!("{}", out);
+            } else {
+                input = Some(out);
+            }
+        }
+        return;
+    }
+    execute_simple(&segments[0], None);
+}
+
+fn cmd_help() -> Result<(), ()> {
     println!("Available commands:");
     println!("  help        show this help");
     println!("  clear       clear the screen");
@@ -368,17 +672,23 @@ fn cmd_help() {
     println!("  whoami      print the current user");
     println!("Paths may be relative to the current directory; '~' means the");
     println!("home directory; quote arguments containing spaces: write notes.txt \"hello world\"");
+    println!("Pipes: cmd1 | cmd2   Redirect: > file / < file");
+    println!("Vars:  VAR=value, ${}VAR / ${{{}}}", "VAR", "VAR");
+    println!("Control: if <cmd>; then <cmd>; else <cmd>; fi");
+    println!("         for <var> in <items>; do <cmd>; done");
+    Ok(())
 }
 
-fn cmd_date() {
+fn cmd_date() -> Result<(), ()> {
     let now = rtc::now();
     println!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         now.year, now.month, now.day, now.hour, now.minute, now.second
     );
+    Ok(())
 }
 
-fn cmd_ls(args: &[&str]) {
+fn cmd_ls(args: &[&str]) -> Result<(), ()> {
     let path = if args.is_empty() {
         cwd()
     } else {
@@ -388,7 +698,7 @@ fn cmd_ls(args: &[&str]) {
         Ok(entries) => {
             if entries.is_empty() {
                 println!("(empty)");
-                return;
+                return Ok(());
             }
             for entry in entries {
                 if entry.is_dir {
@@ -397,15 +707,24 @@ fn cmd_ls(args: &[&str]) {
                     println!("{:<32} {:>8} bytes", entry.name, entry.size);
                 }
             }
+            Ok(())
         }
-        Err(e) => println!("ls: {}: {}", path, e),
+        Err(e) => {
+            println!("ls: {}: {}", path, e);
+            Err(())
+        }
     }
 }
 
-fn cmd_cat(args: &[&str]) {
+fn cmd_cat(args: &[&str]) -> Result<(), ()> {
     if args.is_empty() {
-        println!("usage: cat <path>");
-        return;
+        // Pipeline / `<` stdin: print it (POSIX `cat` with no args).
+        if let Some(input) = CURRENT_STDIN.lock().clone() {
+            print!("{}", input);
+        } else {
+            println!("usage: cat <path>");
+        }
+        return Ok(());
     }
     // The shell splits on whitespace, so a path containing spaces must be
     // reassembled here (or quoted: cat "hello world.txt").
@@ -420,67 +739,95 @@ fn cmd_cat(args: &[&str]) {
             if !text.ends_with('\n') {
                 println!();
             }
+            Ok(())
         }
-        Err(e) => println!("cat: {}: {}", path, e),
+        Err(e) => {
+            println!("cat: {}: {}", path, e);
+            Err(())
+        }
     }
 }
 
-fn cmd_write(args: &[&str]) {
+fn cmd_write(args: &[&str]) -> Result<(), ()> {
     if args.len() < 2 {
         println!("usage: write <path> <text>");
-        return;
+        return Err(());
     }
     // Reassemble the text: the shell splits on whitespace unless it is
     // quoted (write hello.txt "hello world").
     let text = args[1..].join(" ");
     let path = abs_path(args[0]);
     match fat::write_file(&path, text.as_bytes()) {
-        Ok(()) => println!("wrote {} bytes to {}", text.len(), path),
-        Err(e) => println!("write: {}: {}", path, e),
+        Ok(()) => {
+            println!("wrote {} bytes to {}", text.len(), path);
+            Ok(())
+        }
+        Err(e) => {
+            println!("write: {}: {}", path, e);
+            Err(())
+        }
     }
 }
 
-fn cmd_mkdir(args: &[&str]) {
+fn cmd_mkdir(args: &[&str]) -> Result<(), ()> {
     if args.is_empty() {
         println!("usage: mkdir <path>");
-        return;
+        return Err(());
     }
     let path = abs_path(&args.join(" "));
     match fat::make_dir(&path) {
-        Ok(()) => println!("created directory {}", path),
-        Err(e) => println!("mkdir: {}: {}", path, e),
+        Ok(()) => {
+            println!("created directory {}", path);
+            Ok(())
+        }
+        Err(e) => {
+            println!("mkdir: {}: {}", path, e);
+            Err(())
+        }
     }
 }
 
-fn cmd_rm(args: &[&str]) {
+fn cmd_rm(args: &[&str]) -> Result<(), ()> {
     if args.is_empty() {
         println!("usage: rm <path>");
-        return;
+        return Err(());
     }
     let path = abs_path(&args.join(" "));
     match fat::remove(&path) {
-        Ok(()) => println!("removed {}", path),
-        Err(e) => println!("rm: {}: {}", path, e),
+        Ok(()) => {
+            println!("removed {}", path);
+            Ok(())
+        }
+        Err(e) => {
+            println!("rm: {}: {}", path, e);
+            Err(())
+        }
     }
 }
 
-fn cmd_mv(args: &[&str]) {
+fn cmd_mv(args: &[&str]) -> Result<(), ()> {
     if args.len() != 2 {
         println!("usage: mv <path> <new-name>");
-        return;
+        return Err(());
     }
     let path = abs_path(args[0]);
     let new_name = args[1].to_string();
     match fat::rename(&path, &new_name) {
-        Ok(()) => println!("renamed {} to {}", path, new_name),
-        Err(e) => println!("mv: {}: {}", path, e),
+        Ok(()) => {
+            println!("renamed {} to {}", path, new_name);
+            Ok(())
+        }
+        Err(e) => {
+            println!("mv: {}: {}", path, e);
+            Err(())
+        }
     }
 }
 
-fn cmd_cp(args: &[&str]) {
+fn cmd_cp(args: &[&str]) -> Result<(), ()> {
     if args.len() != 2 {
         println!("usage: cp <src> <dst>");
-        return;
+        return Err(());
     }
     let src = abs_path(args[0]);
     let mut dst = abs_path(args[1]);
@@ -491,12 +838,18 @@ fn cmd_cp(args: &[&str]) {
         dst = format!("{}/{}", dst.trim_end_matches('/'), name);
     }
     match fat::copy_file(&src, &dst) {
-        Ok(()) => println!("copied {} to {}", src, dst),
-        Err(e) => println!("cp: {} -> {}: {}", src, dst, e),
+        Ok(()) => {
+            println!("copied {} to {}", src, dst);
+            Ok(())
+        }
+        Err(e) => {
+            println!("cp: {} -> {}: {}", src, dst, e);
+            Err(())
+        }
     }
 }
 
-fn cmd_cd(args: &[&str]) {
+fn cmd_cd(args: &[&str]) -> Result<(), ()> {
     // No argument: back to the user's home. Quoted paths may contain
     // spaces, and `~` expands to the home directory.
     let target = if args.is_empty() {
@@ -505,18 +858,27 @@ fn cmd_cd(args: &[&str]) {
         abs_path(&args.join(" "))
     };
     match fat::is_dir(&target) {
-        Ok(true) => set_cwd(&target),
-        Ok(false) => println!("cd: {}: not a directory", target),
-        Err(e) => println!("cd: {}: {}", target, e),
+        Ok(true) => {
+            set_cwd(&target);
+            Ok(())
+        }
+        Ok(false) => {
+            println!("cd: {}: not a directory", target);
+            Err(())
+        }
+        Err(e) => {
+            println!("cd: {}: {}", target, e);
+            Err(())
+        }
     }
 }
 
 /// Loads an ELF file from the disk, spawns it as a process, waits for it
 /// to exit, and reports its result (up to one second).
-fn cmd_run(args: &[&str]) {
+fn cmd_run(args: &[&str]) -> Result<(), ()> {
     if args.is_empty() {
         println!("usage: run <path>");
-        return;
+        return Err(());
     }
     // A path containing spaces must be reassembled (or quoted).
     let path = abs_path(&args.join(" "));
@@ -540,10 +902,17 @@ fn cmd_run(args: &[&str]) {
                     }
                     None => println!("process {} did not exit within 1s", pid),
                 }
+                Ok(())
             }
-            Err(e) => println!("run: {}: {}", path, e),
+            Err(e) => {
+                println!("run: {}: {}", path, e);
+                Err(())
+            }
         },
-        Err(e) => println!("run: {}: {}", path, e),
+        Err(e) => {
+            println!("run: {}: {}", path, e);
+            Err(())
+        }
     }
 }
 
@@ -552,10 +921,10 @@ fn cmd_run(args: &[&str]) {
 /// stack, syscalls routed through `linux_abi.rs`) instead of the native
 /// ABI's `process::spawn`. `argv[0]` is the path as given (matching what
 /// a real shell passes); any further words become `argv[1..]`.
-fn cmd_runlinux(args: &[&str]) {
+fn cmd_runlinux(args: &[&str]) -> Result<(), ()> {
     let Some(&path) = args.first() else {
         println!("usage: runlinux <path> [args...]");
-        return;
+        return Err(());
     };
     let abs = abs_path(path);
     match fat::read_file(&abs) {
@@ -573,16 +942,23 @@ fn cmd_runlinux(args: &[&str]) {
                         }
                         None => println!("process {} did not exit within 5s", pid),
                     }
+                    Ok(())
                 }
-                Err(e) => println!("runlinux: {}: {}", abs, e),
+                Err(e) => {
+                    println!("runlinux: {}: {}", abs, e);
+                    Err(())
+                }
             }
         }
-        Err(e) => println!("runlinux: {}: {}", abs, e),
+        Err(e) => {
+            println!("runlinux: {}: {}", abs, e);
+            Err(())
+        }
     }
 }
 
 /// Shows the state of the e1000 NIC and QEMU's user-mode network.
-fn cmd_netinfo() {
+fn cmd_netinfo() -> Result<(), ()> {
     match crate::e1000::mac() {
         Some(mac) => {
             let mut buf = [0u8; 24];
@@ -608,14 +984,15 @@ fn cmd_netinfo() {
         }
         None => println!("no e1000 NIC (driver not initialized)"),
     }
+    Ok(())
 }
 
 /// UDP echo to the gateway (QEMU user-net host): `netudp <port> [msg]`.
 /// Requires the host to run `tools/echo_server.py`.
-fn cmd_netudp(args: &[&str]) {
+fn cmd_netudp(args: &[&str]) -> Result<(), ()> {
     let Some(port) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
         println!("usage: netudp <port> [message]");
-        return;
+        return Err(());
     };
     let msg = if args.len() > 1 {
         args[1..].join(" ")
@@ -627,17 +1004,21 @@ fn cmd_netudp(args: &[&str]) {
         Ok(n) => {
             let text = core::str::from_utf8(&reply[..n]).unwrap_or("<binary>");
             println!("udp echo ({} bytes): {}", n, text);
+            Ok(())
         }
-        Err(e) => println!("udp echo failed: {}", e),
+        Err(e) => {
+            println!("udp echo failed: {}", e);
+            Err(())
+        }
     }
 }
 
 /// TCP request/response to the gateway (QEMU user-net host):
 /// `nettcp <port> [msg]`. Requires the host to run `tools/echo_server.py`.
-fn cmd_nettcp(args: &[&str]) {
+fn cmd_nettcp(args: &[&str]) -> Result<(), ()> {
     let Some(port) = args.first().and_then(|s| s.parse::<u16>().ok()) else {
         println!("usage: nettcp <port> [message]");
-        return;
+        return Err(());
     };
     let msg = if args.len() > 1 {
         args[1..].join(" ")
@@ -649,17 +1030,21 @@ fn cmd_nettcp(args: &[&str]) {
         Ok(n) => {
             let text = core::str::from_utf8(&reply[..n]).unwrap_or("<binary>");
             println!("tcp echo ({} bytes): {}", n, text);
+            Ok(())
         }
-        Err(e) => println!("tcp echo failed: {}", e),
+        Err(e) => {
+            println!("tcp echo failed: {}", e);
+            Err(())
+        }
     }
 }
 
 /// Downloads `http://host[:port]/path` and saves it under the user's
 /// Downloads folder: `wget <url>`. Host may be an IP or a DNS name.
-fn cmd_wget(args: &[&str]) {
+fn cmd_wget(args: &[&str]) -> Result<(), ()> {
     let Some(url) = args.first() else {
         println!("usage: wget <http://host[:port]/path>");
-        return;
+        return Err(());
     };
     let rest = url.strip_prefix("http://").unwrap_or(url);
     let (host_port, path) = match rest.find('/') {
@@ -680,7 +1065,7 @@ fn cmd_wget(args: &[&str]) {
             }
             None => {
                 println!("cannot resolve {}", host);
-                return;
+                return Err(());
             }
         }
     };
@@ -690,20 +1075,29 @@ fn cmd_wget(args: &[&str]) {
             let body = crate::net::http_body(&buffer[..n]);
             if body.is_empty() {
                 println!("empty response from {}{}", host_port, path);
-                return;
+                return Err(());
             }
             let name = path.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("index.html");
             let dest = format!("/users/macha/Downloads/{}", name);
             match fat::write_file(&dest, body) {
-                Ok(()) => println!("saved {} ({} bytes) to {}", name, body.len(), dest),
-                Err(e) => println!("save failed: {}", e),
+                Ok(()) => {
+                    println!("saved {} ({} bytes) to {}", name, body.len(), dest);
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("save failed: {}", e);
+                    Err(())
+                }
             }
         }
-        Err(e) => println!("wget failed: {}", e),
+        Err(e) => {
+            println!("wget failed: {}", e);
+            Err(())
+        }
     }
 }
 
-fn cmd_fatinfo() {
+fn cmd_fatinfo() -> Result<(), ()> {
     match fat::info() {
         Some(info) => {
             let cluster_bytes = info.sectors_per_cluster as u32 * 512;
@@ -731,9 +1125,10 @@ fn cmd_fatinfo() {
     if let Some(disk) = crate::disk::first_disk() {
         println!("  {}", disk.description());
     }
+    Ok(())
 }
 
-fn cmd_meminfo() {
+fn cmd_meminfo() -> Result<(), ()> {
     let info = multiboot::info();
 
     println!("boot loader: {}", info.boot_loader_name().unwrap_or("unknown"));
@@ -786,9 +1181,10 @@ fn cmd_meminfo() {
         crate::pmm::used_frames(),
         crate::pmm::free_frames()
     );
+    Ok(())
 }
 
-fn cmd_heap() {
+fn cmd_heap() -> Result<(), ()> {
     let mut vector: Vec<u64> = Vec::new();
     for i in 0..4096 {
         vector.push((i as u64).wrapping_mul(31).wrapping_add(7));
@@ -811,9 +1207,10 @@ fn cmd_heap() {
         "after free: {} bytes allocated",
         crate::allocator::allocated_bytes()
     );
+    Ok(())
 }
 
-fn cmd_cpuinfo() {
+fn cmd_cpuinfo() -> Result<(), ()> {
     let vendor = cpuid::vendor_id();
     println!(
         "vendor: {}",
@@ -826,9 +1223,10 @@ fn cmd_cpuinfo() {
     println!("logical cores: {}", cpuid::cores());
     let features = cpuid::features();
     println!("features: {}", features.join(" "));
+    Ok(())
 }
 
-fn cmd_tasks() {
+fn cmd_tasks() -> Result<(), ()> {
     let count = task::task_count();
     println!("scheduler tasks: {}", count);
     for i in 0..count {
@@ -841,9 +1239,10 @@ fn cmd_tasks() {
     for (i, counter) in task::COUNTERS.iter().enumerate() {
         println!("  bg-{} counter: {}", i, counter.load(Ordering::Relaxed));
     }
+    Ok(())
 }
 
-fn cmd_mousetest() {
+fn cmd_mousetest() -> Result<(), ()> {
     println!("polling PS/2 mouse for 5 seconds...");
     let deadline = interrupts::ticks() + 500;
     while interrupts::ticks() < deadline {
@@ -856,6 +1255,7 @@ fn cmd_mousetest() {
         interrupts::halt();
     }
     println!("mousetest done");
+    Ok(())
 }
 
 fn reboot() -> ! {
@@ -1287,6 +1687,81 @@ pub fn selftest() -> ! {
     match fat::read_file("/selftest/empty file.txt") {
         Err(FatError::NotFound) => println!("[OK] FAT32 empty file removes cleanly"),
         _ => selftest_fail("empty file remove left it behind"),
+    }
+
+    // ---- Phase B.4: native-shell pipes / redirection / variables /
+    // control flow (no Linux ABI involved) ----
+    let pipe_out = capture_output(|| execute("echo hello | cat"));
+    if pipe_out == "hello\n" {
+        println!("[OK] shell pipeline: echo | cat");
+    } else {
+        selftest_fail(&format!("pipeline output mismatch: {:?}", pipe_out));
+    }
+
+    let pipe2 = capture_output(|| execute("echo one | cat | cat"));
+    if pipe2 == "one\n" {
+        println!("[OK] shell multi-stage pipeline");
+    } else {
+        selftest_fail(&format!("multi-stage pipeline mismatch: {:?}", pipe2));
+    }
+
+    let redir = capture_output(|| execute("echo hi > /selftest/redir.txt"));
+    match fat::read_file("/selftest/redir.txt") {
+        Ok(data) if data == b"hi\n" && redir.is_empty() => {
+            println!("[OK] shell redirection: echo > file")
+        }
+        _ => selftest_fail("redirection output mismatch"),
+    }
+
+    let back = capture_output(|| execute("cat < /selftest/redir.txt"));
+    if back == "hi\n" {
+        println!("[OK] shell input redirection: cat < file");
+    } else {
+        selftest_fail(&format!("input redirection mismatch: {:?}", back));
+    }
+
+    execute("greet=konnichiwa");
+    let var = capture_output(|| execute("echo $greet"));
+    if var == "konnichiwa\n" {
+        println!("[OK] shell variable expansion: $VAR");
+    } else {
+        selftest_fail(&format!("variable expansion mismatch: {:?}", var));
+    }
+
+    let if_ok = capture_output(|| execute("if ls /users/macha; then echo yes; fi"));
+    if if_ok == "yes\n" {
+        println!("[OK] shell if-then on success");
+    } else {
+        selftest_fail(&format!("if-then mismatch: {:?}", if_ok));
+    }
+
+    let if_fail =
+        capture_output(|| execute("if ls /no/such/dir; then echo yes; else echo no; fi"));
+    if if_fail == "no\n" {
+        println!("[OK] shell if-else on failure");
+    } else {
+        selftest_fail(&format!("if-else mismatch: {:?}", if_fail));
+    }
+
+    let for_out = capture_output(|| execute("for i in a b c; do echo $i; done"));
+    if for_out == "a\nb\nc\n" {
+        println!("[OK] shell for loop with $i");
+    } else {
+        selftest_fail(&format!("for loop mismatch: {:?}", for_out));
+    }
+
+    // Bare redirection / pipe lines are no-ops, never a kernel panic
+    // (a regression guard for the empty-args / empty-segment paths).
+    execute("> /selftest/edge.txt");
+    execute("|");
+    execute("< /selftest/edge.txt");
+    if fat::remove("/selftest/edge.txt").is_err() {
+        selftest_fail("B.4 edge.txt cleanup failed");
+    }
+    println!("[OK] shell bare redirection/pipe lines are no-ops");
+
+    if fat::remove("/selftest/redir.txt").is_err() {
+        selftest_fail("B.4 redir cleanup failed");
     }
 
     // The shell's `mv` command drives the same rename path (quote paths

@@ -1,6 +1,8 @@
 use core::fmt;
 use core::fmt::Write as _;
 
+use alloc::string::String;
+
 use crate::console;
 use crate::serial;
 use crate::vga;
@@ -40,7 +42,47 @@ pub fn set_console_sink(target: Option<&mut console::Console>) {
     }
 }
 
+// Shell pipe/redirection support: while this points at a `String`, every
+// `print!`/`println!` goes into it instead of the screen/serial. The
+// shell sets it around a command whose output is the input of the next
+// pipeline stage or a `>` target. Same bare-pointer style as
+// ACTIVE_CONSOLE (single-core, never from interrupt context); must be
+// restored to null before the buffer is dropped.
+static mut OUTPUT_CAPTURE: *mut String = core::ptr::null_mut();
+
+/// Sets the capture target and returns the previous one (which may be
+/// non-null when a pipe stage contains its own `>` redirection), so
+/// callers can restore it afterwards instead of clobbering an outer
+/// capture.
+pub fn set_output_capture(target: Option<&mut String>) -> Option<*mut String> {
+    unsafe {
+        let prev = OUTPUT_CAPTURE;
+        OUTPUT_CAPTURE = match target {
+            Some(s) => s as *mut String,
+            None => core::ptr::null_mut(),
+        };
+        if prev.is_null() {
+            None
+        } else {
+            Some(prev)
+        }
+    }
+}
+
+/// Restores the capture target saved by `set_output_capture`.
+pub fn restore_output_capture(prev: Option<*mut String>) {
+    unsafe {
+        OUTPUT_CAPTURE = prev.unwrap_or(core::ptr::null_mut());
+    }
+}
+
 pub fn print(args: fmt::Arguments) {
+    unsafe {
+        if !OUTPUT_CAPTURE.is_null() {
+            let _ = (*OUTPUT_CAPTURE).write_fmt(args);
+            return;
+        }
+    }
     let mut writer = serial::SerialWriter;
     let _ = writer.write_fmt(args);
 
