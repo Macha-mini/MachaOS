@@ -55,6 +55,7 @@ user:
 	cp user/target/x86_64-unknown-none/release/prog_linux_poll target/user-linux-poll.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_fs target/user-linux-fs.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_wayland_client target/user-linux-wayland-client.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_tcp_server target/user-linux-tcp-server.elf
 
 build: gen user
 	cargo build --release
@@ -151,6 +152,10 @@ disk-linux: disk $(BUSYBOX)
 # QEMU user-mode networking: the e1000 NIC the kernel driver expects,
 # NATed through the host (guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3).
 NET_ARGS := -netdev user,id=n0 -device e1000,netdev=n0
+# The selftest boot also forwards host 127.0.0.1:18000 onto the guest's
+# port 8000 so the Phase 10 TCP-server selftest (tools/tcp_server_probe.py)
+# can reach the guest's listener from the host.
+TEST_NET_ARGS := -netdev user,id=n0,hostfwd=tcp::18000-:8000 -device e1000,netdev=n0
 
 # Storage: the disk attaches to an ICH9 AHCI (SATA) controller instead
 # of the legacy PIIX IDE bus, exercising the kernel's AHCI driver.
@@ -169,20 +174,22 @@ run-nographic: iso disk
 
 test: GRUB_CFG=boot/grub/grub-selftest.cfg
 test: iso disk
-	@rm -f $(TEST_LOG) $(TEST_LOG).pid $(TEST_LOG).qpid
+	@rm -f $(TEST_LOG) $(TEST_LOG).pid $(TEST_LOG).qpid $(TEST_LOG).probe
 	@echo "== running MachaOS selftest in QEMU =="
 	@printf 'MachaOS http fixture 1234567890\n' > target/http-fixture.txt
 	@python3 tools/echo_server.py target >/dev/null 2>&1 & echo $$! > $(TEST_LOG).pid
+	@python3 tools/tcp_server_probe.py $(TEST_LOG) 18000 >/tmp/tcp-probe.log 2>&1 & echo $$! > $(TEST_LOG).probe
 	@$(QEMU) -m $(MEM) -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) \
-		$(AHCI_ARGS) $(NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 & echo $$! > $(TEST_LOG).qpid
+		$(AHCI_ARGS) $(TEST_NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 & echo $$! > $(TEST_LOG).qpid
 	@for i in $$(seq 1 90); do \
 		sleep 1; \
 		if grep -q "SELFTEST OK" $(TEST_LOG) 2>/dev/null; then \
 			echo "== PASS: selftest completed =="; \
 			cat $(TEST_LOG); \
 			kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
+			kill $$(cat $(TEST_LOG).probe) 2>/dev/null || true; \
 			kill $$(cat $(TEST_LOG).qpid) 2>/dev/null || true; \
-			rm -f $(TEST_LOG).pid $(TEST_LOG).qpid; \
+			rm -f $(TEST_LOG).pid $(TEST_LOG).probe $(TEST_LOG).qpid; \
 			$(MAKE) test-gui; \
 			exit $$?; \
 		fi; \
@@ -190,15 +197,17 @@ test: iso disk
 			echo "== FAIL: QEMU exited before the selftest finished =="; \
 			cat $(TEST_LOG); \
 			kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
-			rm -f $(TEST_LOG).pid; \
+			kill $$(cat $(TEST_LOG).probe) 2>/dev/null || true; \
+			rm -f $(TEST_LOG).pid $(TEST_LOG).probe; \
 			exit 1; \
 		fi; \
 	done; \
 	echo "== FAIL: selftest timed out =="; \
 	cat $(TEST_LOG); \
 	kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
+	kill $$(cat $(TEST_LOG).probe) 2>/dev/null || true; \
 	kill $$(cat $(TEST_LOG).qpid) 2>/dev/null || true; \
-	rm -f $(TEST_LOG).pid $(TEST_LOG).qpid; \
+	rm -f $(TEST_LOG).pid $(TEST_LOG).probe $(TEST_LOG).qpid; \
 	exit 1
 
 # Phase D.10: headless GUI/WM regression test. Boots the desktop (no

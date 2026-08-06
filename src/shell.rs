@@ -2554,6 +2554,13 @@ pub fn selftest() -> ! {
             // `nslookup`. See `phase10_selftest`.
             phase10_selftest();
 
+            // Phase 10 (server side): the Linux ABI's listen/accept, as
+            // a real listener process the host reaches through QEMU
+            // user-net's hostfwd. The host probe (tools/tcp_server_probe.py)
+            // connects once it sees the guest's [TCP-SRV-READY] marker on
+            // the serial log. See `phase10_server_selftest`.
+            phase10_server_selftest();
+
             // Phase D.8: the ACPI S5 parameters must be discoverable on
             // the VM targets — RSDP/FADT chain plus the `\_S5` sleep type.
             match crate::acpi::s5_params() {
@@ -2721,6 +2728,25 @@ fn phase10_selftest() {
             println!("[OK] Phase 10: busybox nslookup resolved localhost via DNS over UDP");
         }
         other => selftest_fail(&format!("busybox nslookup gave unexpected exit: {:?}", other)),
+    }
+    crate::process::reap(pid);
+}
+
+/// Phase 10 server-side selftest: `prog_linux_tcp_server` binds port
+/// 8000, listens, prints `[TCP-SRV-READY]` (the host probe's go-ahead),
+/// then blocks in `accept` until the host connects through QEMU's
+/// hostfwd (`tcp::18000-:8000`), echoes the probe's ping back, and
+/// exits 0. The wait is 30 s (accept's own kernel deadline) — the host
+/// normally connects within a second or two of the marker.
+fn phase10_server_selftest() {
+    let elf = crate::user_prog::PROG_LINUX_TCP_SERVER;
+    let pid = crate::process::spawn_linux(elf, "tcp-server", &["tcp-server"], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("tcp-server spawn failed: {e}")));
+    match crate::process::wait(pid, 3000) {
+        Some(process::ExitInfo::Normal) => {
+            println!("[OK] Phase 10: TCP server listen/accept echoed the host's ping");
+        }
+        other => selftest_fail(&format!("tcp-server gave unexpected exit: {:?}", other)),
     }
     crate::process::reap(pid);
 }

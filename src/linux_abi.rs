@@ -270,6 +270,9 @@ const SYS_SENDMSG: u64 = 46;
 const SYS_RECVMSG: u64 = 47;
 const SYS_SHUTDOWN: u64 = 48;
 const SYS_BIND: u64 = 49;
+const SYS_LISTEN: u64 = 50;
+const SYS_ACCEPT: u64 = 43;
+const SYS_ACCEPT4: u64 = 288;
 const SYS_GETSOCKNAME: u64 = 51;
 const SYS_GETPEERNAME: u64 = 52;
 const SYS_SETSOCKOPT: u64 = 54;
@@ -2269,6 +2272,59 @@ fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
     }
 }
 
+/// `listen(fd, backlog)`: marks a bound AF_INET TCP socket as a
+/// listener. `backlog` is ignored — the accept queue caps itself at 16
+/// (`inet.rs`). Only a bound, unconnected TCP socket can listen.
+fn sys_listen(fd: u64, _backlog: u64) -> u64 {
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    match crate::inet::listen(id) {
+        Ok(()) => 0,
+        Err(e) => err(e),
+    }
+}
+
+/// `accept(fd, addr, addrlen)` / `accept4(fd, addr, addrlen, flags)`:
+/// pops a handshake-completed incoming connection off a listener's
+/// accept queue, blocking (yield-looping on the NIC, like connect/recv)
+/// until one arrives or the safety deadline. SOCK_NONBLOCK on the
+/// listener, or in accept4's flags, makes it return EAGAIN immediately
+/// when the queue is empty; the new connection inherits O_NONBLOCK.
+fn sys_accept(fd: u64, addr: u64, addrlen: u64, flags: u64) -> u64 {
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    if !crate::inet::is_listening(id) {
+        return err(EINVAL); // real accept: only listeners can accept
+    }
+    let nonblock = crate::inet::is_nonblock(id) || flags & crate::inet::SOCK_NONBLOCK != 0;
+    let deadline = crate::interrupts::ticks() + NET_RECV_TIMEOUT_TICKS;
+    let child = loop {
+        crate::inet::pump();
+        if let Some(child) = crate::inet::accept_pending(id) {
+            break child;
+        }
+        if nonblock {
+            return err(EAGAIN);
+        }
+        if crate::interrupts::ticks() >= deadline {
+            return err(EIO);
+        }
+        crate::task::yield_rr();
+    };
+    if addr != 0 {
+        let (ip, port) = crate::inet::peer_of(child).unwrap_or(([0; 4], 0));
+        if !write_sockaddr_in(addr, addrlen, ip, port) {
+            return err(EFAULT);
+        }
+    }
+    if nonblock {
+        let _ = crate::inet::set_nonblock(child, true);
+    }
+    with_process(|p| p.alloc_fd(FdEntry::Net(child)) as u64).unwrap_or(err(EBADF))
+}
+
 /// `getsockname(fd, addr, addrlen)`: reports our local (ip, port).
 fn sys_getsockname(fd: u64, addr: u64, addrlen: u64) -> u64 {
     let Some(id) = net_id_of(fd) else {
@@ -2840,6 +2896,9 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_SENDTO => sys_sendto(arg1, arg2, arg3, arg4, arg5, arg6),
         SYS_RECVFROM => sys_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6),
         SYS_BIND => sys_bind(arg1, arg2, arg3),
+        SYS_LISTEN => sys_listen(arg1, arg2),
+        SYS_ACCEPT => sys_accept(arg1, arg2, arg3, 0),
+        SYS_ACCEPT4 => sys_accept(arg1, arg2, arg3, arg4),
         SYS_SHUTDOWN => sys_shutdown(arg1, arg2),
         SYS_GETSOCKNAME => sys_getsockname(arg1, arg2, arg3),
         SYS_GETPEERNAME => sys_getpeername(arg1, arg2, arg3),
