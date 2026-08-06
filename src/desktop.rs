@@ -17,6 +17,14 @@ pub fn run() -> ! {
     let (screen_w, screen_h) = fb::virtual_dimensions();
     let mut manager = wm::WindowManager::new(screen_w, screen_h);
     manager.composite();
+    // Serial sync point for the headless GUI test (`make test-gui`): the
+    // host polls for this line, then screendumps the physical framebuffer
+    // to verify the desktop actually rendered. (Plain `io::print`, not the
+    // `println!` macro: this module is declared before `#[macro_use] io`.)
+    crate::io::print(format_args!(
+        "[OK] desktop: first frame composited ({}x{})\n",
+        screen_w, screen_h
+    ));
 
     loop {
         let mut dirty = false;

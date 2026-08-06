@@ -7,6 +7,13 @@ GRUB_MKRESCUE := $(shell command -v i686-elf-grub-mkrescue 2>/dev/null || comman
 GRUB_CFG ?= boot/grub/grub.cfg
 ISO_DIR := target/machaos-iso
 ISO := target/machaos.iso
+# GUI (non-selftest) ISO, booted with the regular grub.cfg by the
+# headless WM screendump test (`test-gui`) so the desktop actually runs.
+GUI_ISO_DIR := target/machaos-gui-iso
+GUI_ISO := target/machaos-gui.iso
+GUI_TEST_LOG := /tmp/machaos-gui.log
+GUI_TEST_SHOT := /tmp/machaos-gui-shot
+GUI_TEST_SOCK := /tmp/gui-test.sock
 DISK := target/disk.img
 WALLPAPER_SRC := himawari.png
 WALLPAPER := target/wallpaper.raw
@@ -21,7 +28,7 @@ TEST_LOG := /tmp/machaos-selftest.log
 BUSYBOX := target/busybox
 BUSYBOX_URL := https://www.busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
 
-.PHONY: all build gen user iso disk disk-linux wallpaper run run-nographic run-linux test clean busybox
+.PHONY: all build gen user iso gui-iso disk disk-linux wallpaper run run-nographic run-linux test test-gui clean busybox
 
 all: build
 
@@ -59,6 +66,17 @@ iso: build
 	cp $(KERNEL) $(ISO_DIR)/boot/machaos
 	cp $(GRUB_CFG) $(ISO_DIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(ISO) $(ISO_DIR)
+
+# The GUI boot disk (regular grub.cfg, no `selftest` on the cmdline),
+# used by `test-gui`. Kept as a separate ISO from `iso` (which the
+# selftest flips to grub-selftest.cfg via a target-specific variable).
+gui-iso: build
+	@test -n "$(GRUB_MKRESCUE)" || (echo "x86_64-elf-grub-mkrescue or grub-mkrescue is required"; exit 1)
+	rm -rf $(GUI_ISO_DIR)
+	mkdir -p $(GUI_ISO_DIR)/boot/grub
+	cp $(KERNEL) $(GUI_ISO_DIR)/boot/machaos
+	cp boot/grub/grub.cfg $(GUI_ISO_DIR)/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(GUI_ISO) $(GUI_ISO_DIR)
 
 # Converts the source wallpaper image into the raw 0x00RRGGBB pixel dump
 # wm.rs loads from disk (see tools/gen_wallpaper.py). Only regenerated
@@ -165,7 +183,8 @@ test: iso disk
 			kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
 			kill $$(cat $(TEST_LOG).qpid) 2>/dev/null || true; \
 			rm -f $(TEST_LOG).pid $(TEST_LOG).qpid; \
-			exit 0; \
+			$(MAKE) test-gui; \
+			exit $$?; \
 		fi; \
 		if ! pgrep -q qemu-system-x86_64; then \
 			echo "== FAIL: QEMU exited before the selftest finished =="; \
@@ -181,6 +200,27 @@ test: iso disk
 	kill $$(cat $(TEST_LOG).qpid) 2>/dev/null || true; \
 	rm -f $(TEST_LOG).pid $(TEST_LOG).qpid; \
 	exit 1
+
+# Phase D.10: headless GUI/WM regression test. Boots the desktop (no
+# selftest) in a separate QEMU with a QMP socket, then the driver waits
+# for the first-composite serial marker, screendumps the framebuffer,
+# and pixel-compares the wallpaper, taskbar, launcher and an app launch
+# (see tools/gui_wm_test.py). Runs as part of `make test`.
+test-gui: gui-iso disk
+	@rm -f $(GUI_TEST_LOG) $(GUI_TEST_SOCK) $(GUI_TEST_SHOT)-*.ppm
+	@$(QEMU) -m $(MEM) -cdrom $(GUI_ISO) -boot d -display none -serial file:$(GUI_TEST_LOG) \
+		-qmp unix:$(GUI_TEST_SOCK),server=on,wait=off \
+		$(AHCI_ARGS) $(NET_ARGS) & echo $$! > $(GUI_TEST_LOG).qpid
+	@python3 tools/gui_wm_test.py $(GUI_TEST_LOG) $(WALLPAPER) $(GUI_TEST_SOCK) $(GUI_TEST_SHOT); \
+		rc=$$?; \
+		kill $$(cat $(GUI_TEST_LOG).qpid) 2>/dev/null || true; \
+		rm -f $(GUI_TEST_LOG).qpid $(GUI_TEST_SOCK); \
+		if [ $$rc -ne 0 ]; then \
+			echo "== FAIL: GUI/WM screendump test =="; \
+			tail -40 $(GUI_TEST_LOG); \
+			exit 1; \
+		fi; \
+		echo "== PASS: GUI/WM screendump test =="
 
 clean:
 	cargo clean

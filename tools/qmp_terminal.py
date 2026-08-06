@@ -53,13 +53,32 @@ def chord(sock, mod, name):
 
 
 def click(sock, x, y):
+    # NOTE: QMP input-send-event expects the event type "btn" with a
+    # *string* button name (QEMU >= 4.0 schema) — "button"/integers are
+    # rejected. The PS/2 mouse is relative, so absolute coordinates are
+    # sent as rel deltas from the screen center (where the cursor starts
+    # on a fresh boot), chunked to stay within the per-packet ±255 range.
+    dx = x - 960
+    dy = y - 540
+    step = 255
+    while dx != 0 or dy != 0:
+        sx = max(-step, min(step, dx))
+        sy = max(-step, min(step, dy))
+        cmd(sock, {
+            "execute": "input-send-event",
+            "arguments": {"events": [
+                {"type": "rel", "data": {"axis": "x", "value": sx}},
+                {"type": "rel", "data": {"axis": "y", "value": sy}},
+            ]},
+        })
+        dx -= sx
+        dy -= sy
+        time.sleep(0.1)
     cmd(sock, {
         "execute": "input-send-event",
         "arguments": {"events": [
-            {"type": "abs", "data": {"axis": "x", "value": x}},
-            {"type": "abs", "data": {"axis": "y", "value": y}},
-            {"type": "button", "data": {"button": 1, "down": True}},
-            {"type": "button", "data": {"button": 1, "down": False}},
+            {"type": "btn", "data": {"button": "left", "down": True}},
+            {"type": "btn", "data": {"button": "left", "down": False}},
         ]},
     })
     time.sleep(0.3)
