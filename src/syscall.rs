@@ -769,6 +769,24 @@ pub fn run_demo(message: &[u8]) {
 
     paging::unmap_page(code_frame as u64);
     paging::unmap_page(stack_frame as u64);
+    // Restore the identity map before freeing — the split+unmap above
+    // destroyed the boot map's 2 MiB coverage of these two pages, and the
+    // PMM hands freed frames straight back out (see the paging selftest's
+    // "normal contract" comment): a later allocation of the same frames
+    // then faults the moment anyone writes to them, because their
+    // identity mapping is gone. That is exactly the kernel-mode #PF the
+    // Phase 10 selftest hit on its first reallocation of this frame
+    // (writing to a freshly-allocated phys frame from the kernel map).
+    let restored = paging::map_page(
+        code_frame as u64,
+        code_frame as u64,
+        paging::PAGE_PRESENT | paging::PAGE_WRITABLE,
+    ) && paging::map_page(
+        stack_frame as u64,
+        stack_frame as u64,
+        paging::PAGE_PRESENT | paging::PAGE_WRITABLE,
+    );
+    assert!(restored, "usermode demo: restoring the identity map");
     pmm::frame_free(code_frame);
     pmm::frame_free(stack_frame);
 }

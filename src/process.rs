@@ -535,17 +535,6 @@ impl Process {
             let Some(phys) = pmm::alloc_contiguous(pages) else {
                 return self.heap_end;
             };
-            // TEMP-DIAG: log heap growth to pin down the Phase 10 PF.
-            crate::io::exception_print(crate::io::sprint(
-                &mut [0u8; 96],
-                format_args!(
-                    "[BRK] map_at={:#x} phys={:#x} len={:#x} pid={}\n",
-                    self.heap_start + old_mapped,
-                    phys,
-                    grow_len,
-                    crate::task::current_pid()
-                ),
-            ));
             for i in 0..pages {
                 self.frames.push(phys + i * pmm::FRAME_SIZE);
             }
@@ -618,17 +607,6 @@ impl Process {
         };
         let pages = (len / paging::PAGE_SIZE) as usize;
         let phys = pmm::alloc_contiguous(pages)?;
-        // TEMP-DIAG: log anon/file mmap frame zeroing (Phase 10 PF hunt).
-        crate::io::exception_print(crate::io::sprint(
-            &mut [0u8; 96],
-            format_args!(
-                "[MMAP] addr={:#x} phys={:#x} len={:#x} pid={}\n",
-                addr,
-                phys,
-                len,
-                crate::task::current_pid()
-            ),
-        ));
         for i in 0..pages {
             self.frames.push(phys + i * pmm::FRAME_SIZE);
         }

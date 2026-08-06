@@ -113,11 +113,6 @@ unsafe fn pt_entry_ptr_in(
     if pde & PAGE_PRESENT == 0 {
         // Nothing mapped here: install a fresh (zeroed) page table.
         let frame = pmm::frame_alloc()?;
-        // TEMP-DIAG: log page-table frame zeroing (Phase 10 PF hunt).
-        crate::io::exception_print(crate::io::sprint(
-            &mut [0u8; 96],
-            format_args!("[PTFRAME] frame={:#x} virt={:#x}\n", frame, virt),
-        ));
         core::ptr::write_bytes(frame as *mut u8, 0, pmm::FRAME_SIZE);
         if let Some(frames) = allocated_frames {
             frames.push(frame);
@@ -132,11 +127,6 @@ unsafe fn pt_entry_ptr_in(
         // region also needs USER set on the page directory itself: the
         // page walk requires U/S at *every* level it passes through.
         let frame = pmm::frame_alloc()?;
-        // TEMP-DIAG: log split page-table frame (Phase 10 PF hunt).
-        crate::io::exception_print(crate::io::sprint(
-            &mut [0u8; 96],
-            format_args!("[PTSPLIT] frame={:#x} virt={:#x}\n", frame, virt),
-        ));
         if let Some(frames) = allocated_frames {
             frames.push(frame);
         }
