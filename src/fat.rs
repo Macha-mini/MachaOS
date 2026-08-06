@@ -1009,6 +1009,42 @@ pub fn write_file(path: &str, content: &[u8]) -> Result<(), FatError> {
     fat.write_file_impl(path, content)
 }
 
+/// Appends `entry` to the file at `path` (creating it if missing), then
+/// caps the result to the newest `max_bytes`, all under a *single* lock
+/// acquisition and a `try_lock` at that — a panic inside a FAT operation
+/// must never deadlock its own panic handler on the volume lock. Returns
+/// `false`, without attempting the write, when the volume isn't mounted
+/// or the lock is already held. This is the crash log's disk path (see
+/// `crashlog.rs`): best-effort by design, at the edge of death.
+pub fn try_append_file(path: &str, entry: &[u8], max_bytes: usize) -> bool {
+    let Some(mut guard) = MOUNTED.try_lock() else {
+        return false;
+    };
+    let Some(fat) = guard.as_mut() else {
+        return false;
+    };
+    let (parent, name) = match fat.resolve_parent(path) {
+        Ok(pair) => pair,
+        Err(_) => return false,
+    };
+    let mut content = Vec::new();
+    let mut entries = Vec::new();
+    if fat.read_dir(parent, &mut entries).is_err() {
+        return false;
+    }
+    if let Some(existing) = entries.iter().find(|e| !e.is_dir && name_matches(&e.name, &name)) {
+        match fat.read_file_data(existing.first_cluster, existing.size as usize) {
+            Ok(data) => content = data,
+            Err(_) => return false,
+        }
+    }
+    content.extend_from_slice(entry);
+    if content.len() > max_bytes {
+        content.drain(..content.len() - max_bytes);
+    }
+    fat.write_file_impl(path, &content).is_ok()
+}
+
 /// Creates a directory with `.` and `..` entries.
 pub fn make_dir(path: &str) -> Result<(), FatError> {
     let mut guard = MOUNTED.lock();

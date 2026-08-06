@@ -1008,6 +1008,24 @@ pub fn selftest() -> ! {
         None => selftest_fail("FAT FSINFO sector missing"),
     }
 
+    // Crash-log persistence (Phase A): the kernel appends panic/exception
+    // diagnostics to /system/panic.log at the edge of death (see
+    // crashlog.rs). Appending a marker through the exact path a real
+    // crash would use, then reading it back, proves the disk write
+    // machinery works; the log is left in place (capped) so a real
+    // crash log survives across boots.
+    crate::crashlog::append("===== selftest crashlog probe =====\n");
+    match fat::read_file("/system/panic.log") {
+        Ok(log) if log.windows(b"selftest crashlog probe".len()).any(|w| w == b"selftest crashlog probe") => {
+            println!("[OK] crash log persisted to /system/panic.log ({} bytes)", log.len());
+        }
+        Ok(log) => selftest_fail(&format!(
+            "crash log content mismatch ({:?})",
+            String::from_utf8_lossy(&log)
+        )),
+        Err(e) => selftest_fail(&format!("crash log read failed: {e}")),
+    }
+
     // Trash: a file moved to the trash is gone from its original
     // location, still readable from the trash, and can be restored to
     // its exact original path (then emptied). The FAT test above

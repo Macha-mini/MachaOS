@@ -11,6 +11,7 @@ mod calculator;
 mod clipboard;
 mod console;
 mod cpuid;
+mod crashlog;
 mod desktop;
 mod disk;
 mod e1000;
@@ -362,6 +363,33 @@ fn panic(info: &PanicInfo) -> ! {
         io::exception_print("\n");
     }
     io::exception_print("System halted.\n");
+
+    // Best-effort: persist the panic to disk so it can be diagnosed
+    // without a serial connection (see crashlog.rs). Built with a fresh
+    // buffer — `message`/`location` borrow the two buffers above, which
+    // are still alive here.
+    let mut log_buf = [0u8; 512];
+    let entry = match info.location() {
+        Some(location) => io::sprint(
+            &mut log_buf,
+            format_args!(
+                "===== KERNEL PANIC @ tick {} =====\n{}\n  at {}:{}\n",
+                interrupts::ticks(),
+                info.message(),
+                location.file(),
+                location.line()
+            ),
+        ),
+        None => io::sprint(
+            &mut log_buf,
+            format_args!(
+                "===== KERNEL PANIC @ tick {} =====\n{}\n",
+                interrupts::ticks(),
+                info.message()
+            ),
+        ),
+    };
+    crashlog::append(entry);
 
     if fb::is_graphics_mode() {
         // No locks, no heap: the allocator or another CPU-visible lock

@@ -73,16 +73,20 @@ pub fn register_default_handlers() {
 }
 
 fn exception(name: &str, frame: &mut InterruptFrame) -> ! {
-    let mut buf = [0u8; 96];
-    io::exception_print(io::sprint(&mut buf, format_args!("\n===== EXCEPTION: {} =====\n", name)));
-    dump_registers(frame);
+    let mut head_buf = [0u8; 96];
+    io::exception_print(io::sprint(&mut head_buf, format_args!("\n===== EXCEPTION: {} =====\n", name)));
+    let mut reg_buf = [0u8; 512];
+    let regs = format_registers(&mut reg_buf, frame);
+    io::exception_print(regs);
+    persist_exception(name, regs);
     halt_forever()
 }
 
-pub(crate) fn dump_registers(frame: &InterruptFrame) {
-    let mut buf = [0u8; 512];
-    let text = io::sprint(
-        &mut buf,
+/// Formats the register dump into a caller-provided stack buffer (no
+/// allocation — this runs from exception context).
+pub(crate) fn format_registers<'a>(buf: &'a mut [u8; 512], frame: &InterruptFrame) -> &'a str {
+    io::sprint(
+        buf,
         format_args!(
             "vector: {}\nRIP: {:#x}  CS: {:#x}  RFLAGS: {:#x}\nRSP: {:#x}  SS: {:#x}\n\
              RAX: {:#x}  RBX: {:#x}  RCX: {:#x}  RDX: {:#x}\n\
@@ -111,8 +115,20 @@ pub(crate) fn dump_registers(frame: &InterruptFrame) {
             frame.r14,
             frame.r15,
         ),
+    )
+}
+
+/// Best-effort: persist a fatal exception to disk for post-mortem
+/// diagnosis without a serial connection. Concatenates a one-line entry
+/// heading (with the tick count) and the register dump into a stack
+/// buffer, then appends via `crashlog` (which swallows every error).
+fn persist_exception(name: &str, registers: &str) {
+    let mut log_buf = [0u8; 768];
+    let entry = io::sprint(
+        &mut log_buf,
+        format_args!("===== EXCEPTION: {} @ tick {} =====\n{}", name, ticks(), registers),
     );
-    io::exception_print(text);
+    crate::crashlog::append(entry);
 }
 
 /// Shared by the exceptions a ring-3 process can plausibly trigger on its
@@ -182,9 +198,9 @@ fn page_fault(frame: &mut InterruptFrame) {
         return;
     }
     let err = frame.error_code;
-    let mut buf = [0u8; 192];
-    io::exception_print(io::sprint(
-        &mut buf,
+    let mut head_buf = [0u8; 192];
+    let head = io::sprint(
+        &mut head_buf,
         format_args!(
             "\n===== EXCEPTION: #PF Page fault =====\nfaulting address (CR2): {:#x}\nerror code: {:#x} (present={}, write={}, user={})\n",
             cr2,
@@ -193,8 +209,29 @@ fn page_fault(frame: &mut InterruptFrame) {
             err & 2 != 0,
             err & 4 != 0,
         ),
-    ));
-    dump_registers(frame);
+    );
+    io::exception_print(head);
+    let mut reg_buf = [0u8; 512];
+    let regs = format_registers(&mut reg_buf, frame);
+    io::exception_print(regs);
+    // Post-mortem log entry: heading (with CR2 + error code) followed by
+    // the register dump, in one buffer so the whole thing can be
+    // appended to the disk log.
+    let mut log_buf = [0u8; 768];
+    let entry = io::sprint(
+        &mut log_buf,
+        format_args!(
+            "===== EXCEPTION: #PF @ tick {} =====\nCR2: {:#x}  error code: {:#x} (present={}, write={}, user={})\n{}",
+            ticks(),
+            cr2,
+            err,
+            err & 1 != 0,
+            err & 2 != 0,
+            err & 4 != 0,
+            regs
+        ),
+    );
+    crate::crashlog::append(entry);
     halt_forever()
 }
 
