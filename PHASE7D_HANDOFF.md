@@ -92,6 +92,22 @@ unexpected exit: None`)。確認済みの事実:
   その後の syscall (rt_sigaction 13 / pipe 22 / dup2 63 等) は実装済みでプリント
   されないため、停止箇所はログからは特定不能
 
+**2026-08-06 追記 2 — exit チェーン破壊バグを発見・修正 (Phase 8a 実装中)**:
+`Process` 構造体に sigactions 配列 (`[SigAction; 65]` = 1040B) をインライン追加したところ、
+fork テストが決定的に ring-0 #UD (rip=0x3) で落ちるようになった。原因は fork パス
+(fork_copy が新 Process をカーネルスタック上に構築) のスタック使用が syscall 領域
+(top-4096) と parked exit チェーン (top-8192) の 4KB ヘッドルームを超え、チェーンの
+ret スロット (exit_self) を破壊 → exit 時に ret がゴミへ飛ぶ、というもの。
+- 修正: sigactions を `Box<[SigAction; 65]>` に変更 (構造体 -1032B) +
+  `repark_exit_chain` の間隔を 4096 → 8192 に拡大 (防御)
+- 教訓: **深い syscall パス (fork/execve) のスタック使用量を増やす構造体変更は
+  exit チェーン破壊を招く** — 構造体は小さく保つか、ヘッドルームを先に広げる
+
+**Phase 8a 進捗**: kill(62)/tgkill(234)/rt_sigaction(13)/rt_sigprocmask(14) 実装 +
+SIG_DFL デフォルト動作の配送 (終了/無視) + wait4 のシグナル終了ステータス符号化。
+selftest の busybox `kill -CHLD/KILL/-0 $$` 3 チェックは一時的順序入れ替えで
+[OK] 確認済み。ハンドラ配送 (sigframe + rt_sigreturn + SIGCHLD) は Phase 8b。
+
 次の手:
 1. **Phase 8 (シグナル配送) が最有力**: `rt_sigaction`/`rt_sigprocmask` は現在
    スタブ (常に 0 返し)。ash は起動時に SIGCHLD/SIGINT 等のハンドラを登録しており、

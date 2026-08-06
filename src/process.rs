@@ -175,6 +175,10 @@ pub enum ExitInfo {
     /// The process raised some other CPU exception (divide-by-zero,
     /// invalid opcode, a privileged instruction causing #GP, ...).
     Exception { vector: u8 },
+    /// The process was terminated by a signal (`kill`/`tgkill` with a
+    /// default-action signal such as SIGKILL/SIGTERM). The wait status
+    /// for a signal death is the signal number itself (no `<< 8`).
+    Signaled { sig: u8 },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -256,6 +260,38 @@ pub struct Process {
     /// processes (a stale, never-reaped child from an earlier test made
     /// BusyBox's `waitpid(-1)` loop forever).
     parent: Option<usize>,
+    /// Per-signal dispositions, indexed by signal number (1..=64; index
+    /// 0 unused). `handler` is the ring-3 handler address, or 0 = SIG_DFL,
+    /// 1 = SIG_IGN. Phase 8: recorded by `rt_sigaction`; default-action
+    /// delivery (terminate / ignore) is implemented, handler delivery is
+    /// not yet. Heap-backed (`Box`) so the `Process` struct itself stays
+    /// small — a 1040-byte inline array made `fork_copy`'s kernel-stack
+    /// footprint overflow the parked exit chain.
+    pub(crate) sigactions: alloc::boxed::Box<[SigAction; 65]>,
+    /// Blocked-signal mask (bit `sig` set = blocked), `rt_sigprocmask`.
+    pub(crate) sig_blocked: u64,
+    /// Signals delivered-but-not-yet-handled (bit `sig` set). Phase 8a
+    /// only accumulates these for caught/blocked signals; delivery of
+    /// caught handlers lands in a later phase.
+    pub(crate) sig_pending: u64,
+}
+
+/// One entry of `Process::sigactions` — the Linux `struct sigaction`
+/// fields this kernel keeps (x86_64: handler, flags, restorer, and the
+/// kernel's 64-bit `sigset_t` mask, 32 bytes total).
+#[derive(Clone, Copy)]
+pub struct SigAction {
+    pub handler: u64,
+    pub flags: u64,
+    pub mask: u64,
+}
+
+impl SigAction {
+    /// `SIG_DFL` — take the signal's default action (terminate, or
+    /// ignore for the default-ignored signals).
+    pub const fn dfl() -> SigAction {
+        SigAction { handler: 0, flags: 0, mask: 0 }
+    }
 }
 
 impl Process {
@@ -753,6 +789,9 @@ pub fn spawn(elf_bytes: &[u8], name: &'static str) -> Result<usize, &'static str
         mmap_next: MMAP_BASE,
         cloexec: Vec::new(),
         parent: None,
+        sigactions: alloc::boxed::Box::new([SigAction::dfl(); 65]),
+        sig_blocked: 0,
+        sig_pending: 0,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -827,6 +866,9 @@ fn load_linux_process(
         mmap_next: MMAP_BASE,
         cloexec: Vec::new(),
         parent: None,
+        sigactions: alloc::boxed::Box::new([SigAction::dfl(); 65]),
+        sig_blocked: 0,
+        sig_pending: 0,
     };
 
     let pml4 = match build_address_space(&mut process) {
@@ -921,6 +963,15 @@ pub fn execve_into_current(
     // (an exec'd pipeline child whose parent vanished would never be
     // reaped, and the shell's wait loop would spin forever).
     new_process.parent = old_parent;
+    // Signals: the blocked mask is preserved across `execve` like
+    // Linux; the disposition table carries over too (Linux resets
+    // caught handlers to SIG_DFL, but Phase 8a has no handler delivery
+    // yet and the exec'd image installs its own dispositions anyway).
+    let sig_state =
+        task::with_current_process_mut(|p| (alloc::boxed::Box::new(*p.sigactions), p.sig_blocked))
+            .unwrap_or((alloc::boxed::Box::new([crate::process::SigAction::dfl(); 65]), 0));
+    new_process.sigactions = sig_state.0;
+    new_process.sig_blocked = sig_state.1;
     // Close-on-exec: drop the fds the old program flagged with
     // FD_CLOEXEC (pipeline pipe ends, etc.) before the new image runs.
     new_process.close_cloexec_fds();
@@ -1573,6 +1624,9 @@ fn fork_copy(parent: &Process) -> Result<(Process, u64), &'static str> {
         mmap_next: parent.mmap_next,
         cloexec: parent.cloexec.clone(),
         parent: parent.parent,
+        sigactions: alloc::boxed::Box::new(*parent.sigactions),
+        sig_blocked: parent.sig_blocked,
+        sig_pending: 0,
     };
     let pml4 = build_address_space(&mut child)?;
     let parent_cr3 = paging::read_cr3();
@@ -1771,6 +1825,52 @@ pub fn kill_current(cr2: u64, frame: &mut interrupts::InterruptFrame) {
     io::exception_print(msg);
 }
 
+/// Signal numbers whose default disposition is to be ignored (Linux's
+/// default-ignore set): SIGCHLD(17), SIGCONT(18), SIGURG(23),
+/// SIGWINCH(28). Every other signal with a SIG_DFL disposition
+/// terminates the process.
+pub fn signal_default_ignored(sig: u8) -> bool {
+    matches!(sig, 17 | 18 | 23 | 28)
+}
+
+/// Delivers signal `sig` to the process at task index `pid` (Phase 8a
+/// subset — default-action delivery only):
+/// - SIGKILL(9) always terminates (uncatchable, unblockable);
+/// - SIG_IGN dispositions and default-ignored signals are dropped;
+/// - SIG_DFL-terminate signals mark the process exited (`Signaled`);
+/// - caught-handler and blocked signals are recorded pending (handler
+///   delivery is a later phase).
+/// Returns `Ok(())` if the target existed and was alive; `Err(())` if
+/// there is no such process or it has already exited.
+pub fn deliver_signal(pid: usize, sig: u8) -> Result<(), ()> {
+    crate::task::with_process_mut(pid, |p| {
+        if p.is_exited() {
+            return Err(());
+        }
+        if sig == 9 {
+            p.mark_exited(ExitInfo::Signaled { sig });
+            return Ok(());
+        }
+        let blocked = (p.sig_blocked >> sig) & 1 == 1;
+        let action = p.sigactions[sig as usize];
+        if blocked {
+            p.sig_pending |= 1u64 << sig;
+        } else if action.handler == 1 {
+            // SIG_IGN — dropped, like Linux
+        } else if action.handler == 0 {
+            // SIG_DFL: terminate unless the signal is default-ignored
+            if !signal_default_ignored(sig) {
+                p.mark_exited(ExitInfo::Signaled { sig });
+            }
+        } else {
+            // A caught handler — not deliverable yet; record pending.
+            p.sig_pending |= 1u64 << sig;
+        }
+        Ok(())
+    })
+    .ok_or(())?
+}
+
 /// Called from #DE/#UD/#GP (and similar) when the faulting task is a
 /// process: a ring-3 program hitting a divide-by-zero, invalid opcode, or
 /// privileged instruction kills just that process, the same way a page
@@ -1898,6 +1998,10 @@ pub fn describe_exit(info: &ExitInfo) -> alloc::string::String {
         ExitInfo::Exception { vector } => {
             use alloc::format;
             format!("killed by exception vector {}", vector)
+        }
+        ExitInfo::Signaled { sig } => {
+            use alloc::format;
+            format!("killed by signal {}", sig)
         }
     }
 }

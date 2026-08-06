@@ -586,7 +586,12 @@ pub fn current_name() -> &'static str {
 pub fn repark_exit_chain(exit_stub: usize) {
     let current = CURRENT.load(Ordering::Relaxed);
     let top = tasks()[current].kernel_stack_top;
-    let chain = (top - RING3_PARK_RESERVE - 4096) as usize;
+    // Two pages of headroom below the syscall-stack region: the deepest
+    // syscall frames (the fork path's fork_copy builds a fresh Process,
+    // and an execve loads a whole new image) reach well past 4 KiB, and
+    // a clobbered chain's ret slot made exits jump into garbage (a
+    // ring-0 #UD at the corrupted target).
+    let chain = (top - RING3_PARK_RESERVE - 8192) as usize;
     unsafe {
         let chain_p = chain as *mut usize;
         for i in 0..6 {
@@ -629,6 +634,17 @@ pub fn with_current_process_mut<R>(f: impl FnOnce(&mut Process) -> R) -> Option<
     } else {
         tasks[current].thread_of?
     };
+    tasks.get_mut(owner)?.process.as_mut().map(f)
+}
+
+/// Runs `f` on the process at task index `pid` (threads resolve through
+/// `thread_of` like `with_current_process_mut`). `None` if there is no
+/// such task or it has no process. Used by signal delivery, which
+/// targets an arbitrary pid from the killer's own syscall context.
+pub fn with_process_mut<R>(pid: usize, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
+    let tasks = tasks_mut();
+    let task = tasks.get(pid)?;
+    let owner = if task.process.is_some() { pid } else { task.thread_of? };
     tasks.get_mut(owner)?.process.as_mut().map(f)
 }
 

@@ -180,6 +180,7 @@ const EBADF: i32 = 9;
 /// No child processes (or all already reaped) — `waitpid`'s terminal
 /// condition; a shell's `waitpid(-1)` loop ends here.
 const ECHILD: i32 = 10;
+const ESRCH: i32 = 3;
 const EFAULT: i32 = 14;
 const EEXIST: i32 = 17;
 const ENOTDIR: i32 = 20;
@@ -225,6 +226,9 @@ const SYS_MUNMAP: u64 = 11;
 const SYS_BRK: u64 = 12;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
+const SYS_RT_SIGRETURN: u64 = 15;
+const SYS_KILL: u64 = 62;
+const SYS_TGKILL: u64 = 234;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
 const SYS_SYSINFO: u64 = 99;
@@ -645,6 +649,7 @@ fn sys_wait4(pid: u64, wstatus: u64, options: u64, _rusage: u64) -> u64 {
                 crate::process::ExitInfo::Normal => 0u64 << WIFEXITED_SHIFT,
                 crate::process::ExitInfo::PageFault { .. } => 11, // SIGSEGV
                 crate::process::ExitInfo::Exception { .. } => 6,  // SIGABRT-ish
+                crate::process::ExitInfo::Signaled { sig } => sig as u64,
             };
             if status_ptr != 0 {
                 if let Some(phys) = resolve(status_ptr, 4) {
@@ -662,6 +667,122 @@ fn sys_wait4(pid: u64, wstatus: u64, options: u64, _rusage: u64) -> u64 {
         // target pid doesn't exist at all this would spin forever, but
         // the only callers wait on pids they forked.
         crate::task::yield_rr();
+    }
+}
+
+/// `rt_sigaction(sig, act, oldact, sigsetsize)`: installs or queries a
+/// signal disposition. Copies 32 bytes of the x86_64 kernel
+/// `struct sigaction` — handler(8) + flags(8) + restorer(8) + the
+/// kernel's 64-bit sigset mask(8). SIGKILL/SIGSTOP can't be caught or
+/// ignored (EINVAL). Phase 8a records the disposition and delivers
+/// default actions; caught-handler delivery is a later phase.
+fn sys_rt_sigaction(sig: u64, act: u64, oldact: u64, _sigsetsize: u64) -> u64 {
+    if !(1..=64).contains(&sig) || sig == 9 || sig == 19 {
+        return err(EINVAL);
+    }
+    if oldact != 0 {
+        let action = crate::task::with_current_process_mut(|p| p.sigactions[sig as usize]);
+        if let Some(action) = action {
+            if let Some(phys) = resolve(oldact, 32) {
+                unsafe {
+                    let p = phys as *mut u64;
+                    core::ptr::write_unaligned(p.add(0), action.handler);
+                    core::ptr::write_unaligned(p.add(1), action.flags);
+                    core::ptr::write_unaligned(p.add(2), 0); // sa_restorer
+                    core::ptr::write_unaligned(p.add(3), action.mask);
+                }
+            }
+        }
+    }
+    if act != 0 {
+        if let Some(phys) = resolve(act, 32) {
+            let (handler, flags, mask) = unsafe {
+                let p = phys as *const u64;
+                (
+                    core::ptr::read_unaligned(p.add(0)),
+                    core::ptr::read_unaligned(p.add(1)),
+                    core::ptr::read_unaligned(p.add(3)),
+                )
+            };
+            crate::task::with_current_process_mut(|proc| {
+                proc.sigactions[sig as usize] = crate::process::SigAction { handler, flags, mask };
+            });
+        }
+    }
+    0
+}
+
+/// `rt_sigprocmask(how, set, oldset, sigsetsize)`: change or query the
+/// blocked-signal mask (kernel `sigset_t` is 8 bytes on x86_64).
+/// `how`: 0 = SIG_BLOCK, 1 = SIG_UNBLOCK, 2 = SIG_SETMASK.
+fn sys_rt_sigprocmask(how: u64, set: u64, oldset: u64, _sigsetsize: u64) -> u64 {
+    let old = crate::task::with_current_process_mut(|p| p.sig_blocked).unwrap_or(0);
+    if oldset != 0 {
+        if let Some(phys) = resolve(oldset, 8) {
+            unsafe { core::ptr::write_unaligned(phys as *mut u64, old) };
+        }
+    }
+    if set != 0 {
+        let mut newset = 0u64;
+        if let Some(phys) = resolve(set, 8) {
+            unsafe { newset = core::ptr::read_unaligned(phys as *const u64) };
+        }
+        crate::task::with_current_process_mut(|p| {
+            p.sig_blocked = match how {
+                0 => p.sig_blocked | newset,  // SIG_BLOCK
+                1 => p.sig_blocked & !newset, // SIG_UNBLOCK
+                _ => newset,                  // SIG_SETMASK
+            };
+        });
+    }
+    0
+}
+
+/// `kill(pid, sig)`: send `sig` to the process at task index `pid`.
+/// `pid == 0` means the caller's process group — there are no groups,
+/// so that's the caller itself. Negative pids (groups) are unsupported
+/// (ESRCH). `sig == 0` is an existence probe: 0 if the target is alive,
+/// ESRCH otherwise.
+fn sys_kill(pid: u64, sig: u64) -> u64 {
+    if sig > 64 {
+        return err(EINVAL);
+    }
+    let target = if pid as i64 == 0 {
+        crate::task::current_pid()
+    } else if (pid as i64) < 0 {
+        return err(ESRCH); // process groups aren't implemented
+    } else {
+        pid as usize
+    };
+    if sig == 0 {
+        if crate::task::task_count() > target && !crate::task::process_is_exited(target) {
+            return 0;
+        }
+        return err(ESRCH);
+    }
+    match crate::process::deliver_signal(target, sig as u8) {
+        Ok(()) => 0,
+        Err(()) => err(ESRCH),
+    }
+}
+
+/// `tgkill(tgid, tid, sig)`: per-thread kill. Threads are one-per-
+/// process here, so any tid naming a live process behaves like `kill`;
+/// the tgid/tid group relationship isn't validated (no groups).
+fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> u64 {
+    if sig > 64 {
+        return err(EINVAL);
+    }
+    let target = if tid as i64 <= 0 { crate::task::current_pid() } else { tid as usize };
+    if sig == 0 {
+        if crate::task::task_count() > target && !crate::task::process_is_exited(target) {
+            return 0;
+        }
+        return err(ESRCH);
+    }
+    match crate::process::deliver_signal(target, sig as u8) {
+        Ok(()) => 0,
+        Err(()) => err(ESRCH),
     }
 }
 
@@ -1500,8 +1621,10 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_MPROTECT => sys_mprotect(arg1, arg2, arg3),
         SYS_MUNMAP => sys_munmap(arg1, arg2),
         SYS_BRK => sys_brk(arg1),
-        SYS_RT_SIGACTION => 0,   // no signal delivery — see module docs
-        SYS_RT_SIGPROCMASK => 0, // ditto
+        SYS_RT_SIGACTION => sys_rt_sigaction(arg1, arg2, arg3, arg4),
+        SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(arg1, arg2, arg3, arg4),
+        SYS_KILL => sys_kill(arg1, arg2),
+        SYS_TGKILL => sys_tgkill(arg1, arg2, arg3),
         SYS_IOCTL => err(ENOTTY), // every fd reports "not a tty"
         SYS_WRITEV => sys_writev(arg1, arg2, arg3),
         SYS_GETPID => crate::task::current_pid() as u64,

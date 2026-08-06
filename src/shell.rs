@@ -1556,6 +1556,34 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
+    // Process management, part 2i: Phase 8a signals — `kill` with
+    // default-action delivery. A self-SIGKILL terminates the process
+    // (the wait reports a signal death); a self-SIGCHLD is dropped (its
+    // default action is to ignore) and the shell exits normally; a
+    // `kill -0` existence probe succeeds. 3 checks, one bit each.
+    for (cmd, want) in [
+        ("kill -CHLD $$", process::ExitInfo::Normal),
+        ("kill -KILL $$", process::ExitInfo::Signaled { sig: 9 }),
+        ("kill -0 $$", process::ExitInfo::Normal),
+    ] {
+        let pid = crate::process::spawn_linux(
+            &busybox,
+            "busybox-sh",
+            &["sh", "-c", cmd],
+            &[],
+        )
+        .unwrap_or_else(|e| selftest_fail(&format!("busybox spawn failed: {e}")));
+        let got = crate::process::wait(pid, 800);
+        if got.as_ref() != Some(&want) {
+            selftest_fail(&format!(
+                "busybox `{}` gave {:?}, wanted {:?}",
+                cmd, got, want
+            ));
+        }
+        crate::process::reap(pid);
+    }
+    println!("[OK] Phase 8a: kill/tgkill default-action delivery correct");
+
     // Process management, part 3: the full disk path. The same program
     // read back from the FAT32 image (copied there by `make disk`) must
     // run identically to the embedded copy.
