@@ -2553,6 +2553,16 @@ pub fn selftest() -> ! {
             // syscalls, plus real DNS over a connected UDP socket via
             // `nslookup`. See `phase10_selftest`.
             phase10_selftest();
+
+            // Phase D.8: the ACPI S5 parameters must be discoverable on
+            // the VM targets — RSDP/FADT chain plus the `\_S5` sleep type.
+            match crate::acpi::s5_params() {
+                Some(s5) => println!(
+                    "[OK] ACPI S5: PM1a_CNT=0x{:x}, SLP_TYP={} (tables decoded)",
+                    s5.pm1a_cnt, s5.slp_typa
+                ),
+                None => selftest_fail("ACPI S5 parameters not found (RSDP/FADT/_S5)"),
+            }
         }
         Err(e) => selftest_fail(&format!("e1000 init failed: {}", e)),
     }
@@ -2573,6 +2583,10 @@ pub fn selftest() -> ! {
     } else {
         println!("[SELFTEST FAIL] background task counters did not advance");
     }
+    // Phase D.8: power off via a real ACPI S5 transition (QEMU powers
+    // the machine down and exits on its own); isa-debug-exit is only
+    // the fallback for a machine without (working) ACPI tables.
+    crate::acpi::s5_shutdown();
     unsafe { port::outb(0xF4, 0) }
     interrupts::halt_forever()
 }

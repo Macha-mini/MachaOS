@@ -7,6 +7,7 @@ extern crate alloc;
 mod allocator;
 mod ata;
 mod ahci;
+mod acpi;
 mod calculator;
 mod clipboard;
 mod console;

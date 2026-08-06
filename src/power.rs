@@ -4,10 +4,10 @@
 //! manager — persists the desktop session before handing over), then
 //! perform the hardware action:
 //!
-//! - `shutdown` writes to QEMU's `isa-debug-exit` port (0xF4), which
-//!   makes the emulator exit with a success status; on real hardware
-//!   this would be an ACPI S5 transition, which this OS does not
-//!   implement yet.
+//! - `shutdown` performs a real ACPI S5 transition (RSDP/FADT ->
+//!   PM1a_CNT write, see `acpi.rs`) so the machine — VM or real
+//!   hardware — actually powers off; if the tables are missing it
+//!   falls back to QEMU's `isa-debug-exit` port (0xF4).
 //! - `reboot` pulses the 8042 keyboard controller reset line (0x64 /
 //!   0xFE), the classic PC reboot mechanism.
 //!
@@ -17,12 +17,14 @@
 use crate::port;
 use crate::settings::Settings;
 
-/// Saves settings and powers the machine off (QEMU: isa-debug-exit).
-/// Never returns.
+/// Saves settings and powers the machine off (real ACPI S5, with a
+/// QEMU isa-debug-exit fallback). Never returns.
 pub fn shutdown(settings: &Settings) -> ! {
     let _ = settings.save();
     let _ = crate::fat::remove("/system/dirty"); // clean shutdown marker
-    unsafe { port::outb(0xF4, 0) }; // QEMU isa-debug-exit
+    crate::acpi::s5_shutdown();
+    // Only reached if ACPI ignored the write (no tables / not S5-capable).
+    unsafe { port::outb(0xF4, 0) }; // QEMU isa-debug-exit fallback
     crate::interrupts::halt_forever()
 }
 
