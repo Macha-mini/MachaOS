@@ -95,6 +95,36 @@ pub fn buffered(id: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// True if a read on the pipe would make progress (poll POLLIN): data is
+/// buffered, or the pipe is empty with no writers left (EOF). A vanished
+/// pipe reads as EOF too.
+pub fn read_ready(id: usize) -> bool {
+    match table().get(id).and_then(|s| s.as_ref()) {
+        None => true,
+        Some(p) => p.rd != p.wr || p.writers == 0,
+    }
+}
+
+/// True if a write to the pipe would make progress (poll POLLOUT): the
+/// buffer isn't full.
+pub fn write_ready(id: usize) -> bool {
+    table()
+        .get(id)
+        .and_then(|s| s.as_ref())
+        .map(|p| p.rd.wrapping_sub(p.wr).wrapping_sub(1) % PIPE_BUF_SIZE != 0)
+        .unwrap_or(false)
+}
+
+/// True if the write end has no readers left (poll POLLERR): the writer
+/// would get EPIPE/SIGPIPE.
+pub fn no_readers(id: usize) -> bool {
+    table()
+        .get(id)
+        .and_then(|s| s.as_ref())
+        .map(|p| p.readers == 0)
+        .unwrap_or(true)
+}
+
 /// Reads up to `out.len()` bytes from the pipe. Blocks while the pipe
 /// is empty and a write end is still open; returns 0 for EOF (empty,
 /// no writers) or a vanished pipe. Wakes any writer blocked on a full

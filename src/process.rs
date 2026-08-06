@@ -40,8 +40,7 @@ use crate::vfs;
 /// fd 0/1/2 are reserved for stdin/stdout/stderr, which `syscall.rs`
 /// already serves directly (see `sys_write`/`sys_read`) rather than
 /// through a `FileHandle`; real files start at fd 3.
-const FIRST_FILE_FD: usize = 3;
-
+pub(crate) const FIRST_FILE_FD: usize = 3;
 /// Virtual address of the `.result` page every test program writes its
 /// result to (see user/linker.ld — keep the two in sync).
 pub const PROC_RESULT_VIRT: u64 = 0x2FF0000;
@@ -125,6 +124,17 @@ pub enum FdEntry {
     Socket(usize),
     /// `pipe.rs` pipe id; `true` for the read end (fd[0]).
     Pipe(usize, bool),
+    /// `eventfd` counter (`eventfd2`): `read` returns the count and
+    /// zeroes it; `write` adds to it. Phase 9a.
+    Eventfd(u64),
+    /// `timerfd` (`timerfd_create`): `(deadline_ticks, period_ticks)` on
+    /// the 100 Hz clock; readable once the deadline passes. `deadline 0`
+    /// is disarmed; `period 0` is a one-shot. Phase 9a.
+    Timerfd(u64, u64),
+    /// `epoll` instance (`epoll_create1`): the `(fd, events, data)`
+    /// registrations `epoll_ctl` installed, scanned for readiness by
+    /// `epoll_wait`. Phase 9a.
+    Epoll(alloc::vec::Vec<(usize, u32, u64)>),
 }
 
 impl Drop for FdEntry {
@@ -137,7 +147,7 @@ impl Drop for FdEntry {
             FdEntry::Shm(id, _) => shm::close(*id),
             FdEntry::Socket(id) => socket::close(*id),
             FdEntry::Pipe(id, is_read) => crate::pipe::close_end(*id, *is_read),
-            FdEntry::File(_) => {}
+            FdEntry::File(_) | FdEntry::Eventfd(_) | FdEntry::Timerfd(..) | FdEntry::Epoll(_) => {}
         }
     }
 }
@@ -161,6 +171,12 @@ impl FdEntry {
                 Some(FdEntry::Pipe(*id, *is_read))
             }
             FdEntry::Socket(_) => None,
+            // Value semantics for the Phase 9a fds: a fork/dup gets an
+            // independent copy (real Linux shares the open description —
+            // fine for the event-loop workloads these serve).
+            FdEntry::Eventfd(v) => Some(FdEntry::Eventfd(*v)),
+            FdEntry::Timerfd(d, p) => Some(FdEntry::Timerfd(*d, *p)),
+            FdEntry::Epoll(v) => Some(FdEntry::Epoll(v.clone())),
         }
     }
 }

@@ -231,6 +231,16 @@ const SYS_KILL: u64 = 62;
 const SYS_TGKILL: u64 = 234;
 const SYS_IOCTL: u64 = 16;
 const SYS_WRITEV: u64 = 20;
+const SYS_POLL: u64 = 7;
+const SYS_PPOLL: u64 = 73;
+const SYS_EVENTFD: u64 = 284;
+const SYS_EVENTFD2: u64 = 290;
+const SYS_TIMERFD_CREATE: u64 = 283;
+const SYS_TIMERFD_SETTIME: u64 = 286;
+const SYS_EPOLL_CREATE1: u64 = 291;
+const SYS_EPOLL_CTL: u64 = 233;
+const SYS_EPOLL_WAIT: u64 = 232;
+const SYS_EPOLL_PWAIT: u64 = 281;
 const SYS_SYSINFO: u64 = 99;
 const SYS_GETPID: u64 = 39;
 pub const SYS_EXIT: u64 = 60;
@@ -376,6 +386,16 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
             let n = crate::pipe::write(*id, bytes);
             Some(if n == 0 { err(EPIPE) } else { n as u64 })
         }
+        Some(FdEntry::Eventfd(v)) => {
+            if count != 8 {
+                Some(err(EINVAL))
+            } else {
+                let add = u64::from_ne_bytes(bytes[..8].try_into().unwrap());
+                *v = v.saturating_add(add);
+                Some(8)
+            }
+        }
+        Some(FdEntry::Timerfd(..)) | Some(FdEntry::Epoll(_)) => Some(err(EINVAL)),
         None => None,
     });
     let routed = routed.flatten();
@@ -426,6 +446,42 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
             }
             Some(n as u64)
         }
+        Some(FdEntry::Eventfd(v)) => {
+            if count < 8 {
+                Some(err(EINVAL))
+            } else if *v == 0 {
+                Some(err(EAGAIN)) // no blocking-read support yet
+            } else {
+                let val = *v;
+                *v = 0;
+                let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, 8) };
+                out.copy_from_slice(&val.to_ne_bytes());
+                Some(8)
+            }
+        }
+        Some(FdEntry::Timerfd(deadline, period)) => {
+            if count < 8 {
+                Some(err(EINVAL))
+            } else if *deadline == 0 || crate::interrupts::ticks() < *deadline {
+                Some(err(EAGAIN)) // not expired yet
+            } else {
+                let now = crate::interrupts::ticks();
+                let expirations = if *period == 0 {
+                    1
+                } else {
+                    ((now - *deadline) / *period) + 1
+                };
+                if *period > 0 {
+                    *deadline += expirations * *period;
+                } else {
+                    *deadline = 0;
+                }
+                let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, 8) };
+                out.copy_from_slice(&expirations.to_ne_bytes());
+                Some(8)
+            }
+        }
+        Some(FdEntry::Epoll(_)) => Some(err(EINVAL)), // not readable
         None => None,
     });
     let routed = routed.flatten();
@@ -786,6 +842,359 @@ fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> u64 {
     }
 }
 
+// ---- Phase 9a: poll / epoll / eventfd / timerfd (the event-loop
+// substrate GUI clients and window managers block on) ----
+
+const POLLIN: u16 = 0x001;
+const POLLPRI: u16 = 0x002;
+const POLLOUT: u16 = 0x004;
+const POLLERR: u16 = 0x008;
+const POLLHUP: u16 = 0x010;
+const POLLNVAL: u16 = 0x020;
+
+/// Readiness of `fd` for the requested events — the shared core of
+/// `poll` and `epoll_wait` (EPOLLIN/EPOLLOUT/... are the same bit
+/// values as POLLIN/POLLOUT/...). Never consumes anything: pipes,
+/// sockets, eventfd counters and timerfd deadlines are only inspected.
+fn fd_revents(p: &crate::process::Process, fd: usize, events: u16) -> u16 {
+    use crate::process::FdEntry;
+    let mut rev = 0u16;
+    if fd < crate::process::FIRST_FILE_FD {
+        // stdio: stdout/stderr are always writable; stdin is treated as
+        // always ready (the console's input isn't a poll source).
+        if fd >= 1 {
+            if events & POLLOUT != 0 {
+                rev |= POLLOUT;
+            }
+        } else if events & POLLIN != 0 {
+            rev |= POLLIN;
+        }
+        return rev;
+    }
+    match p.fd(fd) {
+        None => rev |= POLLNVAL,
+        Some(FdEntry::File(_)) | Some(FdEntry::Shm(..)) => {
+            // Regular files are always ready for everything.
+            if events & (POLLIN | POLLPRI) != 0 {
+                rev |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                rev |= POLLOUT;
+            }
+        }
+        Some(FdEntry::Pipe(id, true)) => {
+            if events & POLLIN != 0 && crate::pipe::read_ready(*id) {
+                rev |= POLLIN;
+            }
+            if events & POLLOUT != 0 && crate::pipe::write_ready(*id) {
+                rev |= POLLOUT;
+            }
+        }
+        Some(FdEntry::Pipe(id, false)) => {
+            if events & POLLOUT != 0 && crate::pipe::write_ready(*id) {
+                rev |= POLLOUT;
+            }
+            if events & POLLERR != 0 && crate::pipe::no_readers(*id) {
+                rev |= POLLERR;
+            }
+        }
+        Some(FdEntry::Socket(id)) => {
+            if events & POLLIN != 0
+                && (crate::socket::has_data(*id) || crate::socket::has_backlog(*id))
+            {
+                rev |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                rev |= POLLOUT;
+            }
+        }
+        Some(FdEntry::Eventfd(v)) => {
+            if events & POLLIN != 0 && *v > 0 {
+                rev |= POLLIN;
+            }
+            if events & POLLOUT != 0 && *v < u64::MAX {
+                rev |= POLLOUT;
+            }
+        }
+        Some(FdEntry::Timerfd(deadline, _)) => {
+            if events & POLLIN != 0 && *deadline != 0 && crate::interrupts::ticks() >= *deadline {
+                rev |= POLLIN;
+            }
+        }
+        Some(FdEntry::Epoll(regs)) => {
+            if events & POLLIN != 0
+                && regs
+                    .iter()
+                    .any(|(f, want, _)| fd_revents(p, *f, (*want & 0xFFFF) as u16) != 0)
+            {
+                rev |= POLLIN;
+            }
+        }
+    }
+    rev
+}
+
+/// Deadline in ticks for a poll-style `timeout` (ms; -1 blocks forever).
+fn poll_deadline(timeout: u64) -> Option<u64> {
+    if (timeout as i64) < 0 {
+        None
+    } else {
+        Some(crate::interrupts::ticks() + timeout / 10)
+    }
+}
+
+/// `poll(fds, nfds, timeout)`: check each `struct pollfd` (i32 fd,
+/// i16 events, i16 revents) for readiness; blocks (yield-loop) until
+/// something is ready or the timeout (ms) elapses. Returns the number
+/// of fds with non-zero revents.
+fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> u64 {
+    let n = nfds as usize;
+    let deadline = poll_deadline(timeout);
+    loop {
+        let ready = with_process(|p| {
+            let mut count = 0usize;
+            for i in 0..n {
+                let off = (i as u64) * 8;
+                let Some(phys) = resolve(fds + off, 8) else {
+                    return Err(());
+                };
+                let (fd, events) = unsafe {
+                    let p8 = phys as *const u8;
+                    (
+                        core::ptr::read_unaligned(p8 as *const i32),
+                        core::ptr::read_unaligned(p8.add(4) as *const u16),
+                    )
+                };
+                let rev = if fd < 0 {
+                    POLLNVAL
+                } else {
+                    fd_revents(p, fd as usize, events)
+                };
+                unsafe {
+                    core::ptr::write_unaligned((phys as *mut u8).add(6) as *mut u16, rev);
+                }
+                if rev != 0 {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        });
+        let ready = match ready {
+            Some(Ok(c)) => c,
+            _ => return err(EFAULT),
+        };
+        if ready > 0 {
+            return ready as u64;
+        }
+        if let Some(d) = deadline {
+            if crate::interrupts::ticks() >= d {
+                return 0;
+            }
+        }
+        crate::task::yield_rr();
+    }
+}
+
+/// `ppoll(fds, nfds, timeout, sigmask, sigsetsize)`: poll with a signal
+/// mask swap. The mask isn't implemented — behaves exactly like `poll`.
+fn sys_ppoll(fds: u64, nfds: u64, timeout: u64, _sigmask: u64, _sigsetsize: u64) -> u64 {
+    sys_poll(fds, nfds, timeout)
+}
+
+/// `eventfd2(initval, flags)`: an fd whose read returns a u64 counter
+/// and zeroes it, and whose write adds to the counter. Flags
+/// (EFD_CLOEXEC/EFD_NONBLOCK/EFD_SEMAPHORE) aren't tracked yet.
+fn sys_eventfd2(initval: u64, _flags: u64) -> u64 {
+    with_process(|p| p.alloc_fd(crate::process::FdEntry::Eventfd(initval)) as u64)
+        .unwrap_or(err(EBADF))
+}
+
+fn sys_eventfd(initval: u64) -> u64 {
+    sys_eventfd2(initval, 0)
+}
+
+/// `timerfd_create(clockid, flags)`: an fd readable when the timer
+/// expires. `clockid` is ignored (all timers use the 100 Hz PIT clock).
+fn sys_timerfd_create(_clockid: u64, _flags: u64) -> u64 {
+    with_process(|p| p.alloc_fd(crate::process::FdEntry::Timerfd(0, 0)) as u64)
+        .unwrap_or(err(EBADF))
+}
+
+/// `timerfd_settime(fd, flags, new_value, old_value)`: arm/disarm a
+/// timer fd. `new_value` is an `itimerspec` (interval + value timespecs,
+/// 32 bytes); the value's relative delay is converted to 100 Hz ticks.
+fn sys_timerfd_settime(fd: u64, _flags: u64, new_value: u64, old_value: u64) -> u64 {
+    let now = crate::interrupts::ticks();
+    let (value_sec, value_nsec, period_ticks) = if new_value != 0 {
+        let Some(phys) = resolve(new_value, 32) else {
+            return err(EFAULT);
+        };
+        unsafe {
+            let p = phys as *const u8;
+            let iv_sec = core::ptr::read_unaligned(p as *const i64);
+            let iv_nsec = core::ptr::read_unaligned(p.add(8) as *const i64);
+            let val_sec = core::ptr::read_unaligned(p.add(16) as *const i64);
+            let val_nsec = core::ptr::read_unaligned(p.add(24) as *const i64);
+            let period = if iv_sec <= 0 && iv_nsec <= 0 {
+                0
+            } else {
+                iv_sec.max(0) as u64 * 100 + (iv_nsec.max(0) as u64) / 10_000_000
+            };
+            (val_sec, val_nsec, period)
+        }
+    } else {
+        (0, 0, 0)
+    };
+    let deadline = if value_sec <= 0 && value_nsec <= 0 {
+        0 // disarm
+    } else {
+        let d = value_sec.max(0) as u64 * 100 + (value_nsec.max(0) as u64) / 10_000_000;
+        now + d.max(1)
+    };
+    if old_value != 0 {
+        if let Some(phys) = resolve(old_value, 32) {
+            unsafe {
+                core::ptr::write_bytes(phys as *mut u8, 0, 32);
+            }
+        }
+    }
+    with_process(|p| match p.fd_mut(fd as usize) {
+        Some(crate::process::FdEntry::Timerfd(d, per)) => {
+            *d = deadline;
+            *per = period_ticks;
+            0
+        }
+        _ => err(EBADF),
+    })
+    .unwrap_or(err(EBADF))
+}
+
+/// `epoll_create1(flags)`: an epoll instance fd (a registration set
+/// `epoll_ctl` fills and `epoll_wait` scans).
+fn sys_epoll_create1(_flags: u64) -> u64 {
+    with_process(|p| {
+        p.alloc_fd(crate::process::FdEntry::Epoll(alloc::vec::Vec::new())) as u64
+    })
+    .unwrap_or(err(EBADF))
+}
+
+/// `epoll_ctl(epfd, op, fd, event)`: ADD(1)/DEL(2)/MOD(3) a `(fd,
+/// events)` registration on an epoll instance. The event is a 12-byte
+/// `struct epoll_event` (u32 events, u64 data — data echoed by
+/// `epoll_wait`).
+fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> u64 {
+    let (want, data) = if event != 0 {
+        let Some(phys) = resolve(event, 12) else {
+            return err(EFAULT);
+        };
+        unsafe {
+            (
+                core::ptr::read_unaligned(phys as *const u32),
+                core::ptr::read_unaligned((phys as *mut u8).add(4) as *const u64),
+            )
+        }
+    } else {
+        (0, 0)
+    };
+    with_process(|p| {
+        let regs = match p.fd_mut(epfd as usize) {
+            Some(crate::process::FdEntry::Epoll(v)) => v,
+            _ => return err(EBADF),
+        };
+        match op {
+            1 => {
+                // ADD
+                if regs.iter().any(|(f, _, _)| *f == fd as usize) {
+                    return err(EEXIST);
+                }
+                regs.push((fd as usize, want, data));
+                0
+            }
+            2 => {
+                // DEL
+                let before = regs.len();
+                regs.retain(|(f, _, _)| *f != fd as usize);
+                if regs.len() == before {
+                    err(ENOENT)
+                } else {
+                    0
+                }
+            }
+            3 => {
+                // MOD
+                match regs.iter_mut().find(|(f, _, _)| *f == fd as usize) {
+                    Some(slot) => {
+                        *slot = (fd as usize, want, data);
+                        0
+                    }
+                    None => err(ENOENT),
+                }
+            }
+            _ => err(EINVAL),
+        }
+    })
+    .unwrap_or(err(EBADF))
+}
+
+/// `epoll_wait(epfd, events, maxevents, timeout)`: scan the instance's
+/// registrations, write a `struct epoll_event` (u32 events, u64 data)
+/// per ready fd (up to `maxevents`), and return the count. Blocks
+/// (yield-loop) like `poll` until something is ready or the timeout.
+fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    let deadline = poll_deadline(timeout);
+    loop {
+        let ready = with_process(|p| {
+            let regs = match p.fd(epfd as usize) {
+                Some(crate::process::FdEntry::Epoll(v)) => v.clone(),
+                _ => return Err(()),
+            };
+            let mut count = 0usize;
+            for (f, want, data) in &regs {
+                let rev = fd_revents(p, *f, (*want & 0xFFFF) as u16) as u32;
+                if rev == 0 {
+                    continue;
+                }
+                if count < maxevents as usize {
+                    if let Some(phys) = resolve(events_ptr + (count as u64) * 12, 12) {
+                        unsafe {
+                            core::ptr::write_unaligned(phys as *mut u32, rev);
+                            core::ptr::write_unaligned((phys as *mut u8).add(4) as *mut u64, *data);
+                        }
+                    }
+                }
+                count += 1;
+            }
+            Ok(count)
+        });
+        let ready = match ready {
+            Some(Ok(c)) => c,
+            _ => return err(EBADF),
+        };
+        if ready > 0 {
+            return ready as u64;
+        }
+        if let Some(d) = deadline {
+            if crate::interrupts::ticks() >= d {
+                return 0;
+            }
+        }
+        crate::task::yield_rr();
+    }
+}
+
+/// `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)`:
+/// epoll_wait with a signal mask swap — the mask isn't implemented.
+fn sys_epoll_pwait(
+    epfd: u64,
+    events: u64,
+    maxevents: u64,
+    timeout: u64,
+    _sigmask: u64,
+    _sigsetsize: u64,
+) -> u64 {
+    sys_epoll_wait(epfd, events, maxevents, timeout)
+}
+
 /// `rt_sigreturn()`: restores the context a signal handler interrupted.
 /// Reads the sigframe pushed by `process::deliver_pending_signals` (at
 /// the current ring-3 rsp minus `SIGFRAME_SIZE`), restores the blocked
@@ -962,6 +1371,9 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         }
         Some(FdEntry::Socket(_)) => err(ESPIPE),
         Some(FdEntry::Pipe(_, _)) => err(ESPIPE), // pipes aren't seekable
+        Some(
+            FdEntry::Eventfd(_) | FdEntry::Timerfd(..) | FdEntry::Epoll(_),
+        ) => err(ESPIPE),
         None => err(EBADF),
     })
     .unwrap_or(err(EBADF))
@@ -1052,6 +1464,9 @@ fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         Some(FdEntry::Shm(id, _)) => Some((S_IFREG | 0o600, shm::size_of(*id).unwrap_or(0) as u64, *id as u64 + 1)),
         Some(FdEntry::Socket(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
         Some(FdEntry::Pipe(id, _)) => Some((S_IFIFO | 0o600, crate::pipe::buffered(*id) as u64, *id as u64 + 1)),
+        Some(FdEntry::Eventfd(_)) => Some((S_IFREG | 0o600, 8, 0xE0)),
+        Some(FdEntry::Timerfd(..)) => Some((S_IFREG | 0o600, 8, 0xE1)),
+        Some(FdEntry::Epoll(_)) => Some((S_IFREG | 0o600, 0, 0xE2)),
         None => None,
     });
     match result {
@@ -1658,6 +2073,16 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_TGKILL => sys_tgkill(arg1, arg2, arg3),
         SYS_IOCTL => err(ENOTTY), // every fd reports "not a tty"
         SYS_WRITEV => sys_writev(arg1, arg2, arg3),
+        SYS_POLL => sys_poll(arg1, arg2, arg3),
+        SYS_PPOLL => sys_ppoll(arg1, arg2, arg3, arg4, arg5),
+        SYS_EVENTFD => sys_eventfd(arg1),
+        SYS_EVENTFD2 => sys_eventfd2(arg1, arg2),
+        SYS_TIMERFD_CREATE => sys_timerfd_create(arg1, arg2),
+        SYS_TIMERFD_SETTIME => sys_timerfd_settime(arg1, arg2, arg3, arg4),
+        SYS_EPOLL_CREATE1 => sys_epoll_create1(arg1),
+        SYS_EPOLL_CTL => sys_epoll_ctl(arg1, arg2, arg3, arg4),
+        SYS_EPOLL_WAIT => sys_epoll_wait(arg1, arg2, arg3, arg4),
+        SYS_EPOLL_PWAIT => sys_epoll_pwait(arg1, arg2, arg3, arg4, arg5, arg6),
         SYS_GETPID => crate::task::current_pid() as u64,
         SYS_GETTID => crate::task::current_pid() as u64,
         SYS_UNAME => sys_uname(arg1),

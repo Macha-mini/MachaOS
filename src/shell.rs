@@ -1539,7 +1539,22 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
-    // Process management, part 2i: Phase 7 integration against a real
+    // Process management, part 2i: Phase 9a event-loop substrate —
+    // poll, epoll, eventfd and timerfd (what GUI clients and window
+    // managers block on). All six checks fold into the program result.
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_POLL, "linux-poll", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 800) {
+        Some(process::ExitInfo::Normal) => println!("[OK] linux-poll process exited normally"),
+        other => selftest_fail(&format!("linux-poll process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0x3F) => println!("[OK] Phase 9a: poll/epoll/eventfd/timerfd all correct"),
+        other => selftest_fail(&format!("linux-poll process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 2j: Phase 7 integration against a real
     // third-party binary — BusyBox ash running a pipeline
     // (`echo … | /bin/cat.elf`), which needs fork + pipe2 + dup2 +
     // execve (of a real dynamically-linked glibc binary) + wait4 all
