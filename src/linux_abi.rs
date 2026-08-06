@@ -1412,29 +1412,56 @@ fn sys_epoll_pwait(
 /// Reads the sigframe pushed by `process::deliver_pending_signals` (at
 /// the current ring-3 rsp minus `SIGFRAME_SIZE`), restores the blocked
 /// mask, and — since a normal syscall return would sysretq back to the
-/// sigreturn trampoline — returns the exec-restart magic with the saved
-/// rip/rsp stashed, so the asm's `.Lsyscall_exec_restart` path iretq's
-/// straight to the interrupted instruction instead.
+/// sigreturn trampoline — returns the exec-restart magic with a full
+/// register-restore block built on the user stack (the 15 GP registers
+/// plus the iretq frame), so the asm's sigreturn path pops every
+/// register and iretq's straight to the interrupted instruction. The
+/// handler's `ret` already consumed the restorer slot, so the saved
+/// context (rip rflags rsp mask sig + the 15 GP registers) sits at the
+/// current ring-3 rsp; the restore block overwrites the frame's low
+/// 160 bytes — pages the kernel already resolved and mapped at delivery.
 fn sys_rt_sigreturn() -> u64 {
-    // The handler's `ret` already consumed the restorer slot, so the
-    // saved context sits at the current ring-3 rsp (five qwords).
+    // user_rsp = frame_base + 8 (the restorer slot was popped by `ret`).
     let user_rsp = crate::task::current_user_rsp();
-    let Some(phys) = resolve(user_rsp, crate::process::SIGFRAME_REMAINDER) else {
+    let frame_base = user_rsp - 8;
+    let Some(phys) = resolve(frame_base, crate::process::SIGFRAME_SIZE) else {
         // No valid frame — Linux kills the process with SIGSEGV.
         crate::process::deliver_signal(crate::task::current_pid(), 11);
         return err(EINVAL);
     };
-    let mut words = [0u64; 5];
+    // Saved context: 20 qwords at frame_base + 8.
+    let mut w = [0u64; 20];
     unsafe {
-        core::ptr::copy_nonoverlapping(phys as *const u8, words.as_mut_ptr() as *mut u8, 40);
+        core::ptr::copy_nonoverlapping(
+            (phys + 8) as *const u8,
+            w.as_mut_ptr() as *mut u8,
+            crate::process::SIGFRAME_REMAINDER as usize,
+        );
     }
-    let saved_rip = words[0];
-    let saved_rsp = words[2];
-    let saved_mask = words[3];
+    // Restore the blocked mask.
     crate::task::with_current_process_mut(|p| {
-        p.sig_blocked = saved_mask;
+        p.sig_blocked = w[3];
     });
-    crate::syscall::set_exec_restart(saved_rip, saved_rsp);
+    // Build the restart block (in the asm's pop order, then the iretq
+    // frame): r15 r14 r13 r12 rbp rbx r11 r10 r9 r8 rdi rsi rdx rcx rax
+    // | rip cs rflags rsp ss.
+    const CS_RING3: u64 = 0x3B;
+    const SS_RING3: u64 = 0x33;
+    let block = [
+        w[19], w[18], w[17], w[16], w[11], w[6], // r15 r14 r13 r12 rbp rbx
+        w[15], w[14], w[13], w[12], w[10], w[9], // r11 r10 r9  r8  rdi rsi
+        w[8], w[7], w[5],                        // rdx rcx rax
+        w[0], CS_RING3, w[1], w[2], SS_RING3,    // rip cs rflags rsp ss
+    ];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            block.as_ptr() as *const u8,
+            phys as *mut u8,
+            (block.len() * 8) as usize,
+        );
+    }
+    crate::syscall::set_exec_restart(0, frame_base);
+    crate::syscall::set_sigreturn_restore();
     crate::syscall::EXECVE_RESTART_MAGIC_VALUE
 }
 

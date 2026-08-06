@@ -1031,6 +1031,10 @@ pub fn execve_into_current(
     // local-relative spot sat inside the deepest syscall frames' reach
     // and got overwritten whenever the exec'd program made deep calls.
     crate::task::repark_exit_chain(exit_self as extern "C" fn() -> ! as usize);
+    // A plain execve restarts into a fresh program, so the asm's
+    // exec-restart path must take the plain-iretq branch — not the
+    // register-restore branch `rt_sigreturn` flags.
+    crate::syscall::clear_sigreturn_restore();
     crate::syscall::set_exec_restart(entry as u64, user_rsp);
     Ok((entry as u64, user_rsp))
 }
@@ -1940,12 +1944,22 @@ pub fn deliver_signal(pid: usize, sig: u8) -> Result<(), ()> {
 ///   +24 saved_rsp     — the interrupted rsp (frame base + SIGFRAME_SIZE)
 ///   +32 saved_sigmask — the blocked mask to restore
 ///   +40 sig           — informational (the handler gets it in rdi)
-pub const SIGFRAME_SIZE: u64 = 48;
+///   +48..+160 the 15 GP registers (rax rbx rcx rdx rsi rdi rbp r8-r15),
+///   saved because the handler — and the rt_sigreturn syscall — clobber
+///   every caller-saved register: without them the interrupted code
+///   resumes with the handler's leftovers (e.g. rdi = sig), which
+///   busybox's `kill -CHLD` caught as a #PF at `movl 0x8c(%rdi), %eax`
+///   (CR2 = sig + 0x8c).
+///   Segment registers are *not* recorded: ds/es/gs are flat 0x33 for
+///   every process and fs must survive sigreturn untouched (its hidden
+///   base is the TLS block set via arch_prctl — see the sigreturn asm),
+///   so a handler that itself changes fs would keep its change.
+pub const SIGFRAME_SIZE: u64 = 168;
 
 /// How much of the frame `rt_sigreturn` reads: the handler's `ret` has
-/// already consumed the restorer slot, so the remaining five qwords sit
+/// already consumed the restorer slot, so the remaining 20 qwords sit
 /// at the current ring-3 rsp.
-pub(crate) const SIGFRAME_REMAINDER: u64 = 40;
+pub(crate) const SIGFRAME_REMAINDER: u64 = 160;
 
 /// The `mov eax, SYS_RT_SIGRETURN; syscall` stub in the syscall-stub page
 /// (`map_syscall_stubs`) — a handler's `ret` lands here.
@@ -2005,6 +2019,21 @@ pub fn deliver_pending_signals(frame: &mut interrupts::InterruptFrame) {
             user_rsp,             // +24 saved_rsp
             old_mask,             // +32 saved_sigmask
             sig as u64,           // +40 sig
+            frame.rax,            // +48
+            frame.rbx,            // +56
+            frame.rcx,            // +64
+            frame.rdx,            // +72
+            frame.rsi,            // +80
+            frame.rdi,            // +88
+            frame.rbp,            // +96
+            frame.r8,             // +104
+            frame.r9,             // +112
+            frame.r10,            // +120
+            frame.r11,            // +128
+            frame.r12,            // +136
+            frame.r13,            // +144
+            frame.r14,            // +152
+            frame.r15,            // +160
         ];
         unsafe {
             core::ptr::copy_nonoverlapping(

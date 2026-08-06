@@ -2107,9 +2107,12 @@ pub fn selftest() -> ! {
     // Process management, part 2h: Phase 8b signal delivery — a caught
     // handler runs asynchronously (timer-delivered, sigframe pushed on
     // the ring-3 stack), rt_sigreturn restores the interrupted context
-    // (a *second* signal is still deliverable — the mask was restored),
-    // and a trailing SIG_DFL SIGTERM terminates the process (the wait
-    // reports the signal death). 3 checks folded into the result.
+    // (a *second* signal is still deliverable — the mask was restored,
+    // and a third phase writes through a pointer held in rdi across a
+    // delivery — the full GP set is restored, the busybox kill -CHLD
+    // flaky regression), and a trailing SIG_DFL SIGTERM terminates the
+    // process (the wait reports the signal death). 4 checks folded into
+    // the result.
     let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_SIGNAL, "linux-signal", &[], &[])
         .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
     match crate::process::wait(pid, 800) {
@@ -2119,8 +2122,8 @@ pub fn selftest() -> ! {
         other => selftest_fail(&format!("linux-signal process gave unexpected exit: {:?}", other)),
     }
     match crate::process::read_result(pid) {
-        Some(0xB) => println!(
-            "[OK] Phase 8b: handler delivery + rt_sigreturn + mask restore all correct"
+        Some(0xF) => println!(
+            "[OK] Phase 8b: handler delivery + rt_sigreturn + mask + full GP-register restore all correct"
         ),
         other => selftest_fail(&format!("linux-signal process result mismatch: {:?}", other)),
     }

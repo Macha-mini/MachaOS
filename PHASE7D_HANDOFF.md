@@ -156,6 +156,44 @@ Phase 8b (SIGCHLD 含むシグナル配送) 実装後 + `sys_wait4` の完全回
 - 効果: selftest 終了時のタスク数が 10 (ゾンビ4) から 5 (main +
   bg×3 + wayland) に減少。`[OK] all process frames returned to the PMM`
 
+**2026-08-06 追記 5 — busybox `kill -CHLD $$` flaky (#GP/PageFault) の根本原因を
+特定・修正**:
+
+16 GiB 構成 (`make test MEM=16G`) で ~1/3 の確率で `kill -CHLD $$` が
+crash する flaky を調査。crash log から逆アセンブルまで追って**2 つの独立した
+バグ**が同じ sigreturn 経路に重なっていることを特定した:
+
+1. **rt_sigreturn が GP レジスタを復元しない** (`src/process.rs` +
+   `src/linux_abi.rs` + `src/syscall.rs`)
+   - 旧 sigframe は rip/rflags/rsp (+mask+sig) のみ保存。ハンドラ戻り時
+     (rt_sigreturn) は exec-restart 経由で rip/rsp だけ復元し、他の GP レジスタは
+     ハンドラの残骸のまま → 割り込み先の命令がレジスタ依存の直後に当たると
+     クラッシュ。実例: busybox が `movl 0x8c(%rdi), %eax` の直前に割り込まれ、
+     rdi=17 (SIGCHLD 番号) のまま復帰 → CR2=0x9D (=17+0x8c) の #PF。
+   - 修正: sigframe を 168B に拡張 (全 15 GP レジスタ保存)。rt_sigreturn が
+     ユーザースタックに復元ブロック (GP 15 + iretq フレーム) を構築し、
+     asm の `.Lsyscall_sigreturn_restore` が pop してから iretq。
+     execve は従来どおり素の iretq (SIGRETURN_RESTORE フラグで切替)。
+2. **sigreturn 復帰時の `mov fs, ax` が TLS の FS ベースを破壊** (`src/syscall.rs`)
+   - 旧 exec-restart 経路 (sigreturn も共用) は execve 用に ds/es/fs/gs=0x33 を
+     mov していた。`mov fs, ax` は GDT から隠れベース (0) を再ロードするため、
+     musl が arch_prctl で設定した FS ベース (MSR) が消え、次の TLS アクセス
+     (`__errno_location` = `mov %fs:0x0, %rax`) がアドレス 0 で #PF。
+     レジスタバグを直したことで今度はこちらの症状 (CR2=0, rip=0x4bf1be) が
+     顕在化した。
+   - 修正: sigreturn 経路ではセグメントレジスタに一切触らない (sysretq 系
+     の戻り経路と同じ)。フレッシュプログラムへ飛ぶ execve/enter_usermode の
+     `mov fs, ax` はそのまま。
+
+**検証**: 修正後 `make test` + `make test MEM=16G` を 4G×複数回・16G×6 回
+連続 [SELFTEST OK]。prog_linux_signal に第3フェーズを追加: rdi にカナリア
+ポインタを保持したままシグナル配送を跨いで書き込み、レジスタ完全復元を
+回帰検証 (RESULT 0xB → 0xF)。
+
+**教訓**: シグナル復帰は「フレッシュプログラムへの遷移」(execve) とは
+違う。execve 用の最小復元 (rip/rsp + セグメント再ロード) を流用してはいけない
+—— 割り込み先のレジスタ・FS ベースはすべて厳密に保存・復元する必要がある。
+
 ## 運用メモ
 
 - `make test` は target/disk.img を作り直す (手動配置ファイルは消える)

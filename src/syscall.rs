@@ -111,11 +111,34 @@ pub const EXECVE_RESTART_MAGIC_VALUE: u64 = 0x4E584543_52455354;
 static mut EXEC_ENTRY: u64 = 0;
 #[unsafe(no_mangle)]
 static mut EXEC_USER_RSP: u64 = 0;
+/// Set by `sys_rt_sigreturn` (1) / `execve_into_current` (0) to tell the
+/// exec-restart asm which consumer returned `EXECVE_RESTART_MAGIC`: a
+/// sigreturn means `EXEC_USER_RSP` points at a full 20-qword register-
+/// restore block (15 GP regs in pop order, then the iretq frame); an
+/// execve means a fresh stack for a plain iretq.
+#[unsafe(no_mangle)]
+static mut SIGRETURN_RESTORE: u8 = 0;
 
 pub fn set_exec_restart(entry: u64, user_rsp: u64) {
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!(EXEC_ENTRY), entry);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(EXEC_USER_RSP), user_rsp);
+    }
+}
+
+/// Signals the exec-restart asm to pop the register-restore block that
+/// `sys_rt_sigreturn` built on the user stack before iretq'ing.
+pub fn set_sigreturn_restore() {
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(SIGRETURN_RESTORE), 1);
+    }
+}
+
+/// Clears the sigreturn-restore flag (every execve, so a later execve
+/// after a sigreturn never takes the register-restore branch).
+pub fn clear_sigreturn_restore() {
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(SIGRETURN_RESTORE), 0);
     }
 }
 
@@ -385,6 +408,13 @@ syscall_entry:
     mov rcx, [rip + SAVED_RIP_SCRATCH]
     sysretq
 .Lsyscall_exec_restart:
+    # Two consumers share this magic: sys_execve (fresh program — plain
+    # iretq) and sys_rt_sigreturn (restore the full interrupted register
+    # set). rt_sigreturn builds a 20-qword block on the user stack (the
+    # 15 GP registers, then the iretq frame) and points EXEC_USER_RSP at
+    # its bottom, flagging the switch via SIGRETURN_RESTORE.
+    cmp byte ptr [rip + SIGRETURN_RESTORE], 1
+    je .Lsyscall_sigreturn_restore
     # Iretq into the new program like enter_usermode does — the handler
     # already parked the exit chain and set ring3_kernel_rsp, so the new
     # program's own exit syscall unwinds cleanly to exit_self.
@@ -401,6 +431,32 @@ syscall_entry:
     push 0x3B            # cs
     mov rax, [rip + EXEC_ENTRY]
     push rax             # rip
+    iretq
+.Lsyscall_sigreturn_restore:
+    # The interrupted code resumes with every register exactly as the
+    # timer ISR captured it. Deliberately *no* segment-register reloads
+    # here (unlike the execve path, which iretq's into a fresh program):
+    # `mov fs, ax` would reset the hidden FS base from the GDT, wiping
+    # the TLS base the program set via arch_prctl — the next errno/TLS
+    # access would fault at fs:0 (busybox `kill -CHLD` crash class 2).
+    # The user's ds/es/fs/gs (flat 0x33 + the MSR fs base) survive the
+    # syscall untouched, exactly as on the sysretq return paths.
+    mov rsp, [rip + EXEC_USER_RSP]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     iretq
 .Lsyscall_exit:
     sti

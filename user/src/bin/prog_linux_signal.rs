@@ -4,7 +4,11 @@
 //! them asynchronously — the handler ran and `rt_sigreturn` restored the
 //! interrupted context (proven by the *second* signal still being
 //! deliverable: if the mask weren't restored, it would stay blocked
-//! forever). Result = 0xB when both handlers ran once, in order.
+//! forever). A third phase holds a canary pointer in rdi across a
+//! delivery and keeps writing through it: if rt_sigreturn doesn't
+//! restore the full GP register set, rdi comes back as the signal
+//! number and the write-through #PFs — the busybox `kill -CHLD` flaky.
+//! Result = 0xF when all three phases passed.
 
 #![no_std]
 #![no_main]
@@ -24,6 +28,9 @@ const SIGUSR2: u64 = 12;
 
 static HITS: AtomicU64 = AtomicU64::new(0);
 static LAST_SIG: AtomicU64 = AtomicU64::new(0);
+/// Written through the pointer held in rdi during phase 3 — a leaked rdi
+/// turns the write into a #PF at the signal number.
+static CANARY: AtomicU64 = AtomicU64::new(0);
 
 #[unsafe(no_mangle)]
 extern "C" fn handle_sig(sig: u64) {
@@ -80,9 +87,48 @@ pub extern "C" fn _start() {
         ok |= 2;
     }
 
+    // Phase 3: full GP register restore. Raise a third SIGUSR1, then spin
+    // writing through a canary pointer held in rdi until it is delivered
+    // (HITS 2 -> 3). A sigreturn that restores only rip/rsp leaves rdi =
+    // sig (10) in the interrupted loop, and the very next `mov [rdi],
+    // rax` page-faults at address 0xA — killing us before the SIGTERM.
+    unsafe {
+        common::syscall(SYS_KILL, me, SIGUSR1, 0, 0);
+    }
+    let ptr = &CANARY as *const AtomicU64 as u64;
+    let mut rdi = ptr;
+    unsafe {
+        core::arch::asm!(
+            "xor rcx, rcx",
+            "2:",
+            "mov rax, [rdi]",
+            "add rax, 1",
+            "mov [rdi], rax", // write through the pointer — #PF if rdi leaked
+            "mov rax, [rip + {hits}]",
+            "cmp rax, 3",
+            "jge 3f",
+            "add rcx, 1",
+            "cmp rcx, 50000000", // safety bound; delivery is at the next tick
+            "jb 2b",
+            "3:",
+            hits = sym HITS,
+            inout("rdi") rdi => rdi,
+            out("rcx") _,
+            out("rax") _,
+            options(nostack),
+        );
+    }
+    if ok == 3
+        && rdi == ptr
+        && CANARY.load(Ordering::Relaxed) > 0
+        && HITS.load(Ordering::Relaxed) >= 3
+    {
+        ok |= 4;
+    }
+
     // A signal with no handler (SIGTERM, SIG_DFL) must terminate us — the
     // parent's wait reports the signal death. Never reached if it works.
-    common::RESULT.store(if ok == 3 { 0xB } else { 0 }, Ordering::Relaxed);
+    common::RESULT.store(if ok == 7 { 0xF } else { 0 }, Ordering::Relaxed);
     unsafe {
         common::syscall(SYS_KILL, me, 15, 0, 0); // SIGTERM — default action: kill
     }
