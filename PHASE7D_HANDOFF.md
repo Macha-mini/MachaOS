@@ -73,19 +73,33 @@ Phase 7 (プロセスモデル: clone/futex/fork/execve/wait4) の最終検証�
 
 ## 残課題 (次のセッションで)
 
-**flaky ハング**: クリーンビルドで sh が exit しない。診断で確認済みの事実:
+**flaky ハング** (調査継続中 — 2026-08-06 追記): クリーンビルドで sh が exit しない
+(selftest の `wait(7, 800)` が `None` でタイムアウト → `busybox-sh process gave
+unexpected exit: None`)。確認済みの事実:
 - fork 子 (echo=8, cat=9) は正常に exit し、cat はファイルへの書込も完了
 - sh の wait4(-1) は 8 → 9 → ECHILD の順に正しく戻る (wait4 自体は完成)
-- **sh は waitforjob 後の ash コード (リング3) で停止し、以後 syscall を一切しない**
-  (デバッグ出力付きの遅いビルドでは通る = タイミング依存の疑い)
+- **シリアル診断出力がタイミングを変えて flaky を隠す**: 診断付きビルド
+  ([SC7] syscall トレース / [SH] timer ダンプ / [WAITPOLL7]) は 2/2 PASS、
+  クリーンビルドは 3/3 FAIL を観測。診断のシリアル書込が syscall dispatch を
+  遅くし interleaving を変えている。**シリアル診断ではこのバグを捕まえられない**
+- **[SH] トレース分析で sh の「リング3 停止」は否定**: sh は tick 320 で
+  カーネルモード (cs=0x8、wait4 ポーリングループ内) で current になっており、
+  以後 t%20 境界に現れないのは正常 (QUANTUM=5、タスク ~13 → ターン間隔 ~65 tick
+  が t%20 とまれにしか重ならないだけ)。スケジューラ・wait4・spawn (sh は
+  parent=None で生成されるため他タスクの wait4(-1) に reap されない) は全て正常
+- クリーン失敗時のログ末尾は sh 起動時の未実装 syscall
+  ([UNKSYSCALL] 102/104/106/105/79 = getuid/getgid/setgid/setuid/getcwd → ENOSYS)。
+  その後の syscall (rt_sigaction 13 / pipe 22 / dup2 63 等) は実装済みでプリント
+  されないため、停止箇所はログからは特定不能
 
 次の手:
-1. 停止中の sh のユーザー RIP を特定する (scheduler で pid==7 の user rip をダンプ、
-   または gdbstub)。0x4567ba 付近 (evaltree) か、その後の waitforjob 後処理と推定
-2. `waitpid(8)` / `waitpid(9)` の戻り値が ash の想定と合うか確認 (status の
-   WIFEXITED エンコーディング `code << 8` は実装済み)
-3. もしかすると ash は `waitpid` を EINTR 扱いする等のエッジがある — SIGCHLD 未実装
-   (Phase 8) の影響の可能性。シグナル配送を実装すれば消えるかも
+1. **Phase 8 (シグナル配送) が最有力**: `rt_sigaction`/`rt_sigprocmask` は現在
+   スタブ (常に 0 返し)。ash は起動時に SIGCHLD/SIGINT 等のハンドラを登録しており、
+   シグナル未配送の影響で ash の待機パスがまれに完了しない可能性がある。
+   SIGCHLD 配送 + rt_sigreturn + sigaltstack を実装して再検証する
+2. それでも残るなら: gdbstub / QEMU monitor で停止中の sh のユーザー RIP を特定
+   (シリアル診断はタイミングを変えるため使えない — 診断なしで停止を捕まえる
+   手段が必要)
 
 ## 運用メモ
 
