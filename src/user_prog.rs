@@ -14,4 +14,5 @@ pub static PROG_LINUX_THREADS: &[u8] = include_bytes!("../target/user-linux-thre
 pub static PROG_LINUX_FORK: &[u8] = include_bytes!("../target/user-linux-fork.elf");
 pub static PROG_LINUX_SIGNAL: &[u8] = include_bytes!("../target/user-linux-signal.elf");
 pub static PROG_LINUX_POLL: &[u8] = include_bytes!("../target/user-linux-poll.elf");
+pub static PROG_LINUX_FS: &[u8] = include_bytes!("../target/user-linux-fs.elf");
 pub static PROG_LINUX_WAYLAND_CLIENT: &[u8] = include_bytes!("../target/user-linux-wayland-client.elf");

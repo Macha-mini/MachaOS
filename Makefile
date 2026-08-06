@@ -45,6 +45,7 @@ user:
 	cp user/target/x86_64-unknown-none/release/prog_linux_fork target/user-linux-fork.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_signal target/user-linux-signal.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_poll target/user-linux-poll.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_fs target/user-linux-fs.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_wayland_client target/user-linux-wayland-client.elf
 
 build: gen user

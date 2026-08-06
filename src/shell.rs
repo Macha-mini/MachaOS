@@ -1554,7 +1554,22 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
-    // Process management, part 2j: Phase 7 integration against a real
+    // Process management, part 2j: Phase 9b pseudo-filesystem and fs
+    // syscalls — /dev/null|zero|urandom, /proc/self/stat, mkdir,
+    // statx, rename, unlink. All eight checks fold into the result.
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_FS, "linux-fs", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 800) {
+        Some(process::ExitInfo::Normal) => println!("[OK] linux-fs process exited normally"),
+        other => selftest_fail(&format!("linux-fs process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0xFF) => println!("[OK] Phase 9b: /dev /proc pseudo-FS + statx/mkdir/rename/unlink correct"),
+        other => selftest_fail(&format!("linux-fs process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 2k: Phase 7 integration against a real
     // third-party binary — BusyBox ash running a pipeline
     // (`echo … | /bin/cat.elf`), which needs fork + pipe2 + dup2 +
     // execve (of a real dynamically-linked glibc binary) + wait4 all

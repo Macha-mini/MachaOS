@@ -135,6 +135,13 @@ pub enum FdEntry {
     /// registrations `epoll_ctl` installed, scanned for readiness by
     /// `epoll_wait`. Phase 9a.
     Epoll(alloc::vec::Vec<(usize, u32, u64)>),
+    /// Pseudo-device (`/dev/null`, `/dev/zero`, `/dev/urandom`):
+    /// 0 = null (reads EOF, writes discarded), 1 = zero (reads zeros),
+    /// 2 = urandom (reads PRNG bytes). Phase 9b.
+    Dev(u8),
+    /// A `/proc` pseudo-file's content, snapshotted at open (`/proc/
+    /// self/stat`); reads consume it. Phase 9b.
+    Proc(alloc::vec::Vec<u8>),
 }
 
 impl Drop for FdEntry {
@@ -148,6 +155,7 @@ impl Drop for FdEntry {
             FdEntry::Socket(id) => socket::close(*id),
             FdEntry::Pipe(id, is_read) => crate::pipe::close_end(*id, *is_read),
             FdEntry::File(_) | FdEntry::Eventfd(_) | FdEntry::Timerfd(..) | FdEntry::Epoll(_) => {}
+            FdEntry::Dev(_) | FdEntry::Proc(_) => {}
         }
     }
 }
@@ -177,6 +185,8 @@ impl FdEntry {
             FdEntry::Eventfd(v) => Some(FdEntry::Eventfd(*v)),
             FdEntry::Timerfd(d, p) => Some(FdEntry::Timerfd(*d, *p)),
             FdEntry::Epoll(v) => Some(FdEntry::Epoll(v.clone())),
+            FdEntry::Dev(kind) => Some(FdEntry::Dev(*kind)),
+            FdEntry::Proc(content) => Some(FdEntry::Proc(content.clone())),
         }
     }
 }

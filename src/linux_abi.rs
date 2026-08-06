@@ -253,6 +253,10 @@ const SYS_CLOCK_GETTIME: u64 = 228;
 pub const SYS_EXIT_GROUP: u64 = 231;
 const SYS_OPENAT: u64 = 257;
 const SYS_NEWFSTATAT: u64 = 262;
+const SYS_STATX: u64 = 332;
+const SYS_MKDIR: u64 = 83;
+const SYS_UNLINK: u64 = 87;
+const SYS_RENAME: u64 = 82;
 const SYS_SET_ROBUST_LIST: u64 = 273;
 const SYS_PRLIMIT64: u64 = 302;
 const SYS_GETRANDOM: u64 = 318;
@@ -396,6 +400,8 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
             }
         }
         Some(FdEntry::Timerfd(..)) | Some(FdEntry::Epoll(_)) => Some(err(EINVAL)),
+        Some(FdEntry::Dev(_)) => Some(bytes.len() as u64), // /dev/* discard writes
+        Some(FdEntry::Proc(_)) => Some(err(EINVAL)),
         None => None,
     });
     let routed = routed.flatten();
@@ -482,6 +488,32 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
             }
         }
         Some(FdEntry::Epoll(_)) => Some(err(EINVAL)), // not readable
+        Some(FdEntry::Dev(kind)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            match *kind {
+                0 => Some(0), // /dev/null: EOF
+                1 => {
+                    out.fill(0);
+                    Some(out.len() as u64) // /dev/zero
+                }
+                _ => {
+                    // /dev/urandom: the same PRNG sys_getrandom uses.
+                    let mut seed = crate::interrupts::ticks() ^ phys as u64;
+                    for (i, b) in out.iter_mut().enumerate() {
+                        seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i as u64);
+                        *b = (seed >> 33) as u8;
+                    }
+                    Some(out.len() as u64)
+                }
+            }
+        }
+        Some(FdEntry::Proc(content)) => {
+            let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+            let n = out.len().min(content.len());
+            out[..n].copy_from_slice(&content[..n]);
+            content.drain(..n); // reads consume the snapshot
+            Some(n as u64)
+        }
         None => None,
     });
     let routed = routed.flatten();
@@ -511,6 +543,23 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
         return err(EFAULT);
     };
     let path = normalize_path(&path);
+    // Phase 9b pseudo-filesystem: `/dev` and `/proc` are intercepted
+    // here, before the FAT32-backed vfs ever sees them.
+    if let Some(kind) = pseudo_dev(&path) {
+        let fd = with_process(|p| p.alloc_fd(crate::process::FdEntry::Dev(kind)) as u64)
+            .unwrap_or(err(EBADF));
+        return fd;
+    }
+    if path == "/proc/self/stat" {
+        let content = alloc::format!(
+            "{} (machaos) S 0 0 0 0 -1 4194304 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+            crate::task::current_pid()
+        )
+        .into_bytes();
+        let fd = with_process(|p| p.alloc_fd(crate::process::FdEntry::Proc(content)) as u64)
+            .unwrap_or(err(EBADF));
+        return fd;
+    }
     let vfs_flags = translate_open_flags(flags);
     match vfs::FileHandle::open(&path, vfs_flags) {
         Ok(handle) => {
@@ -518,6 +567,16 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
             fd
         }
         Err(e) => vfs_err(e),
+    }
+}
+
+/// Maps a pseudo-device path to its `FdEntry::Dev` kind, if any.
+fn pseudo_dev(path: &str) -> Option<u8> {
+    match path {
+        "/dev/null" => Some(0),
+        "/dev/zero" => Some(1),
+        "/dev/urandom" | "/dev/random" => Some(2),
+        _ => None,
     }
 }
 
@@ -927,6 +986,21 @@ fn fd_revents(p: &crate::process::Process, fd: usize, events: u16) -> u16 {
                     .iter()
                     .any(|(f, want, _)| fd_revents(p, *f, (*want & 0xFFFF) as u16) != 0)
             {
+                rev |= POLLIN;
+            }
+        }
+        Some(FdEntry::Dev(_)) => {
+            // Pseudo-devices are always ready both ways (except
+            // /dev/null reads, which report EOF — still "ready").
+            if events & POLLIN != 0 {
+                rev |= POLLIN;
+            }
+            if events & POLLOUT != 0 {
+                rev |= POLLOUT;
+            }
+        }
+        Some(FdEntry::Proc(content)) => {
+            if events & POLLIN != 0 && !content.is_empty() {
                 rev |= POLLIN;
             }
         }
@@ -1374,6 +1448,7 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
         Some(
             FdEntry::Eventfd(_) | FdEntry::Timerfd(..) | FdEntry::Epoll(_),
         ) => err(ESPIPE),
+        Some(FdEntry::Dev(_) | FdEntry::Proc(_)) => err(ESPIPE),
         None => err(EBADF),
     })
     .unwrap_or(err(EBADF))
@@ -1467,6 +1542,10 @@ fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         Some(FdEntry::Eventfd(_)) => Some((S_IFREG | 0o600, 8, 0xE0)),
         Some(FdEntry::Timerfd(..)) => Some((S_IFREG | 0o600, 8, 0xE1)),
         Some(FdEntry::Epoll(_)) => Some((S_IFREG | 0o600, 0, 0xE2)),
+        Some(FdEntry::Dev(_)) => Some((S_IFCHR | 0o666, 0, 0xE3)),
+        Some(FdEntry::Proc(content)) => {
+            Some((S_IFREG | 0o444, content.len() as u64, 0xE4))
+        }
         None => None,
     });
     match result {
@@ -1499,6 +1578,121 @@ fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> u64 {
             write_stat(statbuf, mode, st.size, st.ino)
         }
         Err(e) => vfs_err(e),
+    }
+}
+
+/// Maps a FAT error to a Linux errno for the Phase 9b fs syscalls.
+fn fat_err(e: crate::fat::FatError) -> u64 {
+    match e {
+        crate::fat::FatError::NotFound => err(ENOENT),
+        crate::fat::FatError::NotDir => err(ENOTDIR),
+        crate::fat::FatError::AlreadyExists => err(EEXIST),
+        crate::fat::FatError::NotEmpty => err(EEXIST),
+        crate::fat::FatError::InvalidName => err(EINVAL),
+        _ => err(EIO),
+    }
+}
+
+/// `statx(dirfd, pathname, flags, mask, statxbuf)`: the modern stat —
+/// fills the 256-byte `struct statx` from the same source `fstat` uses.
+/// `AT_EMPTY_PATH` stats the fd itself; the mask is accepted and
+/// ignored (everything is reported).
+fn sys_statx(dirfd: u64, pathname: u64, flags: u64, _mask: u64, statxbuf: u64) -> u64 {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let (mode, size, ino) = if flags & AT_EMPTY_PATH != 0 {
+        let result = with_process(|p| match p.fd_mut(dirfd as usize) {
+            Some(FdEntry::File(h)) => {
+                let st = h.stat();
+                let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
+                Some((mode, st.size, st.ino))
+            }
+            Some(FdEntry::Pipe(id, _)) => {
+                Some((S_IFIFO | 0o600, crate::pipe::buffered(*id) as u64, *id as u64 + 1))
+            }
+            Some(FdEntry::Socket(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
+            Some(FdEntry::Dev(_)) => Some((S_IFCHR | 0o666, 0, 0xE3)),
+            Some(_) => Some((S_IFREG | 0o600, 0, 0xE5)),
+            None => None,
+        });
+        match result {
+            Some(Some(t)) => t,
+            _ => return err(EBADF),
+        }
+    } else {
+        let Some(path) = read_cstr(pathname, 256) else {
+            return err(EFAULT);
+        };
+        let path = normalize_path(&path);
+        match vfs::FileHandle::open(&path, 0) {
+            Ok(h) => {
+                let st = h.stat();
+                let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
+                (mode, st.size, st.ino)
+            }
+            Err(e) => return vfs_err(e),
+        }
+    };
+    let Some(phys) = resolve(statxbuf, 256) else {
+        return err(EFAULT);
+    };
+    unsafe {
+        let p = phys as *mut u8;
+        core::ptr::write_bytes(p, 0, 256);
+        core::ptr::write_unaligned(p as *mut u32, 0x7FF); // stx_mask: everything
+        core::ptr::write_unaligned(p.add(4) as *mut u32, 4096); // stx_blksize
+        core::ptr::write_unaligned(p.add(0x10) as *mut u32, 1); // stx_nlink
+        core::ptr::write_unaligned(p.add(0x1c) as *mut u16, mode as u16); // stx_mode
+        core::ptr::write_unaligned(p.add(0x20) as *mut u64, ino); // stx_ino
+        core::ptr::write_unaligned(p.add(0x28) as *mut u64, size); // stx_size
+        core::ptr::write_unaligned(p.add(0x30) as *mut u64, size.div_ceil(512)); // stx_blocks
+        core::ptr::write_unaligned(p.add(0x38) as *mut u64, 0x7FF); // stx_attributes_mask
+        // timestamps (16-byte statx_timestamp each) left zero
+        core::ptr::write_unaligned(p.add(0x88) as *mut u32, 0x33); // stx_dev_major (synthetic)
+        core::ptr::write_unaligned(p.add(0x8c) as *mut u32, 0);
+    }
+    0
+}
+
+/// `mkdir(pathname, mode)`: create a directory (the mode is accepted
+/// and ignored — the FAT layer's own permissions apply).
+fn sys_mkdir(pathname: u64, _mode: u64) -> u64 {
+    let Some(path) = read_cstr(pathname, 256) else {
+        return err(EFAULT);
+    };
+    let path = normalize_path(&path);
+    match crate::fat::make_dir(&path) {
+        Ok(()) => 0,
+        Err(e) => fat_err(e),
+    }
+}
+
+/// `unlink(pathname)`: remove a file (an empty directory too — this
+/// FAT layer doesn't distinguish).
+fn sys_unlink(pathname: u64) -> u64 {
+    let Some(path) = read_cstr(pathname, 256) else {
+        return err(EFAULT);
+    };
+    let path = normalize_path(&path);
+    match crate::fat::remove(&path) {
+        Ok(()) => 0,
+        Err(e) => fat_err(e),
+    }
+}
+
+/// `rename(oldpath, newpath)`: move a file or empty directory (copy +
+/// delete in the FAT layer; an existing target file is overwritten).
+fn sys_rename(oldpath: u64, newpath: u64) -> u64 {
+    let Some(old) = read_cstr(oldpath, 256) else {
+        return err(EFAULT);
+    };
+    let Some(new) = read_cstr(newpath, 256) else {
+        return err(EFAULT);
+    };
+    let old = normalize_path(&old);
+    let new = normalize_path(&new);
+    match crate::fat::move_file(&old, &new) {
+        Ok(()) => 0,
+        Err(e) => fat_err(e),
     }
 }
 
@@ -2091,6 +2285,10 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_CLOCK_GETTIME => sys_clock_gettime(arg1, arg2),
         SYS_OPENAT => sys_openat(arg1, arg2, arg3, arg4),
         SYS_OPEN => sys_openat(AT_FDCWD, arg1, arg2, arg3),
+        SYS_STATX => sys_statx(arg1, arg2, arg3, arg4, arg5),
+        SYS_MKDIR => sys_mkdir(arg1, arg2),
+        SYS_UNLINK => sys_unlink(arg1),
+        SYS_RENAME => sys_rename(arg1, arg2),
         SYS_NEWFSTATAT => sys_newfstatat(arg1, arg2, arg3, arg4),
         SYS_STAT => sys_newfstatat(AT_FDCWD, arg1, arg2, 0),
         SYS_LSTAT => sys_newfstatat(AT_FDCWD, arg1, arg2, 0),
