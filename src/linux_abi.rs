@@ -263,8 +263,30 @@ const SYS_GETRANDOM: u64 = 318;
 const SYS_RSEQ: u64 = 334;
 const SYS_SOCKET: u64 = 41;
 const SYS_CONNECT: u64 = 42;
+const SYS_SENDTO: u64 = 44;
+const SYS_RECVFROM: u64 = 45;
 const SYS_SENDMSG: u64 = 46;
 const SYS_RECVMSG: u64 = 47;
+const SYS_SHUTDOWN: u64 = 48;
+const SYS_BIND: u64 = 49;
+const SYS_GETSOCKNAME: u64 = 51;
+const SYS_GETPEERNAME: u64 = 52;
+const SYS_SETSOCKOPT: u64 = 54;
+const SYS_GETSOCKOPT: u64 = 55;
+const SYS_GETTIMEOFDAY: u64 = 96;
+const SYS_TIME: u64 = 201;
+const SYS_GETUID: u64 = 102;
+const SYS_GETEUID: u64 = 107;
+const SYS_GETGID: u64 = 104;
+const SYS_GETEGID: u64 = 108;
+const SYS_SETUID: u64 = 105;
+const SYS_SETGID: u64 = 106;
+/// Interval timers — busybox wget arms ITIMER_REAL as its I/O timeout.
+/// Accepted and ignored (the SIGALRM it would deliver never fires; the
+/// kernel's own socket recv deadlines bound waits instead).
+const SYS_SETITIMER: u64 = 38;
+const SYS_GETITIMER: u64 = 36;
+const SYS_ALARM: u64 = 37;
 const SYS_FTRUNCATE: u64 = 77;
 const SYS_MEMFD_CREATE: u64 = 319;
 // Phase 7: clone/fork/vfork are intercepted by the asm special path (see
@@ -386,6 +408,12 @@ fn sys_write(fd: u64, buf: u64, count: u64) -> u64 {
         Some(FdEntry::Socket(id)) => {
             Some(socket::send(*id, bytes, &[]).map(|n| n as u64).unwrap_or(err(EPIPE)))
         }
+        Some(FdEntry::Net(id)) => {
+            Some(match crate::inet::send(*id, bytes) {
+                Ok(n) => n as u64,
+                Err(e) => err(e),
+            })
+        }
         Some(FdEntry::Pipe(id, _)) => {
             let n = crate::pipe::write(*id, bytes);
             Some(if n == 0 { err(EPIPE) } else { n as u64 })
@@ -421,6 +449,19 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
     let Some(phys) = resolve(buf, count) else {
         return err(EFAULT);
     };
+    // AF_INET sockets (Phase 10) need a blocking recv loop that yields
+    // the CPU between NIC polls — that can't run inside `with_process`
+    // (it would hold the process borrow across a context switch), so
+    // they're handled here, before the generic routing below.
+    let net_id = with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::Net(id)) => Some(*id),
+        _ => None,
+    })
+    .flatten();
+    if let Some(id) = net_id {
+        let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, count as usize) };
+        return net_recv_blocking(id, out, false);
+    }
     // An fd-table entry wins over the stdio fallback (same rule as
     // `sys_write`): `cat < file` / `echo x | cat` install a file or
     // pipe onto fd 0, and fd 0 only means "the keyboard" when nothing
@@ -452,6 +493,8 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
             }
             Some(n as u64)
         }
+        // Net fds are handled before the routing closure (see above).
+        Some(FdEntry::Net(_)) => None,
         Some(FdEntry::Eventfd(v)) => {
             if count < 8 {
                 Some(err(EINVAL))
@@ -538,6 +581,38 @@ fn sys_read(fd: u64, buf: u64, count: u64) -> u64 {
     err(EBADF) // fd 1/2 (stdout/stderr) aren't readable
 }
 
+/// Safety bound for a blocking socket recv (ticks at 100 Hz = 30 s) —
+/// real Linux blocks forever; this only exists so a wedged connection
+/// fails the selftest loudly instead of hanging it.
+const NET_RECV_TIMEOUT_TICKS: u64 = 3000;
+/// Same idea for the TCP handshake in `sys_connect` (30 s at 100 Hz).
+const NET_CONNECT_TIMEOUT_TICKS: u64 = 3000;
+
+/// Blocking recv loop for an AF_INET socket (`read`/`recv`/`recvfrom`):
+/// pump the NIC, try to pop, `yield_rr` when empty, until data / EOF /
+/// error or the safety deadline. `want_meta` reports the sender's
+/// address (recvfrom) instead of just the byte count.
+fn net_recv_blocking(id: usize, out: &mut [u8], want_meta: bool) -> u64 {
+    let deadline = crate::interrupts::ticks() + NET_RECV_TIMEOUT_TICKS;
+    loop {
+        crate::inet::pump();
+        let result = if want_meta {
+            crate::inet::recv_from(id, out).map(|(n, _)| n)
+        } else {
+            crate::inet::recv(id, out)
+        };
+        match result {
+            Ok(n) => return n as u64, // n > 0: data; n == 0: EOF (FIN)
+            Err(e) if e == EAGAIN => {}
+            Err(e) => return err(e),
+        }
+        if crate::interrupts::ticks() >= deadline {
+            return err(EIO);
+        }
+        crate::task::yield_rr();
+    }
+}
+
 fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
     let Some(path) = read_cstr(pathname, 256) else {
         return err(EFAULT);
@@ -560,6 +635,15 @@ fn sys_openat(_dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
             .unwrap_or(err(EBADF));
         return fd;
     }
+    // Phase 10: `/etc` pseudo-files the network stack's resolvers read —
+    // musl's getaddrinfo parses /etc/hosts first (name → address), then
+    // falls back to DNS via /etc/resolv.conf's nameservers; busybox's
+    // nslookup applet parses resolv.conf itself.
+    if let Some(content) = pseudo_etc(&path) {
+        let fd = with_process(|p| p.alloc_fd(crate::process::FdEntry::Proc(content)) as u64)
+            .unwrap_or(err(EBADF));
+        return fd;
+    }
     let vfs_flags = translate_open_flags(flags);
     match vfs::FileHandle::open(&path, vfs_flags) {
         Ok(handle) => {
@@ -578,6 +662,30 @@ fn pseudo_dev(path: &str) -> Option<u8> {
         "/dev/urandom" | "/dev/random" => Some(2),
         _ => None,
     }
+}
+
+/// The `/etc` pseudo-file contents, if any. The nameserver is QEMU
+/// user-net's DNS forwarder; `machaos.test` maps to the slirp gateway
+/// (the host), which is what the network selftest's wget-with-hostname
+/// step resolves.
+fn pseudo_etc(path: &str) -> Option<alloc::vec::Vec<u8>> {
+    match path {
+        "/etc/resolv.conf" => Some(b"nameserver 10.0.2.3\n".to_vec()),
+        "/etc/hosts" => Some(b"127.0.0.1 localhost\n10.0.2.2 machaos.test\n".to_vec()),
+        _ => None,
+    }
+}
+
+/// Synthetic `(mode, size)` for the pseudo paths, so `stat`/`statx` by
+/// path see them the way an open would. Returns None for real paths.
+fn pseudo_stat(path: &str) -> Option<(u32, u64)> {
+    if pseudo_dev(path).is_some() {
+        return Some((S_IFCHR | 0o666, 0));
+    }
+    if path == "/proc/self/stat" {
+        return Some((S_IFREG | 0o444, 0));
+    }
+    pseudo_etc(path).map(|c| (S_IFREG | 0o444, c.len() as u64))
 }
 
 /// Copies up to `out.len()` bytes from `id`'s backing starting at
@@ -967,6 +1075,15 @@ fn fd_revents(p: &crate::process::Process, fd: usize, events: u16) -> u16 {
                 rev |= POLLOUT;
             }
         }
+        Some(FdEntry::Net(id)) => {
+            let (r, w) = crate::inet::readiness(*id);
+            if events & POLLIN != 0 && r {
+                rev |= POLLIN;
+            }
+            if events & POLLOUT != 0 && w {
+                rev |= POLLOUT;
+            }
+        }
         Some(FdEntry::Eventfd(v)) => {
             if events & POLLIN != 0 && *v > 0 {
                 rev |= POLLIN;
@@ -1025,6 +1142,10 @@ fn sys_poll(fds: u64, nfds: u64, timeout: u64) -> u64 {
     let n = nfds as usize;
     let deadline = poll_deadline(timeout);
     loop {
+        // Phase 10: the NIC is polled, not interrupt-driven — a poll on
+        // an AF_INET socket must drain the RX ring itself or it would
+        // never see data arrive.
+        crate::inet::pump();
         let ready = with_process(|p| {
             let mut count = 0usize;
             for i in 0..n {
@@ -1217,6 +1338,8 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> u64 {
 fn sys_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
     let deadline = poll_deadline(timeout);
     loop {
+        // Phase 10: same NIC-pump rationale as `sys_poll`.
+        crate::inet::pump();
         let ready = with_process(|p| {
             let regs = match p.fd(epfd as usize) {
                 Some(crate::process::FdEntry::Epoll(v)) => v.clone(),
@@ -1376,16 +1499,38 @@ fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
         F_GETFL => with_process(|p| {
             // Only the access mode is reported; O_APPEND/O_NONBLOCK are
             // not tracked per-fd yet, so 2 (O_RDWR) is the safe answer
-            // for anything callers are likely to probe.
-            if p.fd(fd as usize).is_some() {
-                Some(2u64)
-            } else {
-                None
+            // for anything callers are likely to probe. AF_INET sockets
+            // report O_RDWR | O_NONBLOCK when set (see F_SETFL).
+            match p.fd(fd as usize) {
+                Some(FdEntry::Net(id)) => {
+                    let mut flags = 2u64; // O_RDWR
+                    if crate::inet::is_nonblock(*id) {
+                        flags |= 0o4000; // O_NONBLOCK
+                    }
+                    Some(flags)
+                }
+                Some(_) => Some(2u64),
+                None => None,
             }
         })
         .flatten()
         .unwrap_or(err(EBADF)),
-        F_SETFL => 0, // O_NONBLOCK etc.: accepted, not implemented
+        F_SETFL => {
+            // Only O_NONBLOCK is tracked, and only for AF_INET sockets.
+            if let Some(id) = with_process(|p| match p.fd_mut(fd as usize) {
+                Some(FdEntry::Net(id)) => Some(*id),
+                _ => None,
+            })
+            .flatten()
+            {
+                match crate::inet::set_nonblock(id, arg & 0o4000 != 0) {
+                    Ok(()) => 0,
+                    Err(e) => err(e),
+                }
+            } else {
+                0 // O_APPEND etc.: accepted, not implemented
+            }
+        }
         _ => err(EINVAL),
     }
 }
@@ -1444,6 +1589,7 @@ fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
             *cursor as u64
         }
         Some(FdEntry::Socket(_)) => err(ESPIPE),
+        Some(FdEntry::Net(_)) => err(ESPIPE), // sockets aren't seekable
         Some(FdEntry::Pipe(_, _)) => err(ESPIPE), // pipes aren't seekable
         Some(
             FdEntry::Eventfd(_) | FdEntry::Timerfd(..) | FdEntry::Epoll(_),
@@ -1538,6 +1684,7 @@ fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
         }
         Some(FdEntry::Shm(id, _)) => Some((S_IFREG | 0o600, shm::size_of(*id).unwrap_or(0) as u64, *id as u64 + 1)),
         Some(FdEntry::Socket(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
+        Some(FdEntry::Net(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
         Some(FdEntry::Pipe(id, _)) => Some((S_IFIFO | 0o600, crate::pipe::buffered(*id) as u64, *id as u64 + 1)),
         Some(FdEntry::Eventfd(_)) => Some((S_IFREG | 0o600, 8, 0xE0)),
         Some(FdEntry::Timerfd(..)) => Some((S_IFREG | 0o600, 8, 0xE1)),
@@ -1571,6 +1718,11 @@ fn sys_newfstatat(dirfd: u64, pathname: u64, statbuf: u64, flags: u64) -> u64 {
         return err(EFAULT);
     };
     let path = normalize_path(&path);
+    // Phase 9b/10 pseudo paths (/dev, /proc, /etc) — the FAT vfs can't
+    // see them, but callers stat them by path before opening.
+    if let Some((mode, size)) = pseudo_stat(&path) {
+        return write_stat(statbuf, mode, size, 0xE6);
+    }
     match vfs::FileHandle::open(&path, 0) {
         Ok(h) => {
             let st = h.stat();
@@ -1610,6 +1762,7 @@ fn sys_statx(dirfd: u64, pathname: u64, flags: u64, _mask: u64, statxbuf: u64) -
                 Some((S_IFIFO | 0o600, crate::pipe::buffered(*id) as u64, *id as u64 + 1))
             }
             Some(FdEntry::Socket(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
+        Some(FdEntry::Net(id)) => Some((S_IFSOCK | 0o777, 0, *id as u64 + 1)),
             Some(FdEntry::Dev(_)) => Some((S_IFCHR | 0o666, 0, 0xE3)),
             Some(_) => Some((S_IFREG | 0o600, 0, 0xE5)),
             None => None,
@@ -1623,13 +1776,17 @@ fn sys_statx(dirfd: u64, pathname: u64, flags: u64, _mask: u64, statxbuf: u64) -
             return err(EFAULT);
         };
         let path = normalize_path(&path);
-        match vfs::FileHandle::open(&path, 0) {
-            Ok(h) => {
-                let st = h.stat();
-                let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
-                (mode, st.size, st.ino)
+        if let Some((mode, size)) = pseudo_stat(&path) {
+            (mode, size, 0xE6)
+        } else {
+            match vfs::FileHandle::open(&path, 0) {
+                Ok(h) => {
+                    let st = h.stat();
+                    let mode = if st.is_dir { S_IFDIR | 0o755 } else { S_IFREG | 0o644 };
+                    (mode, st.size, st.ino)
+                }
+                Err(e) => return vfs_err(e),
             }
-            Err(e) => return vfs_err(e),
         }
     };
     let Some(phys) = resolve(statxbuf, 256) else {
@@ -1871,6 +2028,13 @@ const SCM_RIGHTS: u32 = 1;
 const EPIPE: i32 = 32;
 const EAFNOSUPPORT: i32 = 97;
 const ECONNREFUSED: i32 = 111;
+const EPROTONOSUPPORT: i32 = 93;
+const ECONNRESET: i32 = 104;
+const EISCONN: i32 = 106;
+const ENOTCONN: i32 = 107;
+const ETIMEDOUT: i32 = 110;
+const EADDRINUSE: i32 = 98;
+const EINPROGRESS: i32 = 115;
 
 unsafe fn read_u64(addr: u64) -> u64 {
     unsafe { core::ptr::read_unaligned(addr as *const u64) }
@@ -1889,11 +2053,28 @@ unsafe fn write_u32(addr: u64, v: u32) {
 }
 
 fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> u64 {
-    if domain != AF_UNIX || (ty & 0xf) != SOCK_STREAM {
+    if domain == AF_UNIX {
+        if (ty & 0xf) != SOCK_STREAM {
+            return err(EAFNOSUPPORT);
+        }
+        let id = socket::create();
+        return with_process(|p| p.alloc_fd(FdEntry::Socket(id)) as u64).unwrap_or(err(EBADF));
+    }
+    if domain != crate::inet::AF_INET {
         return err(EAFNOSUPPORT);
     }
-    let id = socket::create();
-    with_process(|p| p.alloc_fd(FdEntry::Socket(id)) as u64).unwrap_or(err(EBADF))
+    // SOCK_CLOEXEC/SOCK_NONBLOCK are flags OR'd into the type.
+    let nonblock = ty & crate::inet::SOCK_NONBLOCK != 0;
+    let kind = match ty & 0xf {
+        crate::inet::SOCK_STREAM => crate::inet::Kind::Tcp,
+        crate::inet::SOCK_DGRAM => crate::inet::Kind::Udp,
+        _ => return err(EPROTONOSUPPORT),
+    };
+    let id = crate::inet::create(kind);
+    if nonblock {
+        let _ = crate::inet::set_nonblock(id, true);
+    }
+    with_process(|p| p.alloc_fd(FdEntry::Net(id)) as u64).unwrap_or(err(EBADF))
 }
 
 /// Reads a `struct sockaddr_un` (`sa_family: u16` then a NUL-terminated
@@ -1915,23 +2096,309 @@ fn read_sockaddr_un(addr: u64, addrlen: u64) -> Option<String> {
     core::str::from_utf8(&path_bytes[..nul]).ok().map(|s| s.to_string())
 }
 
-fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
-    let Some(path) = read_sockaddr_un(addr, addrlen) else {
-        return err(EINVAL);
+/// Reads a `struct sockaddr_in` (family u16, port u16 BE, addr u32 BE)
+/// and returns (ip, port). Accepts only AF_INET.
+fn read_sockaddr_in(addr: u64, addrlen: u64) -> Option<([u8; 4], u16)> {
+    let len = addrlen.min(16) as usize;
+    if len < 8 {
+        return None;
+    }
+    let phys = resolve(addr, len as u64)?;
+    let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, len) };
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]);
+    if family as u64 != crate::inet::AF_INET {
+        return None;
+    }
+    let port = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let ip = [bytes[4], bytes[5], bytes[6], bytes[7]];
+    Some((ip, port))
+}
+
+/// Writes a `struct sockaddr_in` for `(ip, port)` into user memory and
+/// stores 16 into `addrlen_out`. Returns false on EFAULT.
+fn write_sockaddr_in(addr: u64, addrlen_out: u64, ip: [u8; 4], port: u16) -> bool {
+    let Some(phys) = resolve(addr, 16) else {
+        return false;
     };
-    let socket_id = with_process(|p| match p.fd_mut(fd as usize) {
-        Some(FdEntry::Socket(id)) => Some(*id),
+    let bytes = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, 16) };
+    bytes.fill(0);
+    bytes[0..2].copy_from_slice(&(crate::inet::AF_INET as u16).to_ne_bytes());
+    bytes[2..4].copy_from_slice(&port.to_be_bytes());
+    bytes[4..8].copy_from_slice(&ip);
+    if addrlen_out != 0 {
+        if let Some(len_phys) = resolve(addrlen_out, 4) {
+            unsafe { core::ptr::write_unaligned(len_phys as *mut u32, 16) };
+        }
+    }
+    true
+}
+
+/// The `inet.rs` endpoint id behind `fd`, if it is an AF_INET socket.
+fn net_id_of(fd: u64) -> Option<usize> {
+    with_process(|p| match p.fd_mut(fd as usize) {
+        Some(FdEntry::Net(id)) => Some(*id),
         _ => None,
     })
-    .flatten();
-    let Some(socket_id) = socket_id else {
+    .flatten()
+}
+
+fn sys_connect(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    // AF_UNIX: the existing path-keyed socket layer.
+    if let Some(path) = read_sockaddr_un(addr, addrlen) {
+        let socket_id = with_process(|p| match p.fd_mut(fd as usize) {
+            Some(FdEntry::Socket(id)) => Some(*id),
+            _ => None,
+        })
+        .flatten();
+        let Some(socket_id) = socket_id else {
+            return err(EBADF);
+        };
+        return if socket::connect(socket_id, &path) {
+            0
+        } else {
+            err(ECONNREFUSED)
+        };
+    }
+    // AF_INET (Phase 10): TCP does a blocking handshake (yield-looping
+    // on the NIC, like wait4); UDP just records the peer.
+    let Some((ip, port)) = read_sockaddr_in(addr, addrlen) else {
+        return err(EINVAL);
+    };
+    let Some(id) = net_id_of(fd) else {
         return err(EBADF);
     };
-    if socket::connect(socket_id, &path) {
+    match crate::inet::start_connect(id, ip, port) {
+        Err(e) => return err(e),
+        Ok(()) => {}
+    }
+    // UDP connect is synchronous (just records the peer); TCP waits
+    // for the handshake.
+    if crate::inet::kind_of(id) == crate::inet::Kind::Udp {
+        return 0;
+    }
+    let deadline = crate::interrupts::ticks() + NET_CONNECT_TIMEOUT_TICKS;
+    loop {
+        crate::inet::pump();
+        match crate::inet::connect_done(id) {
+            Ok(true) => return 0,
+            Ok(false) => {}
+            Err(e) => return err(e),
+        }
+        if crate::interrupts::ticks() >= deadline {
+            return err(ETIMEDOUT);
+        }
+        crate::task::yield_rr();
+    }
+}
+
+/// `bind(fd, addr, addrlen)`: AF_INET only; assigns the local source
+/// port (0 = kernel-chosen ephemeral).
+fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    let Some((_ip, port)) = read_sockaddr_in(addr, addrlen) else {
+        return err(EINVAL);
+    };
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    match crate::inet::bind(id, port) {
+        Ok(()) => 0,
+        Err(e) => err(e),
+    }
+}
+
+/// `getsockname(fd, addr, addrlen)`: reports our local (ip, port).
+fn sys_getsockname(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    let port = crate::inet::local_port_of(id);
+    if write_sockaddr_in(addr, addrlen, crate::net::OUR_IP, port) {
         0
     } else {
-        err(ECONNREFUSED)
+        err(EFAULT)
     }
+}
+
+/// `getpeername(fd, addr, addrlen)`: reports the connected peer.
+fn sys_getpeername(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    match crate::inet::peer_of(id) {
+        Some((ip, port)) => {
+            if write_sockaddr_in(addr, addrlen, ip, port) {
+                0
+            } else {
+                err(EFAULT)
+            }
+        }
+        None => err(ENOTCONN),
+    }
+}
+
+/// `shutdown(fd, how)`: SHUT_WR/SHUT_RDWR send the TCP FIN; SHUT_RD is
+/// accepted as a no-op.
+fn sys_shutdown(fd: u64, how: u64) -> u64 {
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    match crate::inet::shutdown(id, how) {
+        Ok(()) => 0,
+        Err(e) => err(e),
+    }
+}
+
+/// `setsockopt(fd, level, optname, optval, optlen)`: every option is
+/// accepted and ignored — MachaOS has no buffers to tune. Validates the
+/// fd and that `optval`/`optlen` point at readable memory, and returns
+/// the real errno for a bad fd.
+fn sys_setsockopt(fd: u64, _level: u64, _optname: u64, optval: u64, optlen: u64) -> u64 {
+    if net_id_of(fd).is_none() {
+        return err(EBADF);
+    }
+    if optlen > 0 && resolve(optval, optlen).is_none() {
+        return err(EFAULT);
+    }
+    0
+}
+
+/// `getsockopt(fd, level, optname, optval, optlen)`: SO_TYPE reports
+/// the socket kind (1 = SOCK_STREAM, 2 = SOCK_DGRAM); SO_ERROR reports
+/// 0; anything else returns a zeroed option (optlen stays untouched).
+fn sys_getsockopt(fd: u64, _level: u64, optname: u64, optval: u64, optlen: u64) -> u64 {
+    const SO_TYPE: u64 = 3;
+    const SO_ERROR: u64 = 4;
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    let Some(len_phys) = resolve(optlen, 4) else {
+        return err(EFAULT);
+    };
+    let len = unsafe { core::ptr::read_unaligned(len_phys as *const u32) } as usize;
+    if len < 4 {
+        return err(EINVAL);
+    }
+    let Some(val_phys) = resolve(optval, 4) else {
+        return err(EFAULT);
+    };
+    let val = match optname {
+        SO_TYPE => match crate::inet::kind_of(id) {
+            crate::inet::Kind::Tcp => 1, // SOCK_STREAM
+            crate::inet::Kind::Udp => 2, // SOCK_DGRAM
+        },
+        SO_ERROR => 0,
+        _ => 0,
+    };
+    unsafe { core::ptr::write_unaligned(val_phys as *mut i32, val) };
+    0
+}
+
+/// `sendto(fd, buf, len, flags, dest_addr, addrlen)` — also serves
+/// libc's `send()` (musl implements `send` as `sendto` with a null
+/// address). TCP sends one segment; UDP sends one datagram (to the
+/// address argument, or to the `connect`ed peer if null).
+fn sys_sendto(fd: u64, buf: u64, len: u64, _flags: u64, dest_addr: u64, addrlen: u64) -> u64 {
+    let Some(phys) = resolve(buf, len) else {
+        return err(EFAULT);
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    let result = if dest_addr != 0 {
+        let Some((ip, port)) = read_sockaddr_in(dest_addr, addrlen) else {
+            return err(EINVAL);
+        };
+        crate::inet::sendto(id, ip, port, bytes)
+    } else {
+        crate::inet::send(id, bytes)
+    };
+    match result {
+        Ok(n) => n as u64,
+        Err(e) => err(e),
+    }
+}
+
+/// `recvfrom(fd, buf, len, flags, src_addr, addrlen)` — also serves
+/// libc's `recv()` (musl passes a null address). Blocks (yield-loop)
+/// until data / EOF / error; `MSG_DONTWAIT` makes it a single try.
+fn sys_recvfrom(
+    fd: u64,
+    buf: u64,
+    len: u64,
+    flags: u64,
+    src_addr: u64,
+    addrlen: u64,
+) -> u64 {
+    const MSG_DONTWAIT: u64 = 0x40;
+    let Some(phys) = resolve(buf, len) else {
+        return err(EFAULT);
+    };
+    let out = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, len as usize) };
+    let Some(id) = net_id_of(fd) else {
+        return err(EBADF);
+    };
+    if flags & MSG_DONTWAIT != 0 || crate::inet::is_nonblock(id) {
+        crate::inet::pump();
+        return match crate::inet::recv_from(id, out) {
+            Ok((n, meta)) => {
+                report_src_addr(src_addr, addrlen, meta);
+                n as u64
+            }
+            Err(e) => err(e),
+        };
+    }
+    // Blocking: reuse the read loop, but also report the sender.
+    let deadline = crate::interrupts::ticks() + NET_RECV_TIMEOUT_TICKS;
+    loop {
+        crate::inet::pump();
+        match crate::inet::recv_from(id, out) {
+            Ok((n, meta)) => {
+                report_src_addr(src_addr, addrlen, meta);
+                return n as u64;
+            }
+            Err(e) if e == EAGAIN => {}
+            Err(e) => return err(e),
+        }
+        if crate::interrupts::ticks() >= deadline {
+            return err(EIO);
+        }
+        crate::task::yield_rr();
+    }
+}
+
+/// Writes the sender address (recvfrom's `src_addr`/`addrlen` args).
+fn report_src_addr(src_addr: u64, addrlen: u64, meta: crate::inet::RecvMeta) {
+    if src_addr != 0 {
+        write_sockaddr_in(src_addr, addrlen, meta.src_ip, meta.src_port);
+    }
+}
+
+/// `gettimeofday(tv, tz)`: wall clock from the 100 Hz tick counter
+/// (boot-relative, like `clock_gettime`'s REALTIME).
+fn sys_gettimeofday(tv: u64, _tz: u64) -> u64 {
+    let Some(phys) = resolve(tv, 16) else {
+        return err(EFAULT);
+    };
+    let sec = (crate::interrupts::ticks() / 100) as i64;
+    let usec = ((crate::interrupts::ticks() % 100) * 10_000) as i64;
+    unsafe {
+        core::ptr::write_unaligned(phys as *mut i64, sec);
+        core::ptr::write_unaligned((phys as *mut u8).add(8) as *mut i64, usec);
+    }
+    0
+}
+
+/// `time(tloc)`: seconds since boot as a 32-bit-ish `time_t`; busybox
+/// uses it for HTTP Date headers.
+fn sys_time(tloc: u64) -> u64 {
+    let sec = crate::interrupts::ticks() / 100;
+    if tloc != 0 {
+        if let Some(phys) = resolve(tloc, 8) {
+            unsafe { core::ptr::write_unaligned(phys as *mut i64, sec as i64) };
+        }
+    }
+    sec
 }
 
 /// `sendmsg(fd, msg, flags)`: a real `struct msghdr`/`iovec`/`cmsghdr`
@@ -2305,6 +2772,33 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_CONNECT => sys_connect(arg1, arg2, arg3),
         SYS_SENDMSG => sys_sendmsg(arg1, arg2, arg3),
         SYS_RECVMSG => sys_recvmsg(arg1, arg2, arg3),
+        // Phase 10: AF_INET sockets.
+        SYS_SENDTO => sys_sendto(arg1, arg2, arg3, arg4, arg5, arg6),
+        SYS_RECVFROM => sys_recvfrom(arg1, arg2, arg3, arg4, arg5, arg6),
+        SYS_BIND => sys_bind(arg1, arg2, arg3),
+        SYS_SHUTDOWN => sys_shutdown(arg1, arg2),
+        SYS_GETSOCKNAME => sys_getsockname(arg1, arg2, arg3),
+        SYS_GETPEERNAME => sys_getpeername(arg1, arg2, arg3),
+        SYS_SETSOCKOPT => sys_setsockopt(arg1, arg2, arg3, arg4, arg5),
+        SYS_GETSOCKOPT => sys_getsockopt(arg1, arg2, arg3, arg4, arg5),
+        SYS_GETTIMEOFDAY => sys_gettimeofday(arg1, arg2),
+        SYS_TIME => sys_time(arg1),
+        SYS_ALARM => 0, // no pending alarm
+        SYS_SETITIMER => 0,
+        SYS_GETITIMER => {
+            // Write a zeroed itimerval (it_value + it_interval, 4 longs).
+            if arg2 != 0 {
+                if let Some(phys) = resolve(arg2, 32) {
+                    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 32) };
+                }
+            }
+            0
+        }
+        // No real uid/gid model — a fixed nonzero uid keeps getuid-driven
+        // paths (XDG dirs etc.) from tripping over uid 0 semantics, and
+        // setuid/setgid succeed (no privilege model to enforce).
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 1000,
+        SYS_SETUID | SYS_SETGID => 0,
         // Phase 7: process control — fork/clone/vfork are intercepted by
         // the asm special path before dispatch; the rest live here.
         SYS_EXECVE => sys_execve(arg1, arg2, arg3),

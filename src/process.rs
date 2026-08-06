@@ -120,8 +120,10 @@ pub enum FdEntry {
     /// writable like a regular file even though real clients only ever
     /// `mmap` it; kept for completeness since it costs little.
     Shm(usize, usize),
-    /// `socket.rs` endpoint id.
+    /// `(socket.rs` endpoint id.)
     Socket(usize),
+    /// `inet.rs` endpoint id — an `AF_INET` TCP/UDP socket (Phase 10).
+    Net(usize),
     /// `pipe.rs` pipe id; `true` for the read end (fd[0]).
     Pipe(usize, bool),
     /// `eventfd` counter (`eventfd2`): `read` returns the count and
@@ -153,6 +155,7 @@ impl Drop for FdEntry {
         match self {
             FdEntry::Shm(id, _) => shm::close(*id),
             FdEntry::Socket(id) => socket::close(*id),
+            FdEntry::Net(id) => crate::inet::close(*id),
             FdEntry::Pipe(id, is_read) => crate::pipe::close_end(*id, *is_read),
             FdEntry::File(_) | FdEntry::Eventfd(_) | FdEntry::Timerfd(..) | FdEntry::Epoll(_) => {}
             FdEntry::Dev(_) | FdEntry::Proc(_) => {}
@@ -178,7 +181,7 @@ impl FdEntry {
                 crate::pipe::dup_end(*id, *is_read);
                 Some(FdEntry::Pipe(*id, *is_read))
             }
-            FdEntry::Socket(_) => None,
+            FdEntry::Socket(_) | FdEntry::Net(_) => None,
             // Value semantics for the Phase 9a fds: a fork/dup gets an
             // independent copy (real Linux shares the open description —
             // fine for the event-loop workloads these serve).
@@ -532,6 +535,17 @@ impl Process {
             let Some(phys) = pmm::alloc_contiguous(pages) else {
                 return self.heap_end;
             };
+            // TEMP-DIAG: log heap growth to pin down the Phase 10 PF.
+            crate::io::exception_print(crate::io::sprint(
+                &mut [0u8; 96],
+                format_args!(
+                    "[BRK] map_at={:#x} phys={:#x} len={:#x} pid={}\n",
+                    self.heap_start + old_mapped,
+                    phys,
+                    grow_len,
+                    crate::task::current_pid()
+                ),
+            ));
             for i in 0..pages {
                 self.frames.push(phys + i * pmm::FRAME_SIZE);
             }
@@ -604,6 +618,17 @@ impl Process {
         };
         let pages = (len / paging::PAGE_SIZE) as usize;
         let phys = pmm::alloc_contiguous(pages)?;
+        // TEMP-DIAG: log anon/file mmap frame zeroing (Phase 10 PF hunt).
+        crate::io::exception_print(crate::io::sprint(
+            &mut [0u8; 96],
+            format_args!(
+                "[MMAP] addr={:#x} phys={:#x} len={:#x} pid={}\n",
+                addr,
+                phys,
+                len,
+                crate::task::current_pid()
+            ),
+        ));
         for i in 0..pages {
             self.frames.push(phys + i * pmm::FRAME_SIZE);
         }

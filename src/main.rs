@@ -24,6 +24,7 @@ mod gfx;
 mod idt;
 mod image_viewer;
 mod ime;
+mod inet;
 mod interrupts;
 #[macro_use]
 mod io;

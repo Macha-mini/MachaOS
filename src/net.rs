@@ -10,8 +10,8 @@ pub const ETHERTYPE_ARP: u16 = 0x0806;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
 const ARP_REQUEST: u16 = 1;
 const ARP_REPLY: u16 = 2;
-const IP_PROTO_UDP: u8 = 17;
-const IP_PROTO_TCP: u8 = 6;
+pub(crate) const IP_PROTO_UDP: u8 = 17;
+pub(crate) const IP_PROTO_TCP: u8 = 6;
 
 /// This guest's address on the QEMU user-mode network.
 pub const OUR_IP: [u8; 4] = [10, 0, 2, 15];
@@ -75,7 +75,7 @@ pub fn resolve(target_ip: [u8; 4], timeout_ticks: u64) -> Option<[u8; 6]> {
 }
 
 /// Extracts the sender hardware address from an ARP reply frame.
-fn parse_arp_reply(frame: &[u8]) -> Option<[u8; 6]> {
+pub(crate) fn parse_arp_reply(frame: &[u8]) -> Option<[u8; 6]> {
     if frame.len() < 42 {
         return None;
     }
@@ -90,14 +90,71 @@ fn parse_arp_reply(frame: &[u8]) -> Option<[u8; 6]> {
     Some([frame[22], frame[23], frame[24], frame[25], frame[26], frame[27]])
 }
 
+/// The sender's IPv4 address carried by an ARP reply frame (bytes
+/// 28..32 of the frame — right after the sender hardware address).
+pub(crate) fn arp_reply_ip(frame: &[u8]) -> Option<[u8; 4]> {
+    if frame.len() < 42 {
+        return None;
+    }
+    Some([frame[28], frame[29], frame[30], frame[31]])
+}
+
+/// Checks the ARP cache (no wire traffic).
+pub(crate) fn arp_lookup(target_ip: [u8; 4]) -> Option<[u8; 6]> {
+    let cache = ARP_CACHE.lock();
+    cache.iter().find(|(ip, _)| *ip == target_ip).map(|(_, mac)| *mac)
+}
+
+/// Inserts/updates a cache entry.
+pub(crate) fn cache_arp(ip: [u8; 4], mac: [u8; 6]) {
+    let mut cache = ARP_CACHE.lock();
+    cache.retain(|(i, _)| *i != ip);
+    cache.push((ip, mac));
+    if cache.len() > 8 {
+        cache.remove(0);
+    }
+}
+
+/// Sends an ARP request for `target_ip` without waiting for the reply —
+/// the non-blocking counterpart to `resolve` (a syscall handler can't
+/// `hlt`-wait for the reply; callers poll `arp_lookup`/the RX ring).
+pub(crate) fn send_arp_request(target_ip: [u8; 4]) -> Result<(), &'static str> {
+    let mac = crate::e1000::mac().ok_or("NIC down")?;
+    let mut pkt = Vec::with_capacity(42);
+    pkt.extend_from_slice(&[0xFF; 6]); // destination: broadcast
+    pkt.extend_from_slice(&mac); // source
+    pkt.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+    pkt.extend_from_slice(&[0, 1]); // hardware type: Ethernet
+    pkt.extend_from_slice(&[0x08, 0x00]); // protocol: IPv4
+    pkt.extend_from_slice(&[6, 4]); // hlen, plen
+    pkt.extend_from_slice(&ARP_REQUEST.to_be_bytes());
+    pkt.extend_from_slice(&mac); // sender hardware address
+    pkt.extend_from_slice(&OUR_IP); // sender protocol address
+    pkt.extend_from_slice(&[0; 6]); // target hardware: unknown
+    pkt.extend_from_slice(&target_ip); // target protocol address
+    crate::e1000::send(&pkt)
+}
+
 // ---------------------------------------------------------------------
 // IPv4
 // ---------------------------------------------------------------------
 
 /// Builds and sends an IPv4 packet to `dst_ip` (resolving its MAC via
-/// ARP first).
+/// ARP first). Kernel-internal only — the `hlt`-based resolver can't
+/// run inside a syscall handler (see `send_ipv4_mac`).
 pub fn send_ipv4(dst_ip: [u8; 4], proto: u8, payload: &[u8]) -> Result<(), &'static str> {
     let dst_mac = resolve(dst_ip, ARP_TIMEOUT_TICKS).ok_or("ARP failed")?;
+    send_ipv4_mac(dst_mac, dst_ip, proto, payload)
+}
+
+/// Builds and sends an IPv4 packet to `dst_ip` via an already-known
+/// `dst_mac` — no ARP, no waiting, safe to call from a syscall handler.
+pub(crate) fn send_ipv4_mac(
+    dst_mac: [u8; 6],
+    dst_ip: [u8; 4],
+    proto: u8,
+    payload: &[u8],
+) -> Result<(), &'static str> {
     let src_mac = crate::e1000::mac().ok_or("NIC down")?;
     let mut frame = vec![0u8; 14 + 20 + payload.len()];
     frame[0..6].copy_from_slice(&dst_mac);
@@ -122,7 +179,7 @@ pub fn send_ipv4(dst_ip: [u8; 4], proto: u8, payload: &[u8]) -> Result<(), &'sta
 /// Parses an Ethernet frame into an IPv4 packet: (src_ip, dst_ip,
 /// protocol, payload slice). Returns `None` for non-IPv4 or malformed
 /// frames.
-fn parse_ipv4(frame: &[u8]) -> Option<([u8; 4], [u8; 4], u8, &[u8])> {
+pub(crate) fn parse_ipv4(frame: &[u8]) -> Option<([u8; 4], [u8; 4], u8, &[u8])> {
     if frame.len() < 14 + 20 {
         return None;
     }
@@ -153,6 +210,25 @@ pub fn send_udp(
     src_port: u16,
     payload: &[u8],
 ) -> Result<(), &'static str> {
+    let datagram = build_udp(dst_ip, dst_port, src_port, payload);
+    send_ipv4(dst_ip, IP_PROTO_UDP, &datagram)
+}
+
+/// Sends a UDP datagram via an already-known MAC — the syscall-safe
+/// variant (no ARP resolution, which needs a halt-loop the syscall
+/// context can't do).
+pub(crate) fn send_udp_mac(
+    dst_mac: [u8; 6],
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    src_port: u16,
+    payload: &[u8],
+) -> Result<(), &'static str> {
+    let datagram = build_udp(dst_ip, dst_port, src_port, payload);
+    send_ipv4_mac(dst_mac, dst_ip, IP_PROTO_UDP, &datagram)
+}
+
+fn build_udp(dst_ip: [u8; 4], dst_port: u16, src_port: u16, payload: &[u8]) -> Vec<u8> {
     let len = 8 + payload.len();
     let mut udp = vec![0u8; len];
     udp[0..2].copy_from_slice(&src_port.to_be_bytes());
@@ -169,7 +245,7 @@ pub fn send_udp(
     pseudo.extend_from_slice(&udp);
     let csum = checksum(&pseudo);
     udp[6..8].copy_from_slice(&csum.to_be_bytes());
-    send_ipv4(dst_ip, IP_PROTO_UDP, &udp)
+    udp
 }
 
 /// A received UDP datagram.
@@ -239,16 +315,17 @@ const TCP_FIN: u8 = 0x01;
 const TCP_PSH: u8 = 0x08;
 
 /// A received TCP segment.
-struct TcpSegment {
-    src_port: u16,
-    seq: u32,
-    ack: u32,
-    flags: u8,
-    payload: Vec<u8>,
+pub(crate) struct TcpSegment {
+    pub(crate) src_port: u16,
+    pub(crate) dst_port: u16,
+    pub(crate) seq: u32,
+    pub(crate) ack: u32,
+    pub(crate) flags: u8,
+    pub(crate) payload: Vec<u8>,
 }
 
 /// Parses a TCP segment out of an IPv4 payload.
-fn parse_tcp(payload: &[u8]) -> Option<TcpSegment> {
+pub(crate) fn parse_tcp(payload: &[u8]) -> Option<TcpSegment> {
     if payload.len() < 20 {
         return None;
     }
@@ -258,6 +335,7 @@ fn parse_tcp(payload: &[u8]) -> Option<TcpSegment> {
     }
     Some(TcpSegment {
         src_port: u16::from_be_bytes([payload[0], payload[1]]),
+        dst_port: u16::from_be_bytes([payload[2], payload[3]]),
         seq: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
         ack: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
         flags: payload[13],
@@ -397,7 +475,7 @@ pub fn tcp_request(
 }
 
 /// Builds a TCP segment (header + payload) with a valid checksum.
-fn build_tcp(
+pub(crate) fn build_tcp(
     src_port: u16,
     dst_port: u16,
     seq: u32,
@@ -432,7 +510,7 @@ fn build_tcp(
 }
 
 /// Sends a raw TCP segment (Ethernet + IPv4 + TCP).
-fn send_tcp(dst_mac: &[u8; 6], dst_ip: [u8; 4], seg: &[u8]) -> Result<(), &'static str> {
+pub(crate) fn send_tcp(dst_mac: &[u8; 6], dst_ip: [u8; 4], seg: &[u8]) -> Result<(), &'static str> {
     let src_mac = crate::e1000::mac().ok_or("NIC down")?;
     let mut frame = vec![0u8; 14 + 20 + seg.len()];
     frame[0..6].copy_from_slice(dst_mac);
