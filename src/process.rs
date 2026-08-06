@@ -1058,7 +1058,7 @@ fn validate_segments(program: &elf::Program) -> Result<(), &'static str> {
             return Err("segment overlaps kernel heap");
         }
         if end > paging::IDENTITY_MAP_END {
-            return Err("segment beyond 4 GiB");
+            return Err("segment beyond identity map (16 GiB)");
         }
         // The kernel reserves [USER_STACK_LOW_LIMIT, USER_EXIT_STUB_VIRT +
         // one page) in every process for its ring-3 stack — including the

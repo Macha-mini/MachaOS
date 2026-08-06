@@ -5,8 +5,9 @@
 //! handed out by accident.
 //!
 //! Memory beyond `MAX_PHYS_MEM` is simply ignored: the boot-time identity
-//! map covers the whole 4 GiB below (see `paging::IDENTITY_MAP_END`), so
-//! all of it is reachable; QEMU is typically run with `-m 4G`.
+//! map covers the whole 16 GiB below (see `paging::IDENTITY_MAP_END`, and
+//! the static PDs `paging::extend_identity_map` fills in `kmain`), so all
+//! of it is reachable; QEMU is typically run with `-m 4G` to `-m 16G`.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,9 +15,9 @@ use crate::multiboot::MultibootInfo;
 use crate::sync::SpinLock;
 
 pub const FRAME_SIZE: usize = 4096;
-pub const MAX_PHYS_MEM: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
-const FRAME_COUNT: usize = MAX_PHYS_MEM / FRAME_SIZE; // 1048576
-const BITMAP_BYTES: usize = FRAME_COUNT / 8; // 131072
+pub const MAX_PHYS_MEM: usize = 16 * 1024 * 1024 * 1024; // 16 GiB
+const FRAME_COUNT: usize = MAX_PHYS_MEM / FRAME_SIZE; // 4194304
+const BITMAP_BYTES: usize = FRAME_COUNT / 8; // 524288
 
 /// Reserved (never handed out by `frame_alloc`/`alloc_contiguous`) below
 /// this physical address, on top of the kernel image itself. The kernel

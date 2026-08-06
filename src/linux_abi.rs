@@ -255,6 +255,7 @@ const SYS_OPENAT: u64 = 257;
 const SYS_NEWFSTATAT: u64 = 262;
 const SYS_STATX: u64 = 332;
 const SYS_MKDIR: u64 = 83;
+const SYS_RMDIR: u64 = 84;
 const SYS_UNLINK: u64 = 87;
 const SYS_RENAME: u64 = 82;
 const SYS_SET_ROBUST_LIST: u64 = 273;
@@ -1851,6 +1852,26 @@ fn sys_unlink(pathname: u64) -> u64 {
     }
 }
 
+/// `rmdir(pathname)`: remove an empty directory (same FAT layer as
+/// unlink, which handles both files and empty directories). Unlike
+/// unlink, it refuses a non-directory (ENOTDIR) and lets the FAT layer
+/// report ENOTEMPTY for a non-empty directory.
+fn sys_rmdir(pathname: u64) -> u64 {
+    let Some(path) = read_cstr(pathname, 256) else {
+        return err(EFAULT);
+    };
+    let path = normalize_path(&path);
+    match crate::fat::is_dir(&path) {
+        Ok(true) => {}
+        Ok(false) => return err(ENOTDIR),
+        Err(e) => return fat_err(e),
+    }
+    match crate::fat::remove(&path) {
+        Ok(()) => 0,
+        Err(e) => fat_err(e),
+    }
+}
+
 /// `rename(oldpath, newpath)`: move a file or empty directory (copy +
 /// delete in the FAT layer; an existing target file is overwritten).
 fn sys_rename(oldpath: u64, newpath: u64) -> u64 {
@@ -2769,6 +2790,7 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_OPEN => sys_openat(AT_FDCWD, arg1, arg2, arg3),
         SYS_STATX => sys_statx(arg1, arg2, arg3, arg4, arg5),
         SYS_MKDIR => sys_mkdir(arg1, arg2),
+        SYS_RMDIR => sys_rmdir(arg1),
         SYS_UNLINK => sys_unlink(arg1),
         SYS_RENAME => sys_rename(arg1, arg2),
         SYS_NEWFSTATAT => sys_newfstatat(arg1, arg2, arg3, arg4),

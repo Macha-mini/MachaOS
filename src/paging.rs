@@ -1,10 +1,11 @@
 //! The boot assembly (see `boot` in main.rs) identity-maps the first 4 GiB
-//! of physical memory using 2 MiB pages. Any physical address the kernel
-//! wants to access directly (RAM, or MMIO such as the VBE linear
-//! framebuffer) must fall below this bound.
+//! of physical memory using 2 MiB pages, and `extend_identity_map` carries
+//! the same 2 MiB scheme on up to `IDENTITY_MAP_END` (32 GiB). Any
+//! physical address the kernel wants to access directly (RAM, or MMIO such
+//! as the VBE linear framebuffer) must fall below this bound.
 //!
 //! On top of that map, `map_page`/`unmap_page` manipulate individual 4 KiB
-//! pages of the kernel's own address space. Because the whole 4 GiB is
+//! pages of the kernel's own address space. Because the whole range is
 //! already covered by 2 MiB entries, touching a 4 KiB page inside one of
 //! them first *splits* that 2 MiB entry into a fresh page table (each 4 KiB
 //! entry keeps the original page's physical address and flags). The split
@@ -20,7 +21,7 @@ use alloc::vec::Vec;
 
 use crate::pmm;
 
-pub const IDENTITY_MAP_END: u64 = 4 * 1024 * 1024 * 1024;
+pub const IDENTITY_MAP_END: u64 = 16 * 1024 * 1024 * 1024;
 pub const PAGE_SIZE: u64 = 4096;
 
 pub const PAGE_PRESENT: u64 = 1;
@@ -38,6 +39,47 @@ pub const PAGE_NX: u64 = 1 << 63;
 // Defined by the boot assembly in main.rs (.bss).
 unsafe extern "C" {
     static page_table_pml4: u8;
+    static page_table_pdp: u8;
+    static page_table_pd: u8;
+}
+
+/// The boot assembly identity-maps the first 4 GiB with 2 MiB pages,
+/// using statically-allocated tables in main.rs's .bss. This extends
+/// that map up to `IDENTITY_MAP_END` (16 GiB), filling the remaining
+/// statically-reserved PDs (main.rs's `.skip 4096 * 16`) the same way
+/// (2 MiB pages throughout, so the split/PS handling everywhere else is
+/// untouched). Called from `kmain` right after `pmm::init`, before the
+/// allocator can hand out frames above 4 GiB.
+pub fn extend_identity_map() {
+    const PAGES_2M: u64 = IDENTITY_MAP_END / (2 * 1024 * 1024); // 16384
+    let pdp = core::ptr::addr_of!(page_table_pdp) as u64;
+    let pd_base = core::ptr::addr_of!(page_table_pd) as u64;
+    let pdp_entries = (PAGES_2M as usize).div_ceil(512);
+    // Entries 0..4 (the first 4 GiB) were wired by the boot asm; add
+    // the rest, each pointing at the next static PD.
+    let pdp_ptr = pdp as *mut u64;
+    for i in 4..pdp_entries {
+        unsafe {
+            *pdp_ptr.add(i) = (pd_base + (i as u64) * 4096) | PAGE_PRESENT | PAGE_WRITABLE;
+        }
+    }
+    for i in 4..pdp_entries {
+        let pd = (pd_base + (i as u64) * 4096) as *mut u64;
+        let base_page = (i as u64) * 512;
+        for j in 0..512 {
+            let page = base_page + j as u64;
+            if page >= PAGES_2M {
+                break;
+            }
+            unsafe {
+                *pd.add(j) = (page << 21) | PAGE_PRESENT | PAGE_WRITABLE | PS_BIT;
+            }
+        }
+    }
+    // Flush the TLB so the new upper-map entries take effect (pages
+    // above 4 GiB were never walked, but reloading CR3 is cheap and
+    // unconditional here).
+    write_cr3(kernel_pml4());
 }
 
 // Low 12 attribute bits plus NX (bit 63) — everything `map_range_in`/

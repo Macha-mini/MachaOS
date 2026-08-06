@@ -128,6 +128,17 @@ impl E1000 {
         self.rx_ring = pmm::alloc_contiguous(1).ok_or("no memory for RX ring")? as *mut RxDesc;
         self.tx_ring = pmm::alloc_contiguous(1).ok_or("no memory for TX ring")? as *mut TxDesc;
         self.tx_buf = pmm::alloc_contiguous(1).ok_or("no memory for TX buffer")?;
+        // The 82540EM only addresses DMA below 4 GiB. First-fit
+        // allocation from low memory normally guarantees this, but with
+        // the PMM now covering 16 GiB, reject explicitly so a future
+        // allocation-policy change can never silently break the NIC.
+        const DMA_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
+        if (self.rx_ring as u64) >= DMA_LIMIT
+            || (self.tx_ring as u64) >= DMA_LIMIT
+            || (self.tx_buf as u64) >= DMA_LIMIT
+        {
+            return Err("e1000: DMA ring above 4 GiB (82540EM is 32-bit)");
+        }
         unsafe {
             ptr::write_bytes(self.rx_ring as *mut u8, 0, 4096);
             ptr::write_bytes(self.tx_ring as *mut u8, 0, 4096);
@@ -135,6 +146,9 @@ impl E1000 {
         }
         for i in 0..NUM_DESC {
             self.rx_buffers[i] = pmm::alloc_contiguous(1).ok_or("no memory for RX buffers")?;
+            if (self.rx_buffers[i] as u64) >= DMA_LIMIT {
+                return Err("e1000: DMA buffer above 4 GiB (82540EM is 32-bit)");
+            }
             unsafe { ptr::write_bytes(self.rx_buffers[i] as *mut u8, 0, 4096) };
             let d = unsafe { &mut *self.rx_ring.add(i) };
             d.addr = self.rx_buffers[i] as u64;

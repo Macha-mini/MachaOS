@@ -92,7 +92,7 @@ page_table_pml4:
 page_table_pdp:
     .skip 4096
 page_table_pd:
-    .skip 4096 * 4
+    .skip 4096 * 16   # one PD per GiB, covering the full 16 GiB identity map
 stack_bottom:
     .skip 65536
     .balign 16
@@ -230,6 +230,15 @@ pub extern "C" fn kmain(magic: u32, multiboot_info: u32) -> ! {
 
     println!("[OK] initializing physical memory manager...");
     pmm::init(&info);
+
+    // Extend the boot asm's 4 GiB identity map up to IDENTITY_MAP_END
+    // (16 GiB) before the allocator can hand out frames above 4 GiB.
+    paging::extend_identity_map();
+    println!(
+        "[OK] identity map extended to {} GiB",
+        paging::IDENTITY_MAP_END / (1024 * 1024 * 1024)
+    );
+
     println!(
         "[OK] memory: {} MiB usable ({} KiB heap reserved)",
         (pmm::total_frames() * pmm::FRAME_SIZE) / (1024 * 1024),

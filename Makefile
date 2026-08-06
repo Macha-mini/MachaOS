@@ -138,27 +138,32 @@ NET_ARGS := -netdev user,id=n0 -device e1000,netdev=n0
 AHCI_ARGS := -device ich9-ahci,id=ahci -drive id=disk0,if=none,file=$(DISK),format=raw \
 	-device ide-hd,drive=disk0,bus=ahci.0
 
+# Guest RAM size. The kernel now identity-maps up to 16 GiB, so a
+# selftest at e.g. `make test MEM=16G` exercises the full map.
+MEM ?= 4G
+
 run: iso disk
-	$(QEMU) -m 4G -cdrom $(ISO) -boot d $(AHCI_ARGS) $(NET_ARGS) -serial stdio
+	$(QEMU) -m $(MEM) -cdrom $(ISO) -boot d $(AHCI_ARGS) $(NET_ARGS) -serial stdio
 
 run-nographic: iso disk
-	$(QEMU) -m 4G -cdrom $(ISO) -boot d $(AHCI_ARGS) $(NET_ARGS) -display none -serial stdio
+	$(QEMU) -m $(MEM) -cdrom $(ISO) -boot d $(AHCI_ARGS) $(NET_ARGS) -display none -serial stdio
 
 test: GRUB_CFG=boot/grub/grub-selftest.cfg
 test: iso disk
-	@rm -f $(TEST_LOG) $(TEST_LOG).pid
+	@rm -f $(TEST_LOG) $(TEST_LOG).pid $(TEST_LOG).qpid
 	@echo "== running MachaOS selftest in QEMU =="
 	@printf 'MachaOS http fixture 1234567890\n' > target/http-fixture.txt
 	@python3 tools/echo_server.py target >/dev/null 2>&1 & echo $$! > $(TEST_LOG).pid
-	@$(QEMU) -m 4G -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) \
-		$(AHCI_ARGS) $(NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 &
-	@for i in $$(seq 1 60); do \
+	@$(QEMU) -m $(MEM) -cdrom $(ISO) -boot d -display none -serial file:$(TEST_LOG) \
+		$(AHCI_ARGS) $(NET_ARGS) -device isa-debug-exit,iobase=0xf4,iosize=0x04 & echo $$! > $(TEST_LOG).qpid
+	@for i in $$(seq 1 90); do \
 		sleep 1; \
 		if grep -q "SELFTEST OK" $(TEST_LOG) 2>/dev/null; then \
 			echo "== PASS: selftest completed =="; \
 			cat $(TEST_LOG); \
 			kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
-			rm -f $(TEST_LOG).pid; \
+			kill $$(cat $(TEST_LOG).qpid) 2>/dev/null || true; \
+			rm -f $(TEST_LOG).pid $(TEST_LOG).qpid; \
 			exit 0; \
 		fi; \
 		if ! pgrep -q qemu-system-x86_64; then \
@@ -172,7 +177,8 @@ test: iso disk
 	echo "== FAIL: selftest timed out =="; \
 	cat $(TEST_LOG); \
 	kill $$(cat $(TEST_LOG).pid) 2>/dev/null || true; \
-	rm -f $(TEST_LOG).pid; \
+	kill $$(cat $(TEST_LOG).qpid) 2>/dev/null || true; \
+	rm -f $(TEST_LOG).pid $(TEST_LOG).qpid; \
 	exit 1
 
 clean:

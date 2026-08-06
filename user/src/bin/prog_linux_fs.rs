@@ -17,6 +17,7 @@ const SYS_WRITE: u64 = 1;
 const SYS_READ: u64 = 0;
 const SYS_GETPID: u64 = 39;
 const SYS_MKDIR: u64 = 83;
+const SYS_RMDIR: u64 = 84;
 const SYS_UNLINK: u64 = 87;
 const SYS_RENAME: u64 = 82;
 const SYS_STATX: u64 = 332;
@@ -186,6 +187,13 @@ pub extern "C" fn _start() {
         if pid_matches(me, &buf[..n as usize]) {
             ok |= 512;
         }
+    }
+
+    // Clean up the test directory we created. Without this, a re-run of
+    // the selftest (QEMU rebooting after a previous failure, or a later
+    // `make test` reusing a dirty disk image) fails check 4 with EEXIST.
+    unsafe {
+        common::syscall(SYS_RMDIR, &dir as *const u8 as u64, 0, 0, 0);
     }
 
     common::RESULT.store(if ok == 1023 { 0xFF } else { ok }, Ordering::Relaxed);
