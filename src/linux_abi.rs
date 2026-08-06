@@ -226,7 +226,7 @@ const SYS_MUNMAP: u64 = 11;
 const SYS_BRK: u64 = 12;
 const SYS_RT_SIGACTION: u64 = 13;
 const SYS_RT_SIGPROCMASK: u64 = 14;
-const SYS_RT_SIGRETURN: u64 = 15;
+pub(crate) const SYS_RT_SIGRETURN: u64 = 15;
 const SYS_KILL: u64 = 62;
 const SYS_TGKILL: u64 = 234;
 const SYS_IOCTL: u64 = 16;
@@ -784,6 +784,36 @@ fn sys_tgkill(tgid: u64, tid: u64, sig: u64) -> u64 {
         Ok(()) => 0,
         Err(()) => err(ESRCH),
     }
+}
+
+/// `rt_sigreturn()`: restores the context a signal handler interrupted.
+/// Reads the sigframe pushed by `process::deliver_pending_signals` (at
+/// the current ring-3 rsp minus `SIGFRAME_SIZE`), restores the blocked
+/// mask, and — since a normal syscall return would sysretq back to the
+/// sigreturn trampoline — returns the exec-restart magic with the saved
+/// rip/rsp stashed, so the asm's `.Lsyscall_exec_restart` path iretq's
+/// straight to the interrupted instruction instead.
+fn sys_rt_sigreturn() -> u64 {
+    // The handler's `ret` already consumed the restorer slot, so the
+    // saved context sits at the current ring-3 rsp (five qwords).
+    let user_rsp = crate::task::current_user_rsp();
+    let Some(phys) = resolve(user_rsp, crate::process::SIGFRAME_REMAINDER) else {
+        // No valid frame — Linux kills the process with SIGSEGV.
+        crate::process::deliver_signal(crate::task::current_pid(), 11);
+        return err(EINVAL);
+    };
+    let mut words = [0u64; 5];
+    unsafe {
+        core::ptr::copy_nonoverlapping(phys as *const u8, words.as_mut_ptr() as *mut u8, 40);
+    }
+    let saved_rip = words[0];
+    let saved_rsp = words[2];
+    let saved_mask = words[3];
+    crate::task::with_current_process_mut(|p| {
+        p.sig_blocked = saved_mask;
+    });
+    crate::syscall::set_exec_restart(saved_rip, saved_rsp);
+    crate::syscall::EXECVE_RESTART_MAGIC_VALUE
 }
 
 /// `dup(oldfd)`: a new fd referring to the same open description.
@@ -1623,6 +1653,7 @@ pub fn syscall_dispatch(num: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, ar
         SYS_BRK => sys_brk(arg1),
         SYS_RT_SIGACTION => sys_rt_sigaction(arg1, arg2, arg3, arg4),
         SYS_RT_SIGPROCMASK => sys_rt_sigprocmask(arg1, arg2, arg3, arg4),
+        SYS_RT_SIGRETURN => sys_rt_sigreturn(),
         SYS_KILL => sys_kill(arg1, arg2),
         SYS_TGKILL => sys_tgkill(arg1, arg2, arg3),
         SYS_IOCTL => err(ENOTTY), // every fd reports "not a tty"

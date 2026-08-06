@@ -216,7 +216,7 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-fn timer(_frame: &mut InterruptFrame) {
+fn timer(frame: &mut InterruptFrame) {
     TICKS.fetch_add(1, Ordering::Relaxed);
     // EOI must go out before a possible task switch: if scheduler_tick()
     // switches away from this task before the PIC hears about it, IRQ0's
@@ -224,6 +224,9 @@ fn timer(_frame: &mut InterruptFrame) {
     // stalls until this task runs again to send it — which would require
     // another timer interrupt that can now never arrive.
     pic::eoi(0);
+    // Phase 8b: deliver a pending signal to the current task if it's a
+    // ring-3 process (redirects this frame into a handler / terminates).
+    crate::process::deliver_pending_signals(frame);
     task::scheduler_tick();
 }
 

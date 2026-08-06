@@ -1517,7 +1517,29 @@ pub fn selftest() -> ! {
     }
     crate::process::reap(pid);
 
-    // Process management, part 2h: Phase 7 integration against a real
+    // Process management, part 2h: Phase 8b signal delivery — a caught
+    // handler runs asynchronously (timer-delivered, sigframe pushed on
+    // the ring-3 stack), rt_sigreturn restores the interrupted context
+    // (a *second* signal is still deliverable — the mask was restored),
+    // and a trailing SIG_DFL SIGTERM terminates the process (the wait
+    // reports the signal death). 3 checks folded into the result.
+    let pid = crate::process::spawn_linux(crate::user_prog::PROG_LINUX_SIGNAL, "linux-signal", &[], &[])
+        .unwrap_or_else(|e| selftest_fail(&format!("process spawn failed: {e}")));
+    match crate::process::wait(pid, 800) {
+        Some(process::ExitInfo::Signaled { sig: 15 }) => {
+            println!("[OK] linux-signal: SIG_DFL SIGTERM terminated it")
+        }
+        other => selftest_fail(&format!("linux-signal process gave unexpected exit: {:?}", other)),
+    }
+    match crate::process::read_result(pid) {
+        Some(0xB) => println!(
+            "[OK] Phase 8b: handler delivery + rt_sigreturn + mask restore all correct"
+        ),
+        other => selftest_fail(&format!("linux-signal process result mismatch: {:?}", other)),
+    }
+    crate::process::reap(pid);
+
+    // Process management, part 2i: Phase 7 integration against a real
     // third-party binary — BusyBox ash running a pipeline
     // (`echo … | /bin/cat.elf`), which needs fork + pipe2 + dup2 +
     // execve (of a real dynamically-linked glibc binary) + wait4 all

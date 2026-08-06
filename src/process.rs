@@ -934,6 +934,7 @@ fn load_linux_process(
         }
     };
     process.user_rsp = user_rsp;
+    map_syscall_stubs(&mut process, pml4)?;
 
     Ok((process, pml4))
 }
@@ -1210,10 +1211,50 @@ const fn align_up(value: u64, align: u64) -> u64 {
     (value + align - 1) & !(align - 1)
 }
 
-/// Maps a ring-3 stack and an "exit trampoline" page into the process's
+/// Maps the fixed page at `USER_EXIT_STUB_VIRT` holding the two ring-3
+/// syscall stubs: the exit stub (`_start`'s natural `ret` target —
+/// `mov eax, SYS_EXIT; syscall`) and, at offset 16, the sigreturn
+/// trampoline (`mov eax, SYS_RT_SIGRETURN; syscall`) that a signal
+/// handler's `ret` lands on. Both `jmp $` after the syscall — neither
+/// syscall ever returns. Mapped for native *and* Linux spawns (Linux
+/// processes need the sigreturn half for Phase 8b handler delivery).
+fn map_syscall_stubs(process: &mut Process, pml4: u64) -> Result<(), &'static str> {
+    let stub_phys = alloc_frame(process)?;
+    unsafe {
+        let stubs: [u8; 25] = [
+            0xB8, syscall::SYS_EXIT as u8, 0x00, 0x00, 0x00, // mov eax, SYS_EXIT
+            0x0F, 0x05, // syscall
+            0xEB, 0xFE, // jmp $
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // padding
+            0xB8, crate::linux_abi::SYS_RT_SIGRETURN as u8, 0x00, 0x00, 0x00, // mov eax, SYS_RT_SIGRETURN
+            0x0F, 0x05, // syscall
+            0xEB, 0xFE, // jmp $
+        ];
+        core::ptr::copy_nonoverlapping(stubs.as_ptr(), stub_phys as *mut u8, stubs.len());
+    }
+    if !paging::map_range_in(
+        pml4,
+        USER_EXIT_STUB_VIRT,
+        stub_phys as u64,
+        paging::PAGE_SIZE,
+        paging::PAGE_PRESENT | paging::PAGE_USER,
+        &mut process.frames,
+    ) {
+        return Err("failed to map exit trampoline");
+    }
+    process.mappings.push(Mapping {
+        vaddr: USER_EXIT_STUB_VIRT,
+        phys: stub_phys as u64,
+        len: paging::PAGE_SIZE,
+        shm_id: None,
+    });
+    Ok(())
+}
+
+/// Maps a ring-3 stack and the syscall-stub page into the process's
 /// address space, and records the initial stack pointer for
 /// `process_entry_trampoline`. The stack's top slot holds a return address
-/// pointing at the trampoline, so when the ELF's `_start` (an ordinary
+/// pointing at the exit stub, so when the ELF's `_start` (an ordinary
 /// `extern "C" fn`, compiled with a normal prologue/epilogue) executes its
 /// closing `ret`, it lands on `mov eax, SYS_EXIT; syscall` instead of
 /// falling into kernel code it has no ring-3 access to.
@@ -1237,31 +1278,7 @@ fn setup_user_stack(process: &mut Process, pml4: u64) -> Result<(), &'static str
         return Err("failed to map user stack");
     }
 
-    let stub_phys = alloc_frame(process)?;
-    unsafe {
-        let stub: [u8; 9] = [
-            0xB8, syscall::SYS_EXIT as u8, 0x00, 0x00, 0x00, // mov eax, SYS_EXIT
-            0x0F, 0x05, // syscall
-            0xEB, 0xFE, // jmp $ (never reached; sys_exit never returns)
-        ];
-        core::ptr::copy_nonoverlapping(stub.as_ptr(), stub_phys as *mut u8, stub.len());
-    }
-    if !paging::map_range_in(
-        pml4,
-        USER_EXIT_STUB_VIRT,
-        stub_phys as u64,
-        paging::PAGE_SIZE,
-        paging::PAGE_PRESENT | paging::PAGE_USER,
-        &mut process.frames,
-    ) {
-        return Err("failed to map exit trampoline");
-    }
-    process.mappings.push(Mapping {
-        vaddr: USER_EXIT_STUB_VIRT,
-        phys: stub_phys as u64,
-        len: paging::PAGE_SIZE,
-        shm_id: None,
-    });
+    map_syscall_stubs(process, pml4)?;
 
     // One return-address slot at the top of the stack. Written through
     // the frame's kernel-identity address: the process's own PML4 (where
@@ -1511,6 +1528,13 @@ extern "C" fn process_entry_trampoline() -> ! {
 extern "C" fn exit_self() -> ! {
     close_fds_on_exit();
     task::mark_current_exited(ExitInfo::Normal);
+    // Phase 8b: a child's death pends SIGCHLD on its parent (Linux
+    // semantics — the parent is usually wait4-polling, but a caught
+    // SIGCHLD is delivered at the next timer tick). `deliver_signal`
+    // drops it for SIG_DFL/SIG_IGN dispositions.
+    if let Some(parent) = task::process_parent(task::current_pid()) {
+        let _ = deliver_signal(parent, 17);
+    }
     loop {
         interrupts::halt();
     }
@@ -1869,6 +1893,99 @@ pub fn deliver_signal(pid: usize, sig: u8) -> Result<(), ()> {
         Ok(())
     })
     .ok_or(())?
+}
+
+/// Size of the kernel's signal frame, pushed on the ring-3 stack at
+/// delivery and consumed by `rt_sigreturn`. The handler's `ret` pops the
+/// restorer (offset 0 — the lowest address), so the return address sits
+/// at the *bottom* of the frame:
+///   +0  restorer      — the sigreturn trampoline (`USER_EXIT_STUB_VIRT + 16`)
+///   +8  saved_rip
+///   +16 saved_rflags
+///   +24 saved_rsp     — the interrupted rsp (frame base + SIGFRAME_SIZE)
+///   +32 saved_sigmask — the blocked mask to restore
+///   +40 sig           — informational (the handler gets it in rdi)
+pub const SIGFRAME_SIZE: u64 = 48;
+
+/// How much of the frame `rt_sigreturn` reads: the handler's `ret` has
+/// already consumed the restorer slot, so the remaining five qwords sit
+/// at the current ring-3 rsp.
+pub(crate) const SIGFRAME_REMAINDER: u64 = 40;
+
+/// The `mov eax, SYS_RT_SIGRETURN; syscall` stub in the syscall-stub page
+/// (`map_syscall_stubs`) — a handler's `ret` lands here.
+const SIGRETURN_TRAMPOLINE: u64 = USER_EXIT_STUB_VIRT + 16;
+
+/// Called from the timer ISR for the current task: if it is a ring-3
+/// process with a pending, unblocked signal, deliver it by redirecting
+/// the interrupt frame. A caught handler gets a sigframe pushed on the
+/// ring-3 stack and the frame's rip/rsp redirected into the handler
+/// (the handler's `ret` lands on the sigreturn trampoline, whose
+/// rt_sigreturn syscall restores the interrupted context); a SIG_DFL
+/// signal terminates the process; a SIG_IGN one is dropped. One signal
+/// per call — the rest stay pending for the next tick.
+pub fn deliver_pending_signals(frame: &mut interrupts::InterruptFrame) {
+    if frame.cs & 3 != 3 {
+        return; // mid-syscall (kernel frame) — deliver when back in ring 3
+    }
+    let current = crate::task::current_pid();
+    crate::task::with_process_mut(current, |p| {
+        if p.is_exited() {
+            return;
+        }
+        let pending = p.sig_pending & !p.sig_blocked;
+        if pending == 0 {
+            return;
+        }
+        let sig = pending.trailing_zeros() as u8;
+        if !(1..=64).contains(&sig) {
+            p.sig_pending = 0;
+            return;
+        }
+        let action = p.sigactions[sig as usize];
+        if action.handler == 1 {
+            // SIG_IGN — drop the pending signal.
+            p.sig_pending &= !(1u64 << sig);
+            return;
+        }
+        if action.handler == 0 {
+            // SIG_DFL — terminate (default-ignored signals never reach
+            // here: `deliver_signal` drops them at kill time).
+            p.sig_pending &= !(1u64 << sig);
+            p.mark_exited(ExitInfo::Signaled { sig });
+            return;
+        }
+        // Caught handler: push the sigframe below the interrupted rsp
+        // and redirect the frame into the handler.
+        let user_rsp = frame.rsp;
+        let frame_base = user_rsp - SIGFRAME_SIZE;
+        let Some(phys) = crate::syscall::resolve_user_buffer(frame_base, SIGFRAME_SIZE) else {
+            return; // frame unmappable — leave the signal pending
+        };
+        let old_mask = p.sig_blocked;
+        let words = [
+            SIGRETURN_TRAMPOLINE, // +0  restorer — the handler's `ret` target
+            frame.rip,            // +8  saved_rip
+            frame.rflags,         // +16 saved_rflags
+            user_rsp,             // +24 saved_rsp
+            old_mask,             // +32 saved_sigmask
+            sig as u64,           // +40 sig
+        ];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                words.as_ptr() as *const u8,
+                phys as *mut u8,
+                SIGFRAME_SIZE as usize,
+            );
+        }
+        // The signal (and the handler's sa_mask) stay blocked while the
+        // handler runs; `rt_sigreturn` restores the saved mask.
+        p.sig_blocked = old_mask | (1u64 << sig) | action.mask;
+        p.sig_pending &= !(1u64 << sig);
+        frame.rip = action.handler;
+        frame.rsp = frame_base;
+        frame.rdi = sig as u64;
+    });
 }
 
 /// Called from #DE/#UD/#GP (and similar) when the faulting task is a

@@ -43,6 +43,7 @@ user:
 	cp user/target/x86_64-unknown-none/release/prog_linux_phase3 target/user-linux-phase3.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_threads target/user-linux-threads.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_fork target/user-linux-fork.elf
+	cp user/target/x86_64-unknown-none/release/prog_linux_signal target/user-linux-signal.elf
 	cp user/target/x86_64-unknown-none/release/prog_linux_wayland_client target/user-linux-wayland-client.elf
 
 build: gen user
