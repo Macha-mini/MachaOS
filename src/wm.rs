@@ -32,6 +32,15 @@ use crate::task;
 
 const TITLE_BAR_HEIGHT: u32 = 32;
 const TASKBAR_HEIGHT: u32 = 48;
+// Window-snap (Phase E): while dragging, the window "catches" on the
+// screen edges — top = maximize, left/right = half-screen. This is how
+// close the window's edge must be to a screen edge to light up the zone.
+const SNAP_EDGE_MARGIN: i32 = 8;
+// Snap preview: a translucent white zone with a thin accent outline,
+// Win11-style.
+const SNAP_PREVIEW_ALPHA: u32 = 34;
+const SNAP_PREVIEW_ACCENT_ALPHA: u32 = 200;
+
 const WINDOW_RADIUS: u32 = 10;
 const TITLE_BTN_W: u32 = 40;
 const TITLE_BTN_H: u32 = 28;
@@ -310,6 +319,42 @@ struct DragState {
     last_y: i32,
 }
 
+/// The screen-edge zone a dragged window is hovering over (window snap).
+/// `Top` maximizes the window; `Left`/`Right` snap it to half the screen.
+#[derive(Clone, Copy, PartialEq)]
+enum SnapZone {
+    Left,
+    Right,
+    Top,
+}
+
+impl SnapZone {
+    /// The on-screen rect the window will occupy if snapped to this zone.
+    fn rect(self, screen_w: u32, screen_h: u32) -> (u32, u32, u32, u32) {
+        match self {
+            SnapZone::Left => (0, 0, screen_w / 2, screen_h - TASKBAR_HEIGHT),
+            SnapZone::Right => (screen_w / 2, 0, screen_w - screen_w / 2, screen_h - TASKBAR_HEIGHT),
+            SnapZone::Top => (0, 0, screen_w, screen_h - TASKBAR_HEIGHT),
+        }
+    }
+}
+
+/// Which snap zone a window dragged so that its top-left corner is at
+/// `(x, y)` and its content is `content_w` pixels wide falls into.
+/// Top wins over the sides (dragging to the top edge maximizes, like
+/// Windows).
+fn snap_zone_for(x: i32, y: i32, content_w: u32, screen_w: u32) -> Option<SnapZone> {
+    if y <= SNAP_EDGE_MARGIN {
+        Some(SnapZone::Top)
+    } else if x <= SNAP_EDGE_MARGIN {
+        Some(SnapZone::Left)
+    } else if x + content_w as i32 >= screen_w as i32 - SNAP_EDGE_MARGIN {
+        Some(SnapZone::Right)
+    } else {
+        None
+    }
+}
+
 /// Pixels of the desktop (with the dragged window absent) at the
 /// window's current position, covering its rect plus its shadow. Each
 /// drag frame restores this over the window's previous position to
@@ -383,6 +428,14 @@ pub struct WindowManager {
     screen_w: u32,
     screen_h: u32,
     dragging: Option<DragState>,
+    // The snap zone the dragged window currently hovers over, shown as a
+    // translucent preview and applied on mouse-up (see `apply_snap`).
+    snap_zone: Option<SnapZone>,
+    // The snap zone whose preview the *previous* drag composite drew.
+    // The partial drag path can't erase a preview it no longer draws, so
+    // `composite_drag` falls back to a full composite whenever this
+    // differs from `snap_zone` (zone activated, deactivated, or switched).
+    prev_snap_zone: Option<SnapZone>,
     resizing: Option<ResizeState>,
     file_drag: Option<FileDragState>,
     press_state: Option<PressState>,
@@ -440,6 +493,8 @@ impl WindowManager {
             screen_w,
             screen_h,
             dragging: None,
+            snap_zone: None,
+            prev_snap_zone: None,
             resizing: None,
             file_drag: None,
             press_state: None,
@@ -1292,16 +1347,35 @@ impl WindowManager {
         if let Some(drag) = &self.dragging {
             if event.left {
                 let (max_x, max_y) = self.drag_bounds();
-                let window = &mut self.windows[drag.window_index];
-                window.x = (self.cursor_x - drag.offset_x).clamp(0, max_x);
-                window.y = (self.cursor_y - drag.offset_y).clamp(0, max_y);
+                let idx = drag.window_index;
+                let (nx, ny) = {
+                    let window = &mut self.windows[idx];
+                    window.x = (self.cursor_x - drag.offset_x).clamp(0, max_x);
+                    window.y = (self.cursor_y - drag.offset_y).clamp(0, max_y);
+                    (window.x, window.y)
+                };
+                // Window snap: highlight the edge zone the window is
+                // currently hovering over (applied on release). Only
+                // resizable windows can actually snap — a fixed-size app
+                // (Calculator, ...) must not show a preview that promises
+                // a snap its `apply_snap` would refuse.
+                self.snap_zone = if self.windows[idx].resizable {
+                    let (cw, _) = self.windows[idx].content_size();
+                    snap_zone_for(nx, ny, cw, self.screen_w)
+                } else {
+                    None
+                };
             }
         }
         if just_released {
-            if self.dragging.is_some() {
+            if let Some(drag) = &self.dragging {
+                if let Some(zone) = self.snap_zone {
+                    self.apply_snap(drag.window_index, zone);
+                }
                 self.persist_session();
             }
             self.dragging = None;
+            self.snap_zone = None;
             self.press_state = None;
         }
         if just_pressed {
@@ -1945,6 +2019,39 @@ impl WindowManager {
         self.dragging.is_some()
     }
 
+    /// Applies a window snap to a dragged window on mouse-up: the top
+    /// zone maximizes it (reusing the existing maximize machinery), the
+    /// left/right zones resize it to half the screen width and pin it to
+    /// that side. Fixed-size apps (Calculator, Settings, ...) are left
+    /// alone — there's no meaningfully different half size for them.
+    fn apply_snap(&mut self, index: usize, zone: SnapZone) {
+        if !self.windows[index].resizable {
+            return;
+        }
+        match zone {
+            SnapZone::Top => {
+                if !self.windows[index].maximized {
+                    self.maximize_window(index);
+                }
+            }
+            SnapZone::Left | SnapZone::Right => {
+                let (max_cols, max_rows) = self.max_content_cells();
+                let half_cols = ((self.screen_w / 2) / font::glyph_w() as u32) as usize;
+                let cols = half_cols.clamp(1, max_cols);
+                let rows = max_rows.max(MIN_ROWS);
+                let win = &mut self.windows[index];
+                win.maximized = false;
+                win.x = if zone == SnapZone::Left {
+                    0
+                } else {
+                    (self.screen_w / 2) as i32
+                };
+                win.y = 0;
+                resize_window(win, cols, rows);
+            }
+        }
+    }
+
     /// Called when a window drag begins: redraws the desktop without
     /// the dragged window and snapshots its region, so every drag frame
     /// can erase the window's previous position by restoring this
@@ -1988,6 +2095,14 @@ impl WindowManager {
         let Some((bg_w, bg_h)) = self.drag_bg.as_ref().map(|bg| (bg.w, bg.h)) else {
             return self.composite();
         };
+        // A snap-zone transition (preview appeared, disappeared, or moved
+        // sides) can't be done by the partial path — it would leave the
+        // old preview's tint on screen. Fall back to a full composite for
+        // that frame; the next frame continues the partial path normally.
+        if self.prev_snap_zone != self.snap_zone {
+            self.prev_snap_zone = self.snap_zone;
+            return self.composite();
+        }
         let (wx, wy) = (self.windows[idx].x, self.windows[idx].y);
         let m = SHADOW_MARGIN;
         if (wx, wy) != (last_x, last_y) {
@@ -2009,18 +2124,37 @@ impl WindowManager {
         }
         fb::with_surface(|surface| {
             draw_window(surface, &self.windows[idx], idx == self.focused, self.cursor_x, self.cursor_y);
+            if let Some(zone) = self.snap_zone {
+                let (px, py, pw, ph) = zone.rect(self.screen_w, self.screen_h);
+                draw_snap_preview(
+                    surface,
+                    px,
+                    py,
+                    pw,
+                    ph,
+                    self.settings.accent_color_rgb(),
+                );
+            }
             draw_cursor(surface, self.cursor_x, self.cursor_y);
         });
         // Union of the old and new window areas (plus shadow margin),
-        // clamped to the screen.
-        let min_x = ((last_x - m).min(wx - m)).max(0) as u32;
-        let min_y = ((last_y - m).min(wy - m)).max(0) as u32;
-        let max_x = ((last_x + bg_w as i32 - m)
+        // clamped to the screen. A snap preview can extend past the
+        // window, so union its zone rect in too when one is active.
+        let mut min_x = ((last_x - m).min(wx - m)).max(0) as u32;
+        let mut min_y = ((last_y - m).min(wy - m)).max(0) as u32;
+        let mut max_x = ((last_x + bg_w as i32 - m)
             .max(wx + bg_w as i32 - m))
             .min(self.screen_w as i32) as u32;
-        let max_y = ((last_y + bg_h as i32 - m)
+        let mut max_y = ((last_y + bg_h as i32 - m)
             .max(wy + bg_h as i32 - m))
             .min(self.screen_h as i32) as u32;
+        if let Some(zone) = self.snap_zone {
+            let (px, py, pw, ph) = zone.rect(self.screen_w, self.screen_h);
+            min_x = min_x.min(px);
+            min_y = min_y.min(py);
+            max_x = max_x.max((px + pw).min(self.screen_w));
+            max_y = max_y.max((py + ph).min(self.screen_h));
+        }
         if let Some(d) = self.dragging.as_mut() {
             d.last_x = wx;
             d.last_y = wy;
@@ -3260,6 +3394,29 @@ const CURSOR_BITS: [u16; 16] = [
     0b0000001100,
     0b0000001100,
 ];
+
+/// Draws the window-snap preview: a translucent white rounded zone with
+/// a thin accent outline (Win11-style), showing where the dragged window
+/// will land if the button is released.
+fn draw_snap_preview(surface: &mut dyn Surface, x: u32, y: u32, w: u32, h: u32, accent: u32) {
+    let r = 10;
+    gfx::fill_rounded_rect_blend(
+        surface,
+        x + 3,
+        y + 3,
+        w.saturating_sub(6),
+        h.saturating_sub(6),
+        r,
+        0x00_FFFFFF,
+        SNAP_PREVIEW_ALPHA,
+    );
+    let t = 2; // outline thickness
+    let inset = r + 2;
+    gfx::fill_rect_blend(surface, x + inset, y, w.saturating_sub(2 * inset), t, accent, SNAP_PREVIEW_ACCENT_ALPHA);
+    gfx::fill_rect_blend(surface, x + inset, y + h.saturating_sub(t), w.saturating_sub(2 * inset), t, accent, SNAP_PREVIEW_ACCENT_ALPHA);
+    gfx::fill_rect_blend(surface, x, y + inset, t, h.saturating_sub(2 * inset), accent, SNAP_PREVIEW_ACCENT_ALPHA);
+    gfx::fill_rect_blend(surface, x + w.saturating_sub(t), y + inset, t, h.saturating_sub(2 * inset), accent, SNAP_PREVIEW_ACCENT_ALPHA);
+}
 
 fn draw_cursor(surface: &mut dyn Surface, x: i32, y: i32) {
     // Paint the shape eight times offset by one pixel in black first, so

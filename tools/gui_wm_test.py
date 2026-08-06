@@ -391,9 +391,43 @@ def main():
              f"(wallpaper {wp_title}); expected a dark bar")
     print("[OK] Terminal title bar drawn over the wallpaper")
 
+    # ---- Group D: window snap — drag the terminal to the left edge -----
+    # Grab its title bar (clear of the min/max/close buttons), drag it
+    # left until its top-left corner hits the screen edge, release, and
+    # verify it is pinned to the left half: console background near the
+    # left edge, wallpaper still visible on the right half.
+    grab = (300, 140)               # terminal title bar, far from buttons
+    move_to(qmp, grab[0] - t0[0], grab[1] - t0[1])
+    qmp.btn("left", True)           # press -> drag begins
+    # Cursor 132px right of the window's left edge, so the window's x
+    # clamps to 0 well before the cursor reaches the margin.
+    move_to(qmp, 40 - grab[0], 100 - grab[1])
+    qmp.btn("left", False)          # release inside the left zone -> snap
+    time.sleep(1.0)
+
+    shot4 = shot_prefix + "-4-snap.ppm"
+    qmp.screendump(shot4)
+    img = load_image(shot4)
+
+    if not all(abs(img.px(400, 300)[i] - CONSOLE_BG[i]) <= 2 for i in range(3)):
+        fail(f"after left-snap, (400,300) is {img.px(400, 300)}, "
+             f"expected console background {CONSOLE_BG} (window not on the left half)")
+    if not all(abs(img.px(10, 300)[i] - CONSOLE_BG[i]) <= 2 for i in range(3)):
+        fail(f"after left-snap, (10,300) is {img.px(10, 300)}, "
+             f"expected console background {CONSOLE_BG} (window not pinned to the left edge)")
+    # The snapped terminal fills the left half (screen_w/2 wide); points
+    # past the half point must still show pure wallpaper.
+    for (x, y) in ((1000, 300), (1300, 600), (1800, 400)):
+        s = img.px(x, y)
+        e = wp_px(x, y)
+        if not all(abs(s[i] - e[i]) <= 2 for i in range(3)):
+            fail(f"after left-snap, the right half at ({x},{y}) is {s}, "
+                 f"expected wallpaper {e} (window overflowed past the half point)")
+    print("[OK] window snapped to the left half (right half still shows the wallpaper)")
+
     qmp.quit()
     print(f"[PASS] GUI/WM screendump test: wallpaper, taskbar, launcher, "
-          f"and app launch all correct at {w}x{h}", flush=True)
+          f"app launch and window snap all correct at {w}x{h}", flush=True)
 
 
 if __name__ == "__main__":
