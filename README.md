@@ -1,3 +1,6 @@
+これはホビープロジェクトだし俗にいうAIスロップだよ
+
+
 # MachaOS
 
 A small x86_64 Multiboot kernel written in Rust. It currently includes:
